@@ -1,0 +1,11 @@
+[package]
+name = "cyan_backend"
+version = "0.1.0"
+edition = "2024"
+[lib]
+name = "cyan_backend"        # the Rust-side name of the library
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+xaeroflux = "0.3.0-m3"
