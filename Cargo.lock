@@ -759,6 +759,7 @@ dependencies = [
 name = "cyan_backend"
 version = "0.1.0"
 dependencies = [
+ "once_cell",
  "xaeroflux",
 ]
 
