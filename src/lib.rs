@@ -1,16 +1,10 @@
-use std::{
-    error::Error,
-    sync::{Arc, OnceLock},
-};
+use std::{error::Error, sync::OnceLock};
 
 use bytemuck::{Pod, Zeroable, bytes_of};
 use rkyv::{Archive, Deserialize, Serialize};
 use rusted_ring::{RingBuffer, *};
 use xaeroflux::{date_time::emit_secs, hash::blake_hash};
-use xaeroflux_actors::{
-    XaeroFlux,
-    read_api::{RangeQuery, ReadApi},
-};
+use xaeroflux_actors::XaeroFlux;
 use xaeroid::XaeroID;
 
 pub const GROUP_EVENT: u32 = 1;
@@ -104,7 +98,7 @@ pub trait GroupOps<const MAX_WORKSPACES: usize> {
         &mut self,
         name: String,
     ) -> Result<Group<MAX_WORKSPACES>, Box<dyn std::error::Error>>;
-    fn delete_group(&mut self, group_id: [u8; 32]) -> Result<bool, Box<dyn std::error::Error>>;
+    fn delete_group(&mut self, group_id: [u8; 32]) -> Result<(), Box<dyn std::error::Error>>;
     fn list_workspaces(&self, xaero_id: [u8; 32]) -> Result<bool, Box<dyn std::error::Error>>;
 }
 
@@ -135,29 +129,27 @@ pub trait ObjectOps<const MAX_CHILDREN: usize> {
 }
 
 pub struct CyanApp {
-    pub xaero_flux: Arc<XaeroFlux>,
+    pub xaero_flux: XaeroFlux,
 }
 impl CyanApp {
     pub fn init(xaero_id: XaeroID) -> Result<CyanApp, Box<dyn std::error::Error>> {
-        let mut xaero_flux = Arc::new(XaeroFlux::new());
+        let mut xaero_flux = XaeroFlux::new();
         xaero_flux.start_aof()?;
         xaero_flux.start_p2p(xaero_id)?;
         Ok(CyanApp { xaero_flux })
     }
 }
 
-#[repr(C, align(8))]
-pub union CyanEventType {}
 impl<const MAX_WORKSPACES: usize> GroupOps<MAX_WORKSPACES> for CyanApp {
     fn create_group(&mut self, name: String) -> Result<Group<MAX_WORKSPACES>, Box<dyn Error>> {
         let g: Group<MAX_WORKSPACES> = Group::new(name);
         let bytes = bytemuck::bytes_of(&g);
-        Ok(*self.xaero_flux.event_bus.write_optimal(bytes, 1))
+        (self.xaero_flux.event_bus.write_optimal(bytes, 1))?;
+        Ok(g)
     }
 
     fn delete_group(&mut self, group_id: [u8; 32]) -> Result<(), Box<dyn std::error::Error>> {
-        let xf_clone = self.xaero_flux.clone();
-        xf_clone
+        self.xaero_flux
             .event_bus
             .write_optimal(bytes_of(&group_id), GROUP_TOMBSTONE)
             .map_err(|xfe| Box::new(xfe) as Box<dyn std::error::Error>)
