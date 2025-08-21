@@ -5339,9 +5339,9 @@ dependencies = [
 
 [[package]]
 name = "xaeroflux"
-version = "0.9.3-alpha"
+version = "0.9.6-alpha"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d011993f7a1987c9d07ac1ced828806013b0d1237ad2ab37810197f5cfb227d2"
+checksum = "a187786e432f594bf4b89d1818501937b449dc38dc43d0654b8c9666ea1d1f89"
 dependencies = [
  "rusted-ring",
  "xaeroflux-actors",
@@ -5351,9 +5351,9 @@ dependencies = [
 
 [[package]]
 name = "xaeroflux-actors"
-version = "0.9.3-alpha"
+version = "0.9.6-alpha"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32609d0256aa95e41f7bb533a242983813fa5c4c98ff49b96183aa67339e7668"
+checksum = "6dff01e905a47eb65448c21c3e5d3b2b5aba5e7d5cef012e9542441e83ee1b9a"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5377,9 +5377,9 @@ dependencies = [
 
 [[package]]
 name = "xaeroflux-core"
-version = "0.9.3-alpha"
+version = "0.9.6-alpha"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3795c57ca2e9e62247505ba487c8459a5185d62b219008f08b17e259ae6bcd9b"
+checksum = "b01413f5df61fe5871b71eefc3ebd4a69bb40c38ac58b90ebce13b7dafbafad6"
 dependencies = [
  "blake3",
  "bytemuck",
