@@ -1,12 +1,14 @@
+mod objects;
+
 use std::{error::Error, sync::OnceLock};
 
-use bytemuck::{Pod, Zeroable, bytes_of};
+use bytemuck::{bytes_of, Pod, Zeroable};
 use rkyv::{Archive, Deserialize, Serialize};
 use rusted_ring::{RingBuffer, *};
 use xaeroflux::{date_time::emit_secs, hash::blake_hash, pool::XaeroInternalEvent};
 use xaeroflux_actors::{
-    XaeroFlux,
     read_api::{RangeQuery, ReadApi},
+    XaeroFlux,
 };
 use xaeroid::XaeroID;
 
@@ -42,7 +44,7 @@ pub static OBJECT_EVENT_BUFFER_WRITER: OnceLock<Writer<M_TSHIRT_SIZE, M_CAPACITY
 
 #[repr(C, align(64))]
 #[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
-pub struct Object<const MAX_CHILDREN: usize> {
+pub struct Object<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> {
     pub object_id: [u8; 32],
     pub workspace_id: [u8; 32],
     pub group_id: [u8; 32],
@@ -53,19 +55,27 @@ pub struct Object<const MAX_CHILDREN: usize> {
     pub created_at: u64,
     pub updated_at: u64,
     pub children: [[u8; 32]; MAX_CHILDREN],
-    pub _padding: [u8; 7], // Adjusted for u8 object_type
+    pub payload: [u8; PAYLOAD_SIZE], // Raw bytes for payload
+    pub _padding: [u8; 7],           // Adjusted for u8 object_type
 }
 
-unsafe impl<const MAX_CHILDREN: usize> Pod for Object<MAX_CHILDREN> {}
-unsafe impl<const MAX_CHILDREN: usize> Zeroable for Object<MAX_CHILDREN> {}
+unsafe impl<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> Pod
+    for Object<MAX_CHILDREN, PAYLOAD_SIZE>
+{
+}
+unsafe impl<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> Zeroable
+    for Object<MAX_CHILDREN, PAYLOAD_SIZE>
+{
+}
 
-impl<const MAX_CHILDREN: usize> Object<MAX_CHILDREN> {
+impl<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> Object<MAX_CHILDREN, PAYLOAD_SIZE> {
     pub fn new(
         group_id: [u8; 32],
         workspace_id: [u8; 32],
         object_id: [u8; 32],
         parent_id: [u8; 32],
         object_type: u8,
+        payload: [u8; PAYLOAD_SIZE],
     ) -> Self {
         Object {
             object_id,
@@ -78,6 +88,7 @@ impl<const MAX_CHILDREN: usize> Object<MAX_CHILDREN> {
             created_at: emit_secs(),
             updated_at: emit_secs(),
             children: [[0u8; 32]; MAX_CHILDREN],
+            payload,
             _padding: [0u8; 7],
         }
     }
@@ -180,22 +191,24 @@ pub trait WorkspaceOps<const MAX_OBJECTS: usize> {
         xaero_id: [u8; 32],
         workspace_id: [u8; 32],
     ) -> Result<bool, Box<dyn std::error::Error>>;
-    fn list_objects<const MAX_CHILDREN: usize>(
+    fn list_objects<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize>(
         &self,
         xaero_id: [u8; 32],
         workspace_id: [u8; 32],
-    ) -> Result<Vec<Object<MAX_CHILDREN>>, Box<dyn std::error::Error>>;
+    ) -> Result<Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>>, Box<dyn std::error::Error>>;
 }
 
-pub trait ObjectOps<const MAX_CHILDREN: usize> {
+pub trait ObjectOps<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> {
     fn create_object(
         &mut self,
+        name: String,
         xaero_id: [u8; 32],
         group_id: [u8; 32],
         workspace_id: [u8; 32],
         object_id: [u8; 32],
-        name: String,
-    ) -> Result<Object<MAX_CHILDREN>, Box<dyn std::error::Error>>;
+        parent_id: [u8; 32],
+        payload: [u8; PAYLOAD_SIZE],
+    ) -> Result<Object<MAX_CHILDREN, PAYLOAD_SIZE>, Box<dyn std::error::Error>>;
     fn delete_object(
         &mut self,
         xaero_id: [u8; 32],
@@ -209,7 +222,7 @@ pub trait ObjectOps<const MAX_CHILDREN: usize> {
         group_id: [u8; 32],
         workspace_id: [u8; 32],
         object_id: [u8; 32],
-    ) -> Result<Vec<Object<MAX_CHILDREN>>, Box<dyn std::error::Error>>;
+    ) -> Result<Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>>, Box<dyn std::error::Error>>;
 }
 
 pub struct CyanApp {
@@ -321,18 +334,19 @@ impl<const MAX_OBJECTS: usize> WorkspaceOps<MAX_OBJECTS> for CyanApp {
         Ok(true)
     }
 
-    fn list_objects<const MAX_CHILDREN: usize>(
+    fn list_objects<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize>(
         &self,
         xaero_id: [u8; 32],
         workspace_id: [u8; 32],
-    ) -> Result<Vec<Object<MAX_CHILDREN>>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>>, Box<dyn std::error::Error>> {
         let mut objects_found = Vec::new();
 
         // Check ring buffer first
         if let Some(reader) = OBJECT_EVENT_BUFFER_READER.get() {
             let mut reader = reader.clone();
             while let Some(event) = reader.next() {
-                let object = bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.data);
+                let object =
+                    bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.data);
                 if object.workspace_id == workspace_id {
                     objects_found.push(*object);
                 }
@@ -350,14 +364,16 @@ impl<const MAX_OBJECTS: usize> WorkspaceOps<MAX_OBJECTS> for CyanApp {
                     return false;
                 }
                 let object_candidate =
-                    bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.evt.data);
+                    bytemuck::from_bytes::<Object<MAX_CHILDREN,PAYLOAD_SIZE>>(&event.evt.data);
                 object_candidate.workspace_id == workspace_id
             }),
         )?;
 
-        let lmdb_objects: Vec<Object<MAX_CHILDREN>> = query_results
+        let lmdb_objects: Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>> = query_results
             .into_iter()
-            .map(|event| *bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.evt.data))
+            .map(|event| {
+                *bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.evt.data)
+            })
             .collect();
 
         objects_found.extend(lmdb_objects);
@@ -365,21 +381,26 @@ impl<const MAX_OBJECTS: usize> WorkspaceOps<MAX_OBJECTS> for CyanApp {
     }
 }
 
-impl<const MAX_CHILDREN: usize> ObjectOps<MAX_CHILDREN> for CyanApp {
+impl<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> ObjectOps<MAX_CHILDREN, PAYLOAD_SIZE>
+    for CyanApp
+{
     fn create_object(
         &mut self,
+        _name: String,
         _xaero_id: [u8; 32],
         group_id: [u8; 32],
         workspace_id: [u8; 32],
         object_id: [u8; 32],
-        _name: String,
-    ) -> Result<Object<MAX_CHILDREN>, Box<dyn std::error::Error>> {
-        let object: Object<MAX_CHILDREN> = Object::new(
+        parent_id: [u8; 32],
+        payload: [u8; PAYLOAD_SIZE],
+    ) -> Result<Object<MAX_CHILDREN, PAYLOAD_SIZE>, Box<dyn std::error::Error>>{
+        let object: Object<MAX_CHILDREN, PAYLOAD_SIZE> = Object::new(
             group_id,
             workspace_id,
             object_id,
-            [0; 32], // No parent for top-level objects
-            3,       // Default object type (whiteboard)
+            parent_id,
+            3,
+            payload
         );
         let bytes = bytemuck::bytes_of(&object);
         self.xaero_flux
@@ -407,14 +428,14 @@ impl<const MAX_CHILDREN: usize> ObjectOps<MAX_CHILDREN> for CyanApp {
         group_id: [u8; 32],
         workspace_id: [u8; 32],
         object_id: [u8; 32],
-    ) -> Result<Vec<Object<MAX_CHILDREN>>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>>, Box<dyn std::error::Error>> {
         let mut children_found = Vec::new();
 
         // Check ring buffer first
         if let Some(reader) = OBJECT_EVENT_BUFFER_READER.get() {
             let mut reader = reader.clone();
             while let Some(event) = reader.next() {
-                let object = bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.data);
+                let object = bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.data);
                 if object.parent_id == object_id
                     && object.workspace_id == workspace_id
                     && object.group_id == group_id
@@ -435,16 +456,16 @@ impl<const MAX_CHILDREN: usize> ObjectOps<MAX_CHILDREN> for CyanApp {
                     return false;
                 }
                 let object_candidate =
-                    bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.evt.data);
+                    bytemuck::from_bytes::<Object<MAX_CHILDREN,PAYLOAD_SIZE>>(&event.evt.data);
                 object_candidate.parent_id == object_id
                     && object_candidate.workspace_id == workspace_id
                     && object_candidate.group_id == group_id
             }),
         )?;
 
-        let lmdb_children: Vec<Object<MAX_CHILDREN>> = query_results
+        let lmdb_children: Vec<Object<MAX_CHILDREN,PAYLOAD_SIZE>> = query_results
             .into_iter()
-            .map(|event| *bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.evt.data))
+            .map(|event| *bytemuck::from_bytes::<Object<MAX_CHILDREN,PAYLOAD_SIZE>>(&event.evt.data))
             .collect();
 
         children_found.extend(lmdb_children);
