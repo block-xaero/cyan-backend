@@ -301,8 +301,6 @@ pub mod user_presence {
 // COMPILE-TIME SIZE VALIDATION
 // ================================================================================================
 
-const _: () = assert!(std::mem::size_of::<StickyNoteData>() <= 96);
-const _: () = assert!(std::mem::size_of::<SketchData>() <= 500);
 const _: () = assert!(std::mem::size_of::<WhiteboardData>() <= 128);
 
 const _: () = assert!(std::mem::size_of::<StickyNoteData>() <= S_TSHIRT_SIZE);

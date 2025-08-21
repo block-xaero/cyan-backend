@@ -2,13 +2,13 @@ mod objects;
 
 use std::{error::Error, sync::OnceLock};
 
-use bytemuck::{bytes_of, Pod, Zeroable};
+use bytemuck::{Pod, Zeroable, bytes_of};
 use rkyv::{Archive, Deserialize, Serialize};
 use rusted_ring::{RingBuffer, *};
 use xaeroflux::{date_time::emit_secs, hash::blake_hash, pool::XaeroInternalEvent};
 use xaeroflux_actors::{
-    read_api::{RangeQuery, ReadApi},
     XaeroFlux,
+    read_api::{RangeQuery, ReadApi},
 };
 use xaeroid::XaeroID;
 
@@ -364,7 +364,7 @@ impl<const MAX_OBJECTS: usize> WorkspaceOps<MAX_OBJECTS> for CyanApp {
                     return false;
                 }
                 let object_candidate =
-                    bytemuck::from_bytes::<Object<MAX_CHILDREN,PAYLOAD_SIZE>>(&event.evt.data);
+                    bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.evt.data);
                 object_candidate.workspace_id == workspace_id
             }),
         )?;
@@ -393,15 +393,9 @@ impl<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> ObjectOps<MAX_CHILDRE
         object_id: [u8; 32],
         parent_id: [u8; 32],
         payload: [u8; PAYLOAD_SIZE],
-    ) -> Result<Object<MAX_CHILDREN, PAYLOAD_SIZE>, Box<dyn std::error::Error>>{
-        let object: Object<MAX_CHILDREN, PAYLOAD_SIZE> = Object::new(
-            group_id,
-            workspace_id,
-            object_id,
-            parent_id,
-            3,
-            payload
-        );
+    ) -> Result<Object<MAX_CHILDREN, PAYLOAD_SIZE>, Box<dyn std::error::Error>> {
+        let object: Object<MAX_CHILDREN, PAYLOAD_SIZE> =
+            Object::new(group_id, workspace_id, object_id, parent_id, 3, payload);
         let bytes = bytemuck::bytes_of(&object);
         self.xaero_flux
             .event_bus
@@ -435,7 +429,8 @@ impl<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> ObjectOps<MAX_CHILDRE
         if let Some(reader) = OBJECT_EVENT_BUFFER_READER.get() {
             let mut reader = reader.clone();
             while let Some(event) = reader.next() {
-                let object = bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.data);
+                let object =
+                    bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.data);
                 if object.parent_id == object_id
                     && object.workspace_id == workspace_id
                     && object.group_id == group_id
@@ -456,16 +451,18 @@ impl<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> ObjectOps<MAX_CHILDRE
                     return false;
                 }
                 let object_candidate =
-                    bytemuck::from_bytes::<Object<MAX_CHILDREN,PAYLOAD_SIZE>>(&event.evt.data);
+                    bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.evt.data);
                 object_candidate.parent_id == object_id
                     && object_candidate.workspace_id == workspace_id
                     && object_candidate.group_id == group_id
             }),
         )?;
 
-        let lmdb_children: Vec<Object<MAX_CHILDREN,PAYLOAD_SIZE>> = query_results
+        let lmdb_children: Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>> = query_results
             .into_iter()
-            .map(|event| *bytemuck::from_bytes::<Object<MAX_CHILDREN,PAYLOAD_SIZE>>(&event.evt.data))
+            .map(|event| {
+                *bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.evt.data)
+            })
             .collect();
 
         children_found.extend(lmdb_children);
