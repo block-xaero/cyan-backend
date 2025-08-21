@@ -35,6 +35,11 @@ pub static WORKSPACE_EVENT_BUFFER_READER: OnceLock<Reader<S_TSHIRT_SIZE, S_CAPAC
 pub static WORKSPACE_EVENT_BUFFER_WRITER: OnceLock<Writer<S_TSHIRT_SIZE, S_CAPACITY>> =
     OnceLock::new();
 
+pub static OBJECT_EVENT_BUFFER_READER: OnceLock<Reader<M_TSHIRT_SIZE, M_CAPACITY>> =
+    OnceLock::new();
+pub static OBJECT_EVENT_BUFFER_WRITER: OnceLock<Writer<M_TSHIRT_SIZE, M_CAPACITY>> =
+    OnceLock::new();
+
 #[repr(C, align(64))]
 #[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
 pub struct Object<const MAX_CHILDREN: usize> {
@@ -48,11 +53,35 @@ pub struct Object<const MAX_CHILDREN: usize> {
     pub created_at: u64,
     pub updated_at: u64,
     pub children: [[u8; 32]; MAX_CHILDREN],
-    pub _padding: [u8; 8],
+    pub _padding: [u8; 7], // Adjusted for u8 object_type
 }
 
 unsafe impl<const MAX_CHILDREN: usize> Pod for Object<MAX_CHILDREN> {}
 unsafe impl<const MAX_CHILDREN: usize> Zeroable for Object<MAX_CHILDREN> {}
+
+impl<const MAX_CHILDREN: usize> Object<MAX_CHILDREN> {
+    pub fn new(
+        group_id: [u8; 32],
+        workspace_id: [u8; 32],
+        object_id: [u8; 32],
+        parent_id: [u8; 32],
+        object_type: u8,
+    ) -> Self {
+        Object {
+            object_id,
+            workspace_id,
+            group_id,
+            object_type,
+            parent_id,
+            child_count: 0,
+            version: 1,
+            created_at: emit_secs(),
+            updated_at: emit_secs(),
+            children: [[0u8; 32]; MAX_CHILDREN],
+            _padding: [0u8; 7],
+        }
+    }
+}
 
 #[repr(C, align(64))]
 #[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
@@ -69,6 +98,21 @@ pub struct Workspace<const MAX_OBJECTS: usize> {
 
 unsafe impl<const MAX_OBJECTS: usize> Pod for Workspace<MAX_OBJECTS> {}
 unsafe impl<const MAX_OBJECTS: usize> Zeroable for Workspace<MAX_OBJECTS> {}
+
+impl<const MAX_OBJECTS: usize> Workspace<MAX_OBJECTS> {
+    pub fn new(group_id: [u8; 32], name: String) -> Self {
+        Workspace {
+            workspace_id: blake_hash(name.as_str()),
+            group_id,
+            object_count: 0,
+            version: 1,
+            created_at: emit_secs(),
+            updated_at: emit_secs(),
+            objects: [[0u8; 32]; MAX_OBJECTS],
+            _padding: [0u8; 8],
+        }
+    }
+}
 
 #[repr(C, align(64))]
 #[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
@@ -92,13 +136,18 @@ impl<const MAX_WORKSPACES: usize> Group<MAX_WORKSPACES> {
             group_id: blake_hash(name.as_str()),
             parent_id: [0u8; 32],
             workspace_count: 0,
-            version: 0,
+            version: 1,
             created_at: emit_secs(),
             updated_at: emit_secs(),
             workspaces: [[0u8; 32]; MAX_WORKSPACES],
             _padding: [0u8; 31],
         }
     }
+}
+
+// Helper function to check if event is tombstoned
+pub fn is_tombstone_event(event_type: u32) -> bool {
+    event_type >= TOMBSTONE_OFFSET
 }
 
 pub trait GroupOps<const MAX_WORKSPACES: usize> {
@@ -131,7 +180,11 @@ pub trait WorkspaceOps<const MAX_OBJECTS: usize> {
         xaero_id: [u8; 32],
         workspace_id: [u8; 32],
     ) -> Result<bool, Box<dyn std::error::Error>>;
-    fn list_workspaces(&self, group_id: [u8; 32]) -> Result<bool, Box<dyn std::error::Error>>;
+    fn list_objects<const MAX_CHILDREN: usize>(
+        &self,
+        xaero_id: [u8; 32],
+        workspace_id: [u8; 32],
+    ) -> Result<Vec<Object<MAX_CHILDREN>>, Box<dyn std::error::Error>>;
 }
 
 pub trait ObjectOps<const MAX_CHILDREN: usize> {
@@ -162,10 +215,12 @@ pub trait ObjectOps<const MAX_CHILDREN: usize> {
 pub struct CyanApp {
     pub xaero_flux: XaeroFlux,
 }
+
 impl CyanApp {
     pub fn init(xaero_id: XaeroID) -> Result<CyanApp, Box<dyn std::error::Error>> {
         WORKSPACE_EVENT_BUFFER_WRITER
             .get_or_init(|| RingFactory::get_writer(&WORKSPACE_EVENT_BUFFER));
+        OBJECT_EVENT_BUFFER_WRITER.get_or_init(|| RingFactory::get_writer(&OBJECT_EVENT_BUFFER));
         let mut xaero_flux = XaeroFlux::new();
         xaero_flux.start_aof()?;
         xaero_flux.start_p2p(xaero_id)?;
@@ -181,7 +236,7 @@ impl<const MAX_WORKSPACES: usize> GroupOps<MAX_WORKSPACES> for CyanApp {
     ) -> Result<Group<MAX_WORKSPACES>, Box<dyn Error>> {
         let g: Group<MAX_WORKSPACES> = Group::new(name);
         let bytes = bytemuck::bytes_of(&g);
-        (self.xaero_flux.event_bus.write_optimal(bytes, 1))?;
+        (self.xaero_flux.event_bus.write_optimal(bytes, GROUP_EVENT))?;
         Ok(g)
     }
 
@@ -190,11 +245,10 @@ impl<const MAX_WORKSPACES: usize> GroupOps<MAX_WORKSPACES> for CyanApp {
         _xaero_id: [u8; 32],
         group_id: [u8; 32],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // look in ring quickly
         self.xaero_flux
             .event_bus
-            .write_optimal(bytes_of(&group_id), GROUP_TOMBSTONE)
-            .map_err(|xfe| Box::new(xfe) as Box<dyn std::error::Error>)
+            .write_optimal(bytes_of(&group_id), GROUP_TOMBSTONE)?;
+        Ok(())
     }
 
     fn list_workspaces<const MAX_OBJECTS: usize>(
@@ -202,37 +256,198 @@ impl<const MAX_WORKSPACES: usize> GroupOps<MAX_WORKSPACES> for CyanApp {
         xaero_id: [u8; 32],
         group_id: [u8; 32],
     ) -> Result<Vec<Workspace<MAX_OBJECTS>>, Box<dyn std::error::Error>> {
-        // look in ring
         let mut workspaces_found = Vec::new();
-        let mut reader = WORKSPACE_EVENT_BUFFER_READER
-            .get()
-            .expect("READER not ready yet!")
-            .clone(); // Clone the reader to get ownership
-        while let Some(event) = reader.by_ref().next() {
-            let workspace = bytemuck::from_bytes::<Workspace<MAX_OBJECTS>>(&event.data);
-            if workspace.group_id == group_id {
-                workspaces_found.push(*workspace);
+
+        // Check ring buffer first
+        if let Some(reader) = WORKSPACE_EVENT_BUFFER_READER.get() {
+            let mut reader = reader.clone();
+            while let Some(event) = reader.next() {
+                let workspace = bytemuck::from_bytes::<Workspace<MAX_OBJECTS>>(&event.data);
+                if workspace.group_id == group_id {
+                    workspaces_found.push(*workspace);
+                }
             }
         }
-        // look in lmdb and refresh ring
+
+        // Query LMDB for additional workspaces
         let query_results = self.xaero_flux.range_query_with_filter(
             RangeQuery {
                 xaero_id,
                 event_type: WORKSPACE_EVENT,
             },
-            Box::new(|event: &XaeroInternalEvent<MAX_OBJECTS>| {
+            Box::new(move |event: &XaeroInternalEvent<MAX_OBJECTS>| {
+                if is_tombstone_event(event.evt.event_type) {
+                    return false;
+                }
                 let workspace_candidate =
                     bytemuck::from_bytes::<Workspace<MAX_OBJECTS>>(&event.evt.data);
                 workspace_candidate.group_id == group_id
             }),
         )?;
+
         let lmdb_workspaces: Vec<Workspace<MAX_OBJECTS>> = query_results
             .into_iter()
             .map(|event| *bytemuck::from_bytes::<Workspace<MAX_OBJECTS>>(&event.evt.data))
             .collect();
 
-        // Extend with owned values
         workspaces_found.extend(lmdb_workspaces);
         Ok(workspaces_found)
+    }
+}
+
+impl<const MAX_OBJECTS: usize> WorkspaceOps<MAX_OBJECTS> for CyanApp {
+    fn create_workspace(
+        &mut self,
+        _xaero_id: [u8; 32],
+        group_id: [u8; 32],
+        name: String,
+    ) -> Result<Workspace<MAX_OBJECTS>, Box<dyn std::error::Error>> {
+        let workspace: Workspace<MAX_OBJECTS> = Workspace::new(group_id, name);
+        let bytes = bytemuck::bytes_of(&workspace);
+        self.xaero_flux
+            .event_bus
+            .write_optimal(bytes, WORKSPACE_EVENT)?;
+        Ok(workspace)
+    }
+
+    fn delete_workspace(
+        &mut self,
+        _xaero_id: [u8; 32],
+        workspace_id: [u8; 32],
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.xaero_flux
+            .event_bus
+            .write_optimal(bytes_of(&workspace_id), WORKSPACE_TOMBSTONE)?;
+        Ok(true)
+    }
+
+    fn list_objects<const MAX_CHILDREN: usize>(
+        &self,
+        xaero_id: [u8; 32],
+        workspace_id: [u8; 32],
+    ) -> Result<Vec<Object<MAX_CHILDREN>>, Box<dyn std::error::Error>> {
+        let mut objects_found = Vec::new();
+
+        // Check ring buffer first
+        if let Some(reader) = OBJECT_EVENT_BUFFER_READER.get() {
+            let mut reader = reader.clone();
+            while let Some(event) = reader.next() {
+                let object = bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.data);
+                if object.workspace_id == workspace_id {
+                    objects_found.push(*object);
+                }
+            }
+        }
+
+        // Query LMDB for additional objects
+        let query_results = self.xaero_flux.range_query_with_filter(
+            RangeQuery {
+                xaero_id,
+                event_type: WHITEBOARD_EVENT,
+            },
+            Box::new(move |event: &XaeroInternalEvent<MAX_CHILDREN>| {
+                if is_tombstone_event(event.evt.event_type) {
+                    return false;
+                }
+                let object_candidate =
+                    bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.evt.data);
+                object_candidate.workspace_id == workspace_id
+            }),
+        )?;
+
+        let lmdb_objects: Vec<Object<MAX_CHILDREN>> = query_results
+            .into_iter()
+            .map(|event| *bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.evt.data))
+            .collect();
+
+        objects_found.extend(lmdb_objects);
+        Ok(objects_found)
+    }
+}
+
+impl<const MAX_CHILDREN: usize> ObjectOps<MAX_CHILDREN> for CyanApp {
+    fn create_object(
+        &mut self,
+        _xaero_id: [u8; 32],
+        group_id: [u8; 32],
+        workspace_id: [u8; 32],
+        object_id: [u8; 32],
+        _name: String,
+    ) -> Result<Object<MAX_CHILDREN>, Box<dyn std::error::Error>> {
+        let object: Object<MAX_CHILDREN> = Object::new(
+            group_id,
+            workspace_id,
+            object_id,
+            [0; 32], // No parent for top-level objects
+            3,       // Default object type (whiteboard)
+        );
+        let bytes = bytemuck::bytes_of(&object);
+        self.xaero_flux
+            .event_bus
+            .write_optimal(bytes, WHITEBOARD_EVENT)?;
+        Ok(object)
+    }
+
+    fn delete_object(
+        &mut self,
+        _xaero_id: [u8; 32],
+        _group_id: [u8; 32],
+        _workspace_id: [u8; 32],
+        object_id: [u8; 32],
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.xaero_flux
+            .event_bus
+            .write_optimal(bytes_of(&object_id), WHITEBOARD_TOMBSTONE)?;
+        Ok(true)
+    }
+
+    fn list_children(
+        &self,
+        xaero_id: [u8; 32],
+        group_id: [u8; 32],
+        workspace_id: [u8; 32],
+        object_id: [u8; 32],
+    ) -> Result<Vec<Object<MAX_CHILDREN>>, Box<dyn std::error::Error>> {
+        let mut children_found = Vec::new();
+
+        // Check ring buffer first
+        if let Some(reader) = OBJECT_EVENT_BUFFER_READER.get() {
+            let mut reader = reader.clone();
+            while let Some(event) = reader.next() {
+                let object = bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.data);
+                if object.parent_id == object_id
+                    && object.workspace_id == workspace_id
+                    && object.group_id == group_id
+                {
+                    children_found.push(*object);
+                }
+            }
+        }
+
+        // Query LMDB for additional child objects
+        let query_results = self.xaero_flux.range_query_with_filter(
+            RangeQuery {
+                xaero_id,
+                event_type: STICKY_NOTE_EVENT,
+            },
+            Box::new(move |event: &XaeroInternalEvent<MAX_CHILDREN>| {
+                if is_tombstone_event(event.evt.event_type) {
+                    return false;
+                }
+                let object_candidate =
+                    bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.evt.data);
+                object_candidate.parent_id == object_id
+                    && object_candidate.workspace_id == workspace_id
+                    && object_candidate.group_id == group_id
+            }),
+        )?;
+
+        let lmdb_children: Vec<Object<MAX_CHILDREN>> = query_results
+            .into_iter()
+            .map(|event| *bytemuck::from_bytes::<Object<MAX_CHILDREN>>(&event.evt.data))
+            .collect();
+
+        children_found.extend(lmdb_children);
+        Ok(children_found)
     }
 }
