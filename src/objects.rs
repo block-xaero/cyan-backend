@@ -157,6 +157,9 @@ pub mod shape {
 /// chat messages
 pub mod chat {
     use bytemuck::{Pod, Zeroable};
+    use xaeroflux::date_time::emit_secs;
+
+    use crate::{Object, TOMBSTONE_OFFSET};
 
     #[repr(C)]
     #[derive(Copy, Clone, Debug)]
@@ -172,6 +175,39 @@ pub mod chat {
     }
     unsafe impl Pod for ChatMessageData {}
     unsafe impl Zeroable for ChatMessageData {}
+
+    pub const CHAT_MESSAGE_EVENT: u32 = 12;
+    pub const CHAT_MESSAGE_TOMBSTONE: u32 = CHAT_MESSAGE_EVENT + TOMBSTONE_OFFSET;
+    pub type ChatMessageObject = Object<0, 500>;
+
+    impl ChatMessageObject {
+        pub fn new_chat_message(
+            object_id: [u8; 32],
+            group_id: [u8; 32],
+            workspace_id: [u8; 32],
+            xaero_id: [u8; 32],
+            parent_id: [u8; 32], // parent conversation
+            message_text: &str,
+            reply_to: Option<[u8; 32]>,
+        ) -> Self {
+            ChatMessageObject {
+                object_id,
+                workspace_id,
+                group_id,
+                object_type: 0,
+                parent_id,
+                child_count: 0,
+                version: 0,
+                created_at: emit_secs(),
+                updated_at: emit_secs(),
+                children: [],
+                payload: message_text.as_bytes()[..message_text.len()]
+                    .try_into()
+                    .expect("message text is too long"),
+                _padding: [0u8; 7],
+            }
+        }
+    }
 }
 
 pub mod file {
