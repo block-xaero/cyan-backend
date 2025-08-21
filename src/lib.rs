@@ -12,6 +12,8 @@ use xaeroflux_actors::{
 };
 use xaeroid::XaeroID;
 
+use crate::objects::chat::{CHAT_MESSAGE_EVENT, ChatMessageObject};
+
 pub const GROUP_EVENT: u32 = 1;
 pub const WORKSPACE_EVENT: u32 = 2;
 pub const WHITEBOARD_EVENT: u32 = 3;
@@ -238,6 +240,50 @@ impl CyanApp {
         xaero_flux.start_aof()?;
         xaero_flux.start_p2p(xaero_id)?;
         Ok(CyanApp { xaero_flux })
+    }
+
+    pub fn send_chat_message(
+        &mut self,
+        object_id: [u8; 32],
+        group_id: [u8; 32],
+        workspace_id: [u8; 32],
+        sender_id: [u8; 32],
+        parent_id: [u8; 32], // parent conversation
+        text: &str,
+        reply_to: Option<[u8; 32]>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let message = ChatMessageObject::new_chat_message(
+            object_id,
+            group_id,
+            workspace_id,
+            sender_id,
+            parent_id,
+            text,
+            reply_to,
+        );
+
+        // Write pinned event (stored permanently)
+        self.xaero_flux.event_bus.write_optimal(
+            bytemuck::bytes_of(&message),
+            CHAT_MESSAGE_EVENT | xaeroflux_core::event::PIN_FLAG,
+        )?;
+
+        Ok(())
+    }
+
+    /// TODO: ADD This needs to also have a continuous query running to keep loading chat messagess
+    /// TODO: For now we just get chat_messages via pull.
+    pub fn get_chat_messages(
+        &self,
+        _xaero_id: [u8; 32],
+        _group_id: [u8; 32],
+        _workspace_id: [u8; 32],
+        _parent_object_id: [u8; 32],
+    ) -> Result<Vec<ChatMessageObject>, Box<dyn std::error::Error>> {
+        // Query from ring buffer + LMDB
+        // Filter by workspace_id
+        // Return sorted by timestamp
+        todo!()
     }
 }
 
