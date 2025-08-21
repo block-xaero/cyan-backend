@@ -1,12 +1,12 @@
 use std::{error::Error, sync::OnceLock};
 
-use bytemuck::{bytes_of, Pod, Zeroable};
+use bytemuck::{Pod, Zeroable, bytes_of};
 use rkyv::{Archive, Deserialize, Serialize};
 use rusted_ring::{RingBuffer, *};
 use xaeroflux::{date_time::emit_secs, hash::blake_hash, pool::XaeroInternalEvent};
 use xaeroflux_actors::{
-    read_api::{RangeQuery, ReadApi},
     XaeroFlux,
+    read_api::{RangeQuery, ReadApi},
 };
 use xaeroid::XaeroID;
 
@@ -112,11 +112,11 @@ pub trait GroupOps<const MAX_WORKSPACES: usize> {
         xaero_id: [u8; 32],
         group_id: [u8; 32],
     ) -> Result<(), Box<dyn std::error::Error>>;
-    fn list_workspaces(
+    fn list_workspaces<const MAX_OBJECTS: usize>(
         &self,
         xaero_id: [u8; 32],
         group_id: [u8; 32],
-    ) -> Result<bool, Box<dyn std::error::Error>>;
+    ) -> Result<Vec<Workspace<MAX_OBJECTS>>, Box<dyn std::error::Error>>;
 }
 
 pub trait WorkspaceOps<const MAX_OBJECTS: usize> {
@@ -156,7 +156,7 @@ pub trait ObjectOps<const MAX_CHILDREN: usize> {
         group_id: [u8; 32],
         workspace_id: [u8; 32],
         object_id: [u8; 32],
-    ) -> Result<bool, Box<dyn std::error::Error>>;
+    ) -> Result<Vec<Object<MAX_CHILDREN>>, Box<dyn std::error::Error>>;
 }
 
 pub struct CyanApp {
@@ -176,7 +176,7 @@ impl CyanApp {
 impl<const MAX_WORKSPACES: usize> GroupOps<MAX_WORKSPACES> for CyanApp {
     fn create_group(
         &mut self,
-        xaero_id: [u8; 32],
+        _xaero_id: [u8; 32],
         name: String,
     ) -> Result<Group<MAX_WORKSPACES>, Box<dyn Error>> {
         let g: Group<MAX_WORKSPACES> = Group::new(name);
@@ -187,7 +187,7 @@ impl<const MAX_WORKSPACES: usize> GroupOps<MAX_WORKSPACES> for CyanApp {
 
     fn delete_group(
         &mut self,
-        xaero_id: [u8; 32],
+        _xaero_id: [u8; 32],
         group_id: [u8; 32],
     ) -> Result<(), Box<dyn std::error::Error>> {
         // look in ring quickly
@@ -197,37 +197,42 @@ impl<const MAX_WORKSPACES: usize> GroupOps<MAX_WORKSPACES> for CyanApp {
             .map_err(|xfe| Box::new(xfe) as Box<dyn std::error::Error>)
     }
 
-    fn list_workspaces(
+    fn list_workspaces<const MAX_OBJECTS: usize>(
         &self,
         xaero_id: [u8; 32],
         group_id: [u8; 32],
-    ) -> Result<Vec<Workspace<S_TSHIRT_SIZE>>, Box<dyn Error>> {
+    ) -> Result<Vec<Workspace<MAX_OBJECTS>>, Box<dyn std::error::Error>> {
         // look in ring
         let mut workspaces_found = Vec::new();
-        while let Some(event) = WORKSPACE_EVENT_BUFFER_READER
+        let mut reader = WORKSPACE_EVENT_BUFFER_READER
             .get()
             .expect("READER not ready yet!")
-            .by_ref()
-            .next()
-        {
-            let workspace = bytemuck::from_bytes::<Workspace<S_TSHIRT_SIZE>>(&event.data);
+            .clone(); // Clone the reader to get ownership
+        while let Some(event) = reader.by_ref().next() {
+            let workspace = bytemuck::from_bytes::<Workspace<MAX_OBJECTS>>(&event.data);
             if workspace.group_id == group_id {
                 workspaces_found.push(*workspace);
             }
         }
         // look in lmdb and refresh ring
-        let mut res = self.xaero_flux.range_query_with_filter(
+        let query_results = self.xaero_flux.range_query_with_filter(
             RangeQuery {
                 xaero_id,
                 event_type: WORKSPACE_EVENT,
             },
-            Box::new(|event: &XaeroInternalEvent<S_TSHIRT_SIZE>| {
+            Box::new(|event: &XaeroInternalEvent<MAX_OBJECTS>| {
                 let workspace_candidate =
-                    bytemuck::from_bytes::<Workspace<S_TSHIRT_SIZE>>(&event.evt.data);
+                    bytemuck::from_bytes::<Workspace<MAX_OBJECTS>>(&event.evt.data);
                 workspace_candidate.group_id == group_id
             }),
         )?;
-        workspaces_found.extend(res.drain(..));
+        let lmdb_workspaces: Vec<Workspace<MAX_OBJECTS>> = query_results
+            .into_iter()
+            .map(|event| *bytemuck::from_bytes::<Workspace<MAX_OBJECTS>>(&event.evt.data))
+            .collect();
+
+        // Extend with owned values
+        workspaces_found.extend(lmdb_workspaces);
         Ok(workspaces_found)
     }
 }
