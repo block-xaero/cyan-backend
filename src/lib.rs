@@ -1,517 +1,353 @@
+// lib.rs - Updated with full parity to Swift UI
+
 mod objects;
 
-use std::{error::Error, sync::OnceLock};
-
-use bytemuck::{Pod, Zeroable, bytes_of};
+use bytemuck::{Pod, Zeroable};
 use rkyv::{Archive, Deserialize, Serialize};
-use rusted_ring::{RingBuffer, *};
-use xaeroflux::{date_time::emit_secs, hash::blake_hash, pool::XaeroInternalEvent};
-use xaeroflux_actors::{
-    XaeroFlux,
-    read_api::{RangeQuery, ReadApi},
-};
-use xaeroid::XaeroID;
 
-use crate::objects::chat::{CHAT_MESSAGE_EVENT, ChatMessageObject};
-
+// Event type constants matching Swift UI needs
 pub const GROUP_EVENT: u32 = 1;
 pub const WORKSPACE_EVENT: u32 = 2;
 pub const WHITEBOARD_EVENT: u32 = 3;
 pub const STICKY_NOTE_EVENT: u32 = 4;
 pub const SKETCH_EVENT: u32 = 5;
+pub const COMMENT_EVENT: u32 = 6;
+pub const LAYER_EVENT: u32 = 7;
+pub const DRAWING_PATH_EVENT: u32 = 8;
 
 pub const TOMBSTONE_OFFSET: u32 = 1000;
-pub const POST_OFFSET: u32 = 2000;
+pub const UPDATE_OFFSET: u32 = 2000;
+pub const PIN_FLAG: u32 = 0x80000000;
 
-pub const GROUP_TOMBSTONE: u32 = GROUP_EVENT + TOMBSTONE_OFFSET; // 1001
-pub const WORKSPACE_TOMBSTONE: u32 = WORKSPACE_EVENT + TOMBSTONE_OFFSET; // 1002
-pub const WHITEBOARD_TOMBSTONE: u32 = WHITEBOARD_EVENT + TOMBSTONE_OFFSET; // 1003
-pub const STICKY_NOTE_TOMBSTONE: u32 = STICKY_NOTE_EVENT + TOMBSTONE_OFFSET; // 1004
-
-pub static OBJECT_EVENT_BUFFER: OnceLock<RingBuffer<M_TSHIRT_SIZE, M_CAPACITY>> = OnceLock::new();
-pub static WORKSPACE_EVENT_BUFFER: OnceLock<RingBuffer<S_TSHIRT_SIZE, S_CAPACITY>> =
-    OnceLock::new();
-
-pub static GROUP_EVENT_BUFFER: OnceLock<RingBuffer<XS_TSHIRT_SIZE, XS_CAPACITY>> = OnceLock::new();
-
-pub static WORKSPACE_EVENT_BUFFER_READER: OnceLock<Reader<S_TSHIRT_SIZE, S_CAPACITY>> =
-    OnceLock::new();
-pub static WORKSPACE_EVENT_BUFFER_WRITER: OnceLock<Writer<S_TSHIRT_SIZE, S_CAPACITY>> =
-    OnceLock::new();
-
-pub static OBJECT_EVENT_BUFFER_READER: OnceLock<Reader<M_TSHIRT_SIZE, M_CAPACITY>> =
-    OnceLock::new();
-pub static OBJECT_EVENT_BUFFER_WRITER: OnceLock<Writer<M_TSHIRT_SIZE, M_CAPACITY>> =
-    OnceLock::new();
-
-#[repr(C, align(64))]
-#[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
-pub struct Object<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> {
-    pub object_id: [u8; 32],
-    pub workspace_id: [u8; 32],
-    pub group_id: [u8; 32],
-    pub object_type: u8,
-    pub parent_id: [u8; 32],
-    pub child_count: u32,
-    pub version: u32,
-    pub created_at: u64,
-    pub updated_at: u64,
-    pub children: [[u8; 32]; MAX_CHILDREN],
-    pub payload: [u8; PAYLOAD_SIZE], // Raw bytes for payload
-    pub _padding: [u8; 7],           // Adjusted for u8 object_type
-}
-
-unsafe impl<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> Pod
-    for Object<MAX_CHILDREN, PAYLOAD_SIZE>
-{
-}
-unsafe impl<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> Zeroable
-    for Object<MAX_CHILDREN, PAYLOAD_SIZE>
-{
-}
-
-impl<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> Object<MAX_CHILDREN, PAYLOAD_SIZE> {
-    pub fn new(
-        group_id: [u8; 32],
-        workspace_id: [u8; 32],
-        object_id: [u8; 32],
-        parent_id: [u8; 32],
-        object_type: u8,
-        payload: [u8; PAYLOAD_SIZE],
-    ) -> Self {
-        Object {
-            object_id,
-            workspace_id,
-            group_id,
-            object_type,
-            parent_id,
-            child_count: 0,
-            version: 1,
-            created_at: emit_secs(),
-            updated_at: emit_secs(),
-            children: [[0u8; 32]; MAX_CHILDREN],
-            payload,
-            _padding: [0u8; 7],
-        }
-    }
-}
-
-#[repr(C, align(64))]
-#[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
-pub struct Workspace<const MAX_OBJECTS: usize> {
-    pub workspace_id: [u8; 32],
-    pub group_id: [u8; 32],
-    pub object_count: u32,
-    pub version: u32,
-    pub created_at: u64,
-    pub updated_at: u64,
-    pub objects: [[u8; 32]; MAX_OBJECTS],
-    pub _padding: [u8; 8],
-}
-
-unsafe impl<const MAX_OBJECTS: usize> Pod for Workspace<MAX_OBJECTS> {}
-unsafe impl<const MAX_OBJECTS: usize> Zeroable for Workspace<MAX_OBJECTS> {}
-
-impl<const MAX_OBJECTS: usize> Workspace<MAX_OBJECTS> {
-    pub fn new(group_id: [u8; 32], name: String) -> Self {
-        Workspace {
-            workspace_id: blake_hash(name.as_str()),
-            group_id,
-            object_count: 0,
-            version: 1,
-            created_at: emit_secs(),
-            updated_at: emit_secs(),
-            objects: [[0u8; 32]; MAX_OBJECTS],
-            _padding: [0u8; 8],
-        }
-    }
-}
-
+// Group structure matching Swift's GroupNode
 #[repr(C, align(64))]
 #[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
 pub struct Group<const MAX_WORKSPACES: usize> {
     pub group_id: [u8; 32],
     pub parent_id: [u8; 32],
+    pub name: [u8; 64],           // Group name
+    pub icon: [u8; 32],            // Icon name (e.g., "paintbrush")
+    pub color: [u8; 4],            // RGBA color
     pub workspace_count: u32,
     pub version: u32,
     pub created_at: u64,
     pub updated_at: u64,
+    pub created_by: [u8; 32],     // XaeroID of creator
     pub workspaces: [[u8; 32]; MAX_WORKSPACES],
-    pub _padding: [u8; 31],
+    pub _padding: [u8; 23],
 }
 
 unsafe impl<const MAX_WORKSPACES: usize> Pod for Group<MAX_WORKSPACES> {}
 unsafe impl<const MAX_WORKSPACES: usize> Zeroable for Group<MAX_WORKSPACES> {}
 
-impl<const MAX_WORKSPACES: usize> Group<MAX_WORKSPACES> {
-    pub fn new(name: String) -> Self {
-        Group {
-            group_id: blake_hash(name.as_str()),
-            parent_id: [0u8; 32],
-            workspace_count: 0,
-            version: 1,
-            created_at: emit_secs(),
-            updated_at: emit_secs(),
-            workspaces: [[0u8; 32]; MAX_WORKSPACES],
-            _padding: [0u8; 31],
-        }
-    }
+// Workspace structure matching Swift's WorkspaceNode
+#[repr(C, align(64))]
+#[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct Workspace<const MAX_BOARDS: usize> {
+    pub workspace_id: [u8; 32],
+    pub group_id: [u8; 32],
+    pub name: [u8; 64],           // Workspace name
+    pub board_count: u32,
+    pub version: u32,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub created_by: [u8; 32],     // XaeroID of creator
+    pub boards: [[u8; 32]; MAX_BOARDS],  // Board IDs (whiteboards)
+    pub _padding: [u8; 24],
 }
 
-// Helper function to check if event is tombstoned
-pub fn is_tombstone_event(event_type: u32) -> bool {
-    event_type >= TOMBSTONE_OFFSET
+unsafe impl<const MAX_BOARDS: usize> Pod for Workspace<MAX_BOARDS> {}
+unsafe impl<const MAX_BOARDS: usize> Zeroable for Workspace<MAX_BOARDS> {}
+
+// Board/Whiteboard structure matching Swift's BoardNode
+#[repr(C, align(64))]
+#[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct Board<const MAX_FILES: usize> {
+    pub board_id: [u8; 32],
+    pub workspace_id: [u8; 32],
+    pub group_id: [u8; 32],
+    pub name: [u8; 64],
+    pub upvotes: u32,
+    pub comment_count: u32,
+    pub version: u32,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub created_by: [u8; 32],
+    pub last_modified_by: [u8; 32],
+    pub files: [[u8; 32]; MAX_FILES],
+    pub file_count: u32,
+    pub _padding: [u8; 20],
 }
 
+unsafe impl<const MAX_FILES: usize> Pod for Board<MAX_FILES> {}
+unsafe impl<const MAX_FILES: usize> Zeroable for Board<MAX_FILES> {}
+
+// Comment structure for Reddit-style commenting
+#[repr(C, align(64))]
+#[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct Comment<const MAX_TEXT: usize> {
+    pub comment_id: [u8; 32],
+    pub board_id: [u8; 32],       // Which board this comment belongs to
+    pub parent_id: [u8; 32],      // Parent comment for threading
+    pub author_id: [u8; 32],      // XaeroID of author
+    pub author_name: [u8; 64],
+    pub content: [u8; MAX_TEXT],
+    pub upvotes: u32,
+    pub downvotes: u32,
+    pub depth: u8,                 // Reply depth (0 for top-level)
+    pub is_collapsed: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub _padding: [u8; 6],
+}
+
+unsafe impl<const MAX_TEXT: usize> Pod for Comment<MAX_TEXT> {}
+unsafe impl<const MAX_TEXT: usize> Zeroable for Comment<MAX_TEXT> {}
+
+// Layer structure for whiteboard layers
+#[repr(C, align(64))]
+#[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct Layer {
+    pub layer_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub name: [u8; 64],
+    pub visible: bool,
+    pub locked: bool,
+    pub opacity: f32,              // 0.0 to 1.0
+    pub z_index: u32,
+    pub created_at: u64,
+    pub _padding: [u8; 50],
+}
+
+unsafe impl Pod for Layer {}
+unsafe impl Zeroable for Layer {}
+
+// DrawingPath for whiteboard drawings
+#[repr(C, align(64))]
+#[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct DrawingPath<const MAX_POINTS: usize> {
+    pub path_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub layer_id: [u8; 32],
+    pub path_type: u8,             // 0=freehand, 1=rectangle, 2=circle, etc.
+    pub stroke_color: [u8; 4],     // RGBA
+    pub fill_color: [u8; 4],       // RGBA
+    pub stroke_width: f32,
+    pub start_point: [f32; 2],     // x, y
+    pub end_point: [f32; 2],       // x, y
+    pub transform: [f32; 6],       // 2D transform matrix
+    pub point_count: u32,
+    pub points: [[f32; 2]; MAX_POINTS],  // Path points for freehand
+    pub text: [u8; 256],           // For text/sticky notes
+    pub created_at: u64,
+    pub created_by: [u8; 32],
+    pub _padding: [u8; 3],
+}
+
+unsafe impl<const MAX_POINTS: usize> Pod for DrawingPath<MAX_POINTS> {}
+unsafe impl<const MAX_POINTS: usize> Zeroable for DrawingPath<MAX_POINTS> {}
+
+// File attachment for boards
+#[repr(C, align(64))]
+#[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct FileNode {
+    pub file_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub name: [u8; 256],
+    pub file_type: u8,             // 0=image, 1=pdf, 2=text, 3=code, 4=data
+    pub file_size: u64,
+    pub blake_hash: [u8; 32],      // Content hash
+    pub uploaded_by: [u8; 32],
+    pub uploaded_at: u64,
+    pub _padding: [u8; 95],
+}
+
+unsafe impl Pod for FileNode {}
+unsafe impl Zeroable for FileNode {}
+
+// Vote tracking for upvotes/downvotes
+#[repr(C, align(64))]
+#[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct Vote {
+    pub vote_id: [u8; 32],
+    pub target_id: [u8; 32],      // Board or Comment ID
+    pub voter_id: [u8; 32],        // XaeroID of voter
+    pub vote_type: u8,             // 0=upvote, 1=downvote
+    pub created_at: u64,
+    pub _padding: [u8; 55],
+}
+
+unsafe impl Pod for Vote {}
+unsafe impl Zeroable for Vote {}
+
+// Traits for operations
 pub trait GroupOps<const MAX_WORKSPACES: usize> {
     fn create_group(
         &mut self,
-        xaero_id: [u8; 32],
-        name: String,
+        creator_id: [u8; 32],
+        name: &str,
+        icon: &str,
+        color: [u8; 4],
     ) -> Result<Group<MAX_WORKSPACES>, Box<dyn std::error::Error>>;
-    fn delete_group(
+
+    fn update_group(
         &mut self,
-        xaero_id: [u8; 32],
+        group_id: [u8; 32],
+        name: Option<&str>,
+        icon: Option<&str>,
+        color: Option<[u8; 4]>,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    fn tombstone_group(
+        &mut self,
         group_id: [u8; 32],
     ) -> Result<(), Box<dyn std::error::Error>>;
-    fn list_workspaces<const MAX_OBJECTS: usize>(
+
+    fn list_groups(
         &self,
-        xaero_id: [u8; 32],
-        group_id: [u8; 32],
-    ) -> Result<Vec<Workspace<MAX_OBJECTS>>, Box<dyn std::error::Error>>;
+    ) -> Result<Vec<Group<MAX_WORKSPACES>>, Box<dyn std::error::Error>>;
 }
 
-pub trait WorkspaceOps<const MAX_OBJECTS: usize> {
+pub trait WorkspaceOps<const MAX_BOARDS: usize> {
     fn create_workspace(
         &mut self,
-        xaero_id: [u8; 32],
+        creator_id: [u8; 32],
         group_id: [u8; 32],
-        name: String,
-    ) -> Result<Workspace<MAX_OBJECTS>, Box<dyn std::error::Error>>;
-    fn delete_workspace(
+        name: &str,
+    ) -> Result<Workspace<MAX_BOARDS>, Box<dyn std::error::Error>>;
+
+    fn update_workspace(
         &mut self,
-        xaero_id: [u8; 32],
         workspace_id: [u8; 32],
-    ) -> Result<bool, Box<dyn std::error::Error>>;
-    fn list_objects<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize>(
+        name: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    fn tombstone_workspace(
+        &mut self,
+        workspace_id: [u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    fn list_workspaces(
         &self,
-        xaero_id: [u8; 32],
-        workspace_id: [u8; 32],
-    ) -> Result<Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>>, Box<dyn std::error::Error>>;
+        group_id: [u8; 32],
+    ) -> Result<Vec<Workspace<MAX_BOARDS>>, Box<dyn std::error::Error>>;
 }
 
-pub trait ObjectOps<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> {
-    fn create_object(
+pub trait BoardOps<const MAX_FILES: usize> {
+    fn create_board(
         &mut self,
-        name: String,
-        xaero_id: [u8; 32],
-        group_id: [u8; 32],
+        creator_id: [u8; 32],
         workspace_id: [u8; 32],
-        object_id: [u8; 32],
-        parent_id: [u8; 32],
-        payload: [u8; PAYLOAD_SIZE],
-    ) -> Result<Object<MAX_CHILDREN, PAYLOAD_SIZE>, Box<dyn std::error::Error>>;
-    fn delete_object(
+        group_id: [u8; 32],
+        name: &str,
+    ) -> Result<Board<MAX_FILES>, Box<dyn std::error::Error>>;
+
+    fn update_board(
         &mut self,
-        xaero_id: [u8; 32],
-        group_id: [u8; 32],
-        workspace_id: [u8; 32],
-        object_id: [u8; 32],
-    ) -> Result<bool, Box<dyn std::error::Error>>;
-    fn list_children(
+        board_id: [u8; 32],
+        name: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    fn tombstone_board(
+        &mut self,
+        board_id: [u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    fn list_boards(
         &self,
-        xaero_id: [u8; 32],
-        group_id: [u8; 32],
         workspace_id: [u8; 32],
-        object_id: [u8; 32],
-    ) -> Result<Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>>, Box<dyn std::error::Error>>;
+    ) -> Result<Vec<Board<MAX_FILES>>, Box<dyn std::error::Error>>;
 }
 
-pub struct CyanApp {
-    pub xaero_flux: XaeroFlux,
+pub trait CommentOps<const MAX_TEXT: usize> {
+    fn add_comment(
+        &mut self,
+        board_id: [u8; 32],
+        author_id: [u8; 32],
+        author_name: &str,
+        content: &str,
+        parent_id: Option<[u8; 32]>,
+    ) -> Result<Comment<MAX_TEXT>, Box<dyn std::error::Error>>;
+
+    fn upvote_comment(
+        &mut self,
+        comment_id: [u8; 32],
+        voter_id: [u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    fn downvote_comment(
+        &mut self,
+        comment_id: [u8; 32],
+        voter_id: [u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    fn list_comments(
+        &self,
+        board_id: [u8; 32],
+    ) -> Result<Vec<Comment<MAX_TEXT>>, Box<dyn std::error::Error>>;
 }
 
-impl CyanApp {
-    pub fn init(xaero_id: XaeroID) -> Result<CyanApp, Box<dyn std::error::Error>> {
-        WORKSPACE_EVENT_BUFFER_WRITER
-            .get_or_init(|| RingFactory::get_writer(&WORKSPACE_EVENT_BUFFER));
-        OBJECT_EVENT_BUFFER_WRITER.get_or_init(|| RingFactory::get_writer(&OBJECT_EVENT_BUFFER));
-        let mut xaero_flux = XaeroFlux::new();
-        xaero_flux.start_aof()?;
-        xaero_flux.start_p2p(xaero_id)?;
-        Ok(CyanApp { xaero_flux })
-    }
-
-    pub fn send_chat_message(
+pub trait DrawingOps<const MAX_POINTS: usize> {
+    fn add_drawing_path(
         &mut self,
-        object_id: [u8; 32],
-        group_id: [u8; 32],
-        workspace_id: [u8; 32],
-        sender_id: [u8; 32],
-        parent_id: [u8; 32], // parent conversation
-        text: &str,
-        reply_to: Option<[u8; 32]>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let message = ChatMessageObject::new_chat_message(
-            object_id,
-            group_id,
-            workspace_id,
-            sender_id,
-            parent_id,
-            text,
-            reply_to,
-        );
+        board_id: [u8; 32],
+        layer_id: [u8; 32],
+        path: DrawingPath<MAX_POINTS>,
+    ) -> Result<(), Box<dyn std::error::Error>>;
 
-        // Write pinned event (stored permanently)
-        self.xaero_flux.event_bus.write_optimal(
-            bytemuck::bytes_of(&message),
-            CHAT_MESSAGE_EVENT | xaeroflux_core::event::PIN_FLAG,
-        )?;
+    fn update_drawing_path(
+        &mut self,
+        path_id: [u8; 32],
+        transform: Option<[f32; 6]>,
+    ) -> Result<(), Box<dyn std::error::Error>>;
 
-        Ok(())
-    }
+    fn delete_drawing_path(
+        &mut self,
+        path_id: [u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error>>;
 
-    /// TODO: ADD This needs to also have a continuous query running to keep loading chat messagess
-    /// TODO: For now we just get chat_messages via pull.
-    pub fn get_chat_messages(
+    fn list_drawing_paths(
         &self,
-        _xaero_id: [u8; 32],
-        _group_id: [u8; 32],
-        _workspace_id: [u8; 32],
-        _parent_object_id: [u8; 32],
-    ) -> Result<Vec<ChatMessageObject>, Box<dyn std::error::Error>> {
-        // Query from ring buffer + LMDB
-        // Filter by workspace_id
-        // Return sorted by timestamp
-        todo!()
-    }
+        board_id: [u8; 32],
+    ) -> Result<Vec<DrawingPath<MAX_POINTS>>, Box<dyn std::error::Error>>;
 }
 
-impl<const MAX_WORKSPACES: usize> GroupOps<MAX_WORKSPACES> for CyanApp {
-    fn create_group(
+pub trait LayerOps {
+    fn create_layer(
         &mut self,
-        _xaero_id: [u8; 32],
-        name: String,
-    ) -> Result<Group<MAX_WORKSPACES>, Box<dyn Error>> {
-        let g: Group<MAX_WORKSPACES> = Group::new(name);
-        let bytes = bytemuck::bytes_of(&g);
-        (self.xaero_flux.event_bus.write_optimal(bytes, GROUP_EVENT))?;
-        Ok(g)
-    }
+        board_id: [u8; 32],
+        name: &str,
+    ) -> Result<Layer, Box<dyn std::error::Error>>;
 
-    fn delete_group(
+    fn update_layer(
         &mut self,
-        _xaero_id: [u8; 32],
-        group_id: [u8; 32],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.xaero_flux
-            .event_bus
-            .write_optimal(bytes_of(&group_id), GROUP_TOMBSTONE)?;
-        Ok(())
-    }
+        layer_id: [u8; 32],
+        name: Option<&str>,
+        visible: Option<bool>,
+        locked: Option<bool>,
+        opacity: Option<f32>,
+    ) -> Result<(), Box<dyn std::error::Error>>;
 
-    fn list_workspaces<const MAX_OBJECTS: usize>(
+    fn delete_layer(
+        &mut self,
+        layer_id: [u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    fn list_layers(
         &self,
-        xaero_id: [u8; 32],
-        group_id: [u8; 32],
-    ) -> Result<Vec<Workspace<MAX_OBJECTS>>, Box<dyn std::error::Error>> {
-        let mut workspaces_found = Vec::new();
-
-        // Check ring buffer first
-        if let Some(reader) = WORKSPACE_EVENT_BUFFER_READER.get() {
-            let mut reader = reader.clone();
-            while let Some(event) = reader.next() {
-                let workspace = bytemuck::from_bytes::<Workspace<MAX_OBJECTS>>(&event.data);
-                if workspace.group_id == group_id {
-                    workspaces_found.push(*workspace);
-                }
-            }
-        }
-
-        // Query LMDB for additional workspaces
-        let query_results = self.xaero_flux.range_query_with_filter(
-            RangeQuery {
-                xaero_id,
-                event_type: WORKSPACE_EVENT,
-            },
-            Box::new(move |event: &XaeroInternalEvent<MAX_OBJECTS>| {
-                if is_tombstone_event(event.evt.event_type) {
-                    return false;
-                }
-                let workspace_candidate =
-                    bytemuck::from_bytes::<Workspace<MAX_OBJECTS>>(&event.evt.data);
-                workspace_candidate.group_id == group_id
-            }),
-        )?;
-
-        let lmdb_workspaces: Vec<Workspace<MAX_OBJECTS>> = query_results
-            .into_iter()
-            .map(|event| *bytemuck::from_bytes::<Workspace<MAX_OBJECTS>>(&event.evt.data))
-            .collect();
-
-        workspaces_found.extend(lmdb_workspaces);
-        Ok(workspaces_found)
-    }
+        board_id: [u8; 32],
+    ) -> Result<Vec<Layer>, Box<dyn std::error::Error>>;
 }
 
-impl<const MAX_OBJECTS: usize> WorkspaceOps<MAX_OBJECTS> for CyanApp {
-    fn create_workspace(
-        &mut self,
-        _xaero_id: [u8; 32],
-        group_id: [u8; 32],
-        name: String,
-    ) -> Result<Workspace<MAX_OBJECTS>, Box<dyn std::error::Error>> {
-        let workspace: Workspace<MAX_OBJECTS> = Workspace::new(group_id, name);
-        let bytes = bytemuck::bytes_of(&workspace);
-        self.xaero_flux
-            .event_bus
-            .write_optimal(bytes, WORKSPACE_EVENT)?;
-        Ok(workspace)
-    }
-
-    fn delete_workspace(
-        &mut self,
-        _xaero_id: [u8; 32],
-        workspace_id: [u8; 32],
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        self.xaero_flux
-            .event_bus
-            .write_optimal(bytes_of(&workspace_id), WORKSPACE_TOMBSTONE)?;
-        Ok(true)
-    }
-
-    fn list_objects<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize>(
-        &self,
-        xaero_id: [u8; 32],
-        workspace_id: [u8; 32],
-    ) -> Result<Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>>, Box<dyn std::error::Error>> {
-        let mut objects_found = Vec::new();
-
-        // Check ring buffer first
-        if let Some(reader) = OBJECT_EVENT_BUFFER_READER.get() {
-            let mut reader = reader.clone();
-            while let Some(event) = reader.next() {
-                let object =
-                    bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.data);
-                if object.workspace_id == workspace_id {
-                    objects_found.push(*object);
-                }
-            }
-        }
-
-        // Query LMDB for additional objects
-        let query_results = self.xaero_flux.range_query_with_filter(
-            RangeQuery {
-                xaero_id,
-                event_type: WHITEBOARD_EVENT,
-            },
-            Box::new(move |event: &XaeroInternalEvent<MAX_CHILDREN>| {
-                if is_tombstone_event(event.evt.event_type) {
-                    return false;
-                }
-                let object_candidate =
-                    bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.evt.data);
-                object_candidate.workspace_id == workspace_id
-            }),
-        )?;
-
-        let lmdb_objects: Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>> = query_results
-            .into_iter()
-            .map(|event| {
-                *bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.evt.data)
-            })
-            .collect();
-
-        objects_found.extend(lmdb_objects);
-        Ok(objects_found)
-    }
+// Helper functions
+pub fn is_tombstone_event(event_type: u32) -> bool {
+    (event_type & TOMBSTONE_OFFSET) != 0
 }
 
-impl<const MAX_CHILDREN: usize, const PAYLOAD_SIZE: usize> ObjectOps<MAX_CHILDREN, PAYLOAD_SIZE>
-    for CyanApp
-{
-    fn create_object(
-        &mut self,
-        _name: String,
-        _xaero_id: [u8; 32],
-        group_id: [u8; 32],
-        workspace_id: [u8; 32],
-        object_id: [u8; 32],
-        parent_id: [u8; 32],
-        payload: [u8; PAYLOAD_SIZE],
-    ) -> Result<Object<MAX_CHILDREN, PAYLOAD_SIZE>, Box<dyn std::error::Error>> {
-        let object: Object<MAX_CHILDREN, PAYLOAD_SIZE> =
-            Object::new(group_id, workspace_id, object_id, parent_id, 3, payload);
-        let bytes = bytemuck::bytes_of(&object);
-        self.xaero_flux
-            .event_bus
-            .write_optimal(bytes, WHITEBOARD_EVENT)?;
-        Ok(object)
-    }
+pub fn is_update_event(event_type: u32) -> bool {
+    (event_type & UPDATE_OFFSET) != 0
+}
 
-    fn delete_object(
-        &mut self,
-        _xaero_id: [u8; 32],
-        _group_id: [u8; 32],
-        _workspace_id: [u8; 32],
-        object_id: [u8; 32],
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        self.xaero_flux
-            .event_bus
-            .write_optimal(bytes_of(&object_id), WHITEBOARD_TOMBSTONE)?;
-        Ok(true)
-    }
-
-    fn list_children(
-        &self,
-        xaero_id: [u8; 32],
-        group_id: [u8; 32],
-        workspace_id: [u8; 32],
-        object_id: [u8; 32],
-    ) -> Result<Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>>, Box<dyn std::error::Error>> {
-        let mut children_found = Vec::new();
-
-        // Check ring buffer first
-        if let Some(reader) = OBJECT_EVENT_BUFFER_READER.get() {
-            let mut reader = reader.clone();
-            while let Some(event) = reader.next() {
-                let object =
-                    bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.data);
-                if object.parent_id == object_id
-                    && object.workspace_id == workspace_id
-                    && object.group_id == group_id
-                {
-                    children_found.push(*object);
-                }
-            }
-        }
-
-        // Query LMDB for additional child objects
-        let query_results = self.xaero_flux.range_query_with_filter(
-            RangeQuery {
-                xaero_id,
-                event_type: STICKY_NOTE_EVENT,
-            },
-            Box::new(move |event: &XaeroInternalEvent<MAX_CHILDREN>| {
-                if is_tombstone_event(event.evt.event_type) {
-                    return false;
-                }
-                let object_candidate =
-                    bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.evt.data);
-                object_candidate.parent_id == object_id
-                    && object_candidate.workspace_id == workspace_id
-                    && object_candidate.group_id == group_id
-            }),
-        )?;
-
-        let lmdb_children: Vec<Object<MAX_CHILDREN, PAYLOAD_SIZE>> = query_results
-            .into_iter()
-            .map(|event| {
-                *bytemuck::from_bytes::<Object<MAX_CHILDREN, PAYLOAD_SIZE>>(&event.evt.data)
-            })
-            .collect();
-
-        children_found.extend(lmdb_children);
-        Ok(children_found)
-    }
+pub fn is_pinned_event(event_type: u32) -> bool {
+    (event_type & PIN_FLAG) != 0
 }
