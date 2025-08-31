@@ -24,7 +24,7 @@ pub struct CyanHandle {
 // GROUP FFI
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_create_group(
     handle: *mut CyanHandle,
     creator_id: *const u8,
@@ -36,7 +36,7 @@ pub unsafe extern "C" fn cyan_create_group(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_update_group(
     handle: *mut CyanHandle,
     group_id: *const u8,
@@ -47,12 +47,12 @@ pub unsafe extern "C" fn cyan_update_group(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_tombstone_group(handle: *mut CyanHandle, group_id: *const u8) -> i32 {
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_list_groups(
     handle: *const CyanHandle,
     out_groups: *mut Group<32>,
@@ -66,7 +66,7 @@ pub unsafe extern "C" fn cyan_list_groups(
 // WORKSPACE FFI
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_create_workspace(
     handle: *mut CyanHandle,
     creator_id: *const u8,
@@ -77,7 +77,7 @@ pub unsafe extern "C" fn cyan_create_workspace(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_update_workspace(
     handle: *mut CyanHandle,
     workspace_id: *const u8,
@@ -86,7 +86,7 @@ pub unsafe extern "C" fn cyan_update_workspace(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_tombstone_workspace(
     handle: *mut CyanHandle,
     workspace_id: *const u8,
@@ -94,7 +94,7 @@ pub unsafe extern "C" fn cyan_tombstone_workspace(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_list_workspaces(
     handle: *const CyanHandle,
     group_id: *const u8,
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn cyan_list_workspaces(
 // BOARD/WHITEBOARD FFI
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_create_board(
     handle: *mut CyanHandle,
     creator_id: *const u8,
@@ -121,7 +121,7 @@ pub unsafe extern "C" fn cyan_create_board(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_update_board(
     handle: *mut CyanHandle,
     board_id: *const u8,
@@ -130,12 +130,12 @@ pub unsafe extern "C" fn cyan_update_board(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_tombstone_board(handle: *mut CyanHandle, board_id: *const u8) -> i32 {
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_list_boards(
     handle: *const CyanHandle,
     workspace_id: *const u8,
@@ -146,7 +146,7 @@ pub unsafe extern "C" fn cyan_list_boards(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_upvote_board(
     handle: *mut CyanHandle,
     board_id: *const u8,
@@ -159,7 +159,7 @@ pub unsafe extern "C" fn cyan_upvote_board(
 // COMMENT FFI
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_add_comment(
     handle: *mut CyanHandle,
     board_id: *const u8,
@@ -172,7 +172,7 @@ pub unsafe extern "C" fn cyan_add_comment(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_upvote_comment(
     handle: *mut CyanHandle,
     comment_id: *const u8,
@@ -181,7 +181,7 @@ pub unsafe extern "C" fn cyan_upvote_comment(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_downvote_comment(
     handle: *mut CyanHandle,
     comment_id: *const u8,
@@ -190,7 +190,7 @@ pub unsafe extern "C" fn cyan_downvote_comment(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_list_comments(
     handle: *const CyanHandle,
     board_id: *const u8,
@@ -205,7 +205,7 @@ pub unsafe extern "C" fn cyan_list_comments(
 // DRAWING PATH FFI
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_add_drawing_path(
     handle: *mut CyanHandle,
     board_id: *const u8,
@@ -224,7 +224,7 @@ pub unsafe extern "C" fn cyan_add_drawing_path(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_update_drawing_path(
     handle: *mut CyanHandle,
     path_id: *const u8,
@@ -233,7 +233,7 @@ pub unsafe extern "C" fn cyan_update_drawing_path(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_delete_drawing_path(
     handle: *mut CyanHandle,
     path_id: *const u8,
@@ -241,7 +241,7 @@ pub unsafe extern "C" fn cyan_delete_drawing_path(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_list_drawing_paths(
     handle: *const CyanHandle,
     board_id: *const u8,
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn cyan_list_drawing_paths(
 // LAYER FFI
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_create_layer(
     handle: *mut CyanHandle,
     board_id: *const u8,
@@ -266,7 +266,7 @@ pub unsafe extern "C" fn cyan_create_layer(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_update_layer(
     handle: *mut CyanHandle,
     layer_id: *const u8,
@@ -278,12 +278,12 @@ pub unsafe extern "C" fn cyan_update_layer(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_delete_layer(handle: *mut CyanHandle, layer_id: *const u8) -> i32 {
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_list_layers(
     handle: *const CyanHandle,
     board_id: *const u8,
@@ -298,7 +298,7 @@ pub unsafe extern "C" fn cyan_list_layers(
 // FILE ATTACHMENT FFI
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_attach_file(
     handle: *mut CyanHandle,
     board_id: *const u8,
@@ -312,7 +312,7 @@ pub unsafe extern "C" fn cyan_attach_file(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_list_files(
     handle: *const CyanHandle,
     board_id: *const u8,
@@ -323,7 +323,7 @@ pub unsafe extern "C" fn cyan_list_files(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_delete_file(handle: *mut CyanHandle, file_id: *const u8) -> i32 {
     todo!()
 }
@@ -332,7 +332,7 @@ pub unsafe extern "C" fn cyan_delete_file(handle: *mut CyanHandle, file_id: *con
 // INITIALIZATION & CLEANUP
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_init(
     xaero_id: *const u8,
     data_dir: *const c_char,
@@ -340,7 +340,7 @@ pub unsafe extern "C" fn cyan_init(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_shutdown(handle: *mut CyanHandle) -> i32 {
     todo!()
 }
@@ -349,7 +349,7 @@ pub unsafe extern "C" fn cyan_shutdown(handle: *mut CyanHandle) -> i32 {
 // SYNC & EVENTS
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_poll_events(
     handle: *const CyanHandle,
     out_events: *mut u8,
@@ -359,7 +359,7 @@ pub unsafe extern "C" fn cyan_poll_events(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_sync_p2p(handle: *mut CyanHandle) -> i32 {
     todo!()
 }
@@ -368,7 +368,7 @@ pub unsafe extern "C" fn cyan_sync_p2p(handle: *mut CyanHandle) -> i32 {
 // QUERY & SEARCH
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_search_boards(
     handle: *const CyanHandle,
     query: *const c_char,
@@ -379,7 +379,7 @@ pub unsafe extern "C" fn cyan_search_boards(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_get_board_by_id(
     handle: *const CyanHandle,
     board_id: *const u8,
@@ -392,7 +392,7 @@ pub unsafe extern "C" fn cyan_get_board_by_id(
 // MATERIALIZED STATE
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_get_current_state(
     handle: *const CyanHandle,
     out_state: *mut u8,
@@ -401,7 +401,7 @@ pub unsafe extern "C" fn cyan_get_current_state(
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_trigger_materialization(handle: *mut CyanHandle) -> i32 {
     todo!()
 }
@@ -410,7 +410,7 @@ pub unsafe extern "C" fn cyan_trigger_materialization(handle: *mut CyanHandle) -
 // ERROR HANDLING
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_get_last_error(
     handle: *const CyanHandle,
     out_error: *mut c_char,
@@ -423,12 +423,12 @@ pub unsafe extern "C" fn cyan_get_last_error(
 // MEMORY MANAGEMENT HELPERS
 // ================================================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_free_string(s: *mut c_char) {
     todo!()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cyan_free_buffer(buffer: *mut u8, size: usize) {
     todo!()
 }
