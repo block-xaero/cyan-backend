@@ -1,5 +1,6 @@
 // lib.rs - Updated with full parity to Swift UI
 
+mod ffi;
 mod objects;
 
 use bytemuck::{Pod, Zeroable};
