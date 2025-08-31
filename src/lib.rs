@@ -25,14 +25,14 @@ pub const PIN_FLAG: u32 = 0x80000000;
 pub struct Group<const MAX_WORKSPACES: usize> {
     pub group_id: [u8; 32],
     pub parent_id: [u8; 32],
-    pub name: [u8; 64],           // Group name
-    pub icon: [u8; 32],            // Icon name (e.g., "paintbrush")
-    pub color: [u8; 4],            // RGBA color
+    pub name: [u8; 64], // Group name
+    pub icon: [u8; 32], // Icon name (e.g., "paintbrush")
+    pub color: [u8; 4], // RGBA color
     pub workspace_count: u32,
     pub version: u32,
     pub created_at: u64,
     pub updated_at: u64,
-    pub created_by: [u8; 32],     // XaeroID of creator
+    pub created_by: [u8; 32], // XaeroID of creator
     pub workspaces: [[u8; 32]; MAX_WORKSPACES],
     pub _padding: [u8; 23],
 }
@@ -46,13 +46,13 @@ unsafe impl<const MAX_WORKSPACES: usize> Zeroable for Group<MAX_WORKSPACES> {}
 pub struct Workspace<const MAX_BOARDS: usize> {
     pub workspace_id: [u8; 32],
     pub group_id: [u8; 32],
-    pub name: [u8; 64],           // Workspace name
+    pub name: [u8; 64], // Workspace name
     pub board_count: u32,
     pub version: u32,
     pub created_at: u64,
     pub updated_at: u64,
-    pub created_by: [u8; 32],     // XaeroID of creator
-    pub boards: [[u8; 32]; MAX_BOARDS],  // Board IDs (whiteboards)
+    pub created_by: [u8; 32],           // XaeroID of creator
+    pub boards: [[u8; 32]; MAX_BOARDS], // Board IDs (whiteboards)
     pub _padding: [u8; 24],
 }
 
@@ -87,14 +87,14 @@ unsafe impl<const MAX_FILES: usize> Zeroable for Board<MAX_FILES> {}
 #[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
 pub struct Comment<const MAX_TEXT: usize> {
     pub comment_id: [u8; 32],
-    pub board_id: [u8; 32],       // Which board this comment belongs to
-    pub parent_id: [u8; 32],      // Parent comment for threading
-    pub author_id: [u8; 32],      // XaeroID of author
+    pub board_id: [u8; 32],  // Which board this comment belongs to
+    pub parent_id: [u8; 32], // Parent comment for threading
+    pub author_id: [u8; 32], // XaeroID of author
     pub author_name: [u8; 64],
     pub content: [u8; MAX_TEXT],
     pub upvotes: u32,
     pub downvotes: u32,
-    pub depth: u8,                 // Reply depth (0 for top-level)
+    pub depth: u8, // Reply depth (0 for top-level)
     pub is_collapsed: bool,
     pub created_at: u64,
     pub updated_at: u64,
@@ -113,7 +113,7 @@ pub struct Layer {
     pub name: [u8; 64],
     pub visible: bool,
     pub locked: bool,
-    pub opacity: f32,              // 0.0 to 1.0
+    pub opacity: f32, // 0.0 to 1.0
     pub z_index: u32,
     pub created_at: u64,
     pub _padding: [u8; 50],
@@ -129,16 +129,16 @@ pub struct DrawingPath<const MAX_POINTS: usize> {
     pub path_id: [u8; 32],
     pub board_id: [u8; 32],
     pub layer_id: [u8; 32],
-    pub path_type: u8,             // 0=freehand, 1=rectangle, 2=circle, etc.
-    pub stroke_color: [u8; 4],     // RGBA
-    pub fill_color: [u8; 4],       // RGBA
+    pub path_type: u8,         // 0=freehand, 1=rectangle, 2=circle, etc.
+    pub stroke_color: [u8; 4], // RGBA
+    pub fill_color: [u8; 4],   // RGBA
     pub stroke_width: f32,
-    pub start_point: [f32; 2],     // x, y
-    pub end_point: [f32; 2],       // x, y
-    pub transform: [f32; 6],       // 2D transform matrix
+    pub start_point: [f32; 2], // x, y
+    pub end_point: [f32; 2],   // x, y
+    pub transform: [f32; 6],   // 2D transform matrix
     pub point_count: u32,
-    pub points: [[f32; 2]; MAX_POINTS],  // Path points for freehand
-    pub text: [u8; 256],           // For text/sticky notes
+    pub points: [[f32; 2]; MAX_POINTS], // Path points for freehand
+    pub text: [u8; 256],                // For text/sticky notes
     pub created_at: u64,
     pub created_by: [u8; 32],
     pub _padding: [u8; 3],
@@ -154,9 +154,9 @@ pub struct FileNode {
     pub file_id: [u8; 32],
     pub board_id: [u8; 32],
     pub name: [u8; 256],
-    pub file_type: u8,             // 0=image, 1=pdf, 2=text, 3=code, 4=data
+    pub file_type: u8, // 0=image, 1=pdf, 2=text, 3=code, 4=data
     pub file_size: u64,
-    pub blake_hash: [u8; 32],      // Content hash
+    pub blake_hash: [u8; 32], // Content hash
     pub uploaded_by: [u8; 32],
     pub uploaded_at: u64,
     pub _padding: [u8; 95],
@@ -170,9 +170,9 @@ unsafe impl Zeroable for FileNode {}
 #[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
 pub struct Vote {
     pub vote_id: [u8; 32],
-    pub target_id: [u8; 32],      // Board or Comment ID
-    pub voter_id: [u8; 32],        // XaeroID of voter
-    pub vote_type: u8,             // 0=upvote, 1=downvote
+    pub target_id: [u8; 32], // Board or Comment ID
+    pub voter_id: [u8; 32],  // XaeroID of voter
+    pub vote_type: u8,       // 0=upvote, 1=downvote
     pub created_at: u64,
     pub _padding: [u8; 55],
 }
@@ -198,14 +198,9 @@ pub trait GroupOps<const MAX_WORKSPACES: usize> {
         color: Option<[u8; 4]>,
     ) -> Result<(), Box<dyn std::error::Error>>;
 
-    fn tombstone_group(
-        &mut self,
-        group_id: [u8; 32],
-    ) -> Result<(), Box<dyn std::error::Error>>;
+    fn tombstone_group(&mut self, group_id: [u8; 32]) -> Result<(), Box<dyn std::error::Error>>;
 
-    fn list_groups(
-        &self,
-    ) -> Result<Vec<Group<MAX_WORKSPACES>>, Box<dyn std::error::Error>>;
+    fn list_groups(&self) -> Result<Vec<Group<MAX_WORKSPACES>>, Box<dyn std::error::Error>>;
 }
 
 pub trait WorkspaceOps<const MAX_BOARDS: usize> {
@@ -248,10 +243,7 @@ pub trait BoardOps<const MAX_FILES: usize> {
         name: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>>;
 
-    fn tombstone_board(
-        &mut self,
-        board_id: [u8; 32],
-    ) -> Result<(), Box<dyn std::error::Error>>;
+    fn tombstone_board(&mut self, board_id: [u8; 32]) -> Result<(), Box<dyn std::error::Error>>;
 
     fn list_boards(
         &self,
@@ -301,10 +293,7 @@ pub trait DrawingOps<const MAX_POINTS: usize> {
         transform: Option<[f32; 6]>,
     ) -> Result<(), Box<dyn std::error::Error>>;
 
-    fn delete_drawing_path(
-        &mut self,
-        path_id: [u8; 32],
-    ) -> Result<(), Box<dyn std::error::Error>>;
+    fn delete_drawing_path(&mut self, path_id: [u8; 32]) -> Result<(), Box<dyn std::error::Error>>;
 
     fn list_drawing_paths(
         &self,
@@ -328,15 +317,9 @@ pub trait LayerOps {
         opacity: Option<f32>,
     ) -> Result<(), Box<dyn std::error::Error>>;
 
-    fn delete_layer(
-        &mut self,
-        layer_id: [u8; 32],
-    ) -> Result<(), Box<dyn std::error::Error>>;
+    fn delete_layer(&mut self, layer_id: [u8; 32]) -> Result<(), Box<dyn std::error::Error>>;
 
-    fn list_layers(
-        &self,
-        board_id: [u8; 32],
-    ) -> Result<Vec<Layer>, Box<dyn std::error::Error>>;
+    fn list_layers(&self, board_id: [u8; 32]) -> Result<Vec<Layer>, Box<dyn std::error::Error>>;
 }
 
 // Helper functions

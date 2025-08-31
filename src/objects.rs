@@ -55,18 +55,18 @@ pub struct PathData<const MAX_POINTS: usize> {
     pub board_id: [u8; 32],
     pub layer_index: u32,
     pub path_type: u8,
-    pub stencil_type: u8,              // Only used if path_type is STENCIL
-    pub stroke_color: [u8; 4],         // RGBA
-    pub fill_color: [u8; 4],           // RGBA
+    pub stencil_type: u8,      // Only used if path_type is STENCIL
+    pub stroke_color: [u8; 4], // RGBA
+    pub fill_color: [u8; 4],   // RGBA
     pub stroke_width: f32,
-    pub start_point: [f32; 2],         // x, y
-    pub end_point: [f32; 2],           // x, y
-    pub transform: [f32; 2],           // Translation x, y
-    pub text: [u8; 256],               // For text/sticky/math content
+    pub start_point: [f32; 2], // x, y
+    pub end_point: [f32; 2],   // x, y
+    pub transform: [f32; 2],   // Translation x, y
+    pub text: [u8; 256],       // For text/sticky/math content
     pub point_count: u32,
     pub points: [[f32; 2]; MAX_POINTS], // For freehand paths
     pub created_at: u64,
-    pub created_by: [u8; 32],          // XaeroID
+    pub created_by: [u8; 32], // XaeroID
     pub _padding: [u8; 2],
 }
 
@@ -85,9 +85,9 @@ pub struct LayerData {
     pub name: [u8; 64],
     pub visible: bool,
     pub locked: bool,
-    pub opacity: f32,                  // 0.0 to 1.0
+    pub opacity: f32, // 0.0 to 1.0
     pub z_index: u32,
-    pub object_count: u32,             // Number of objects in this layer
+    pub object_count: u32, // Number of objects in this layer
     pub created_at: u64,
     pub _padding: [u8; 42],
 }
@@ -139,10 +139,10 @@ pub struct StickyNoteData {
     pub height: f32,
     pub rotation: f32,
     pub z_index: u32,
-    pub background_color: [u8; 4],     // Default yellow
-    pub text_color: [u8; 4],           // Default black
+    pub background_color: [u8; 4], // Default yellow
+    pub text_color: [u8; 4],       // Default black
     pub font_size: u16,
-    pub text: [u8; 400],               // Note content
+    pub text: [u8; 400], // Note content
     pub created_at: u64,
     pub created_by: [u8; 32],
     pub _padding: [u8; 6],
@@ -164,8 +164,8 @@ pub struct TextBoxData {
     pub y: f32,
     pub text_color: [u8; 4],
     pub font_size: u16,
-    pub font_weight: u8,                // 0=normal, 1=bold
-    pub text_align: u8,                 // 0=left, 1=center, 2=right
+    pub font_weight: u8, // 0=normal, 1=bold
+    pub text_align: u8,  // 0=left, 1=center, 2=right
     pub text: [u8; 256],
     pub created_at: u64,
     pub created_by: [u8; 32],
@@ -186,7 +186,7 @@ pub struct MathSymbolData {
     pub board_id: [u8; 32],
     pub x: f32,
     pub y: f32,
-    pub symbol: [u8; 8],                // UTF-8 encoded math symbol
+    pub symbol: [u8; 8], // UTF-8 encoded math symbol
     pub font_size: u16,
     pub color: [u8; 4],
     pub created_at: u64,
@@ -271,15 +271,15 @@ unsafe impl Zeroable for ArrowData {}
 pub struct CommentData {
     pub comment_id: [u8; 32],
     pub board_id: [u8; 32],
-    pub parent_id: [u8; 32],           // For threading (0 if top-level)
-    pub author_id: [u8; 32],           // XaeroID
+    pub parent_id: [u8; 32], // For threading (0 if top-level)
+    pub author_id: [u8; 32], // XaeroID
     pub author_name: [u8; 64],
     pub content: [u8; 500],
     pub upvotes: u32,
     pub downvotes: u32,
-    pub depth: u8,                     // Reply depth
+    pub depth: u8, // Reply depth
     pub is_collapsed: bool,
-    pub has_upvoted: bool,             // Current user's vote state
+    pub has_upvoted: bool, // Current user's vote state
     pub has_downvoted: bool,
     pub created_at: u64,
     pub _padding: [u8; 16],
@@ -298,11 +298,11 @@ pub struct FileAttachmentData {
     pub file_id: [u8; 32],
     pub board_id: [u8; 32],
     pub name: [u8; 256],
-    pub file_type: u8,                 // 0=image, 1=pdf, 2=text, 3=code, 4=data
+    pub file_type: u8, // 0=image, 1=pdf, 2=text, 3=code, 4=data
     pub file_size: u64,
-    pub blake_hash: [u8; 32],          // Content hash
-    pub color: [u8; 4],                // Display color based on type
-    pub icon: [u8; 32],                // Icon name for display
+    pub blake_hash: [u8; 32], // Content hash
+    pub color: [u8; 4],       // Display color based on type
+    pub icon: [u8; 32],       // Icon name for display
     pub uploaded_by: [u8; 32],
     pub uploaded_at: u64,
     pub _padding: [u8; 59],
@@ -325,7 +325,7 @@ pub struct UserCursorData {
     pub cursor_color: [u8; 4],
     pub user_name: [u8; 64],
     pub is_active: bool,
-    pub current_tool: u8,              // Canvas mode
+    pub current_tool: u8, // Canvas mode
     pub last_seen: u64,
     pub _padding: [u8; 106],
 }
@@ -359,7 +359,7 @@ pub struct GraphData {
     pub y: f32,
     pub width: f32,
     pub height: f32,
-    pub equation: [u8; 128],           // Math equation string
+    pub equation: [u8; 128], // Math equation string
     pub color: [u8; 4],
     pub created_at: u64,
     pub created_by: [u8; 32],
