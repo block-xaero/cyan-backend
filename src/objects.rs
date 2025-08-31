@@ -1,68 +1,109 @@
-// Object data types sized to fit different payload sizes
+// objects.rs - Updated with parity to Swift WhiteboardView
 
 use bytemuck::{Pod, Zeroable};
-use rusted_ring::{L_TSHIRT_SIZE, M_TSHIRT_SIZE, S_TSHIRT_SIZE, XL_TSHIRT_SIZE};
-
-use crate::objects::file::FileAttachmentData;
-// ================================================================================================
-// OBJECT TYPE CONSTANTS
-// ================================================================================================
-
-pub const WHITEBOARD_TYPE: u8 = 1;
-pub const STICKY_NOTE_TYPE: u8 = 2;
-pub const SKETCH_TYPE: u8 = 3;
-pub const TEXT_BOX_TYPE: u8 = 7;
-pub const TEXT_LABEL_TYPE: u8 = 8;
-pub const RECTANGLE_TYPE: u8 = 9;
-pub const CIRCLE_TYPE: u8 = 10;
-pub const CONNECTOR_TYPE: u8 = 11;
-pub const CHAT_MESSAGE_TYPE: u8 = 12;
-pub const FILE_ATTACHMENT_TYPE: u8 = 13;
-pub const IMAGE_TYPE: u8 = 14;
-pub const EXCEL_EMBED_TYPE: u8 = 15;
-pub const POWERPOINT_SLIDE_TYPE: u8 = 16;
-pub const USER_CURSOR_TYPE: u8 = 17;
-pub const SELECTION_BOX_TYPE: u8 = 18;
 
 // ================================================================================================
-// OBJECT DATA TYPES (WHAT GOES IN THE PAYLOAD FIELD)
+// CANVAS MODE TYPES (matching Swift's CanvasMode enum)
 // ================================================================================================
 
-#[repr(C)]
+pub const CANVAS_MODE_SELECT: u8 = 0;
+pub const CANVAS_MODE_DRAW: u8 = 1;
+pub const CANVAS_MODE_RECTANGLE: u8 = 2;
+pub const CANVAS_MODE_CIRCLE: u8 = 3;
+pub const CANVAS_MODE_ARROW: u8 = 4;
+pub const CANVAS_MODE_ERASER: u8 = 5;
+pub const CANVAS_MODE_TEXT: u8 = 6;
+pub const CANVAS_MODE_STICKY: u8 = 7;
+pub const CANVAS_MODE_MATH_SYMBOL: u8 = 8;
+pub const CANVAS_MODE_FRACTION: u8 = 9;
+pub const CANVAS_MODE_GRAPH: u8 = 10;
+pub const CANVAS_MODE_STENCIL: u8 = 11;
+
+// ================================================================================================
+// PATH TYPES (matching Swift's PathType enum)
+// ================================================================================================
+
+pub const PATH_TYPE_FREEHAND: u8 = 0;
+pub const PATH_TYPE_RECTANGLE: u8 = 1;
+pub const PATH_TYPE_CIRCLE: u8 = 2;
+pub const PATH_TYPE_ARROW: u8 = 3;
+pub const PATH_TYPE_TEXT: u8 = 4;
+pub const PATH_TYPE_STICKY: u8 = 5;
+pub const PATH_TYPE_MATH_SYMBOL: u8 = 6;
+pub const PATH_TYPE_FRACTION: u8 = 7;
+pub const PATH_TYPE_STENCIL: u8 = 8;
+
+// ================================================================================================
+// STENCIL TYPES (matching Swift's StencilType enum)
+// ================================================================================================
+
+pub const STENCIL_FLOWCHART_BOX: u8 = 0;
+pub const STENCIL_FLOWCHART_DIAMOND: u8 = 1;
+pub const STENCIL_FLOWCHART_CIRCLE: u8 = 2;
+pub const STENCIL_CLOUD_BUBBLE: u8 = 3;
+pub const STENCIL_STAR: u8 = 4;
+pub const STENCIL_HEXAGON: u8 = 5;
+
+// ================================================================================================
+// DRAWING PATH DATA (matching Swift's DrawnPath)
+// ================================================================================================
+
+#[repr(C, align(64))]
 #[derive(Copy, Clone, Debug)]
-pub struct StickyNoteData {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-    pub rotation: f32,
-    pub z_index: u16,
-    pub background_color: [u8; 4],
-    pub text_color: [u8; 4],
-    pub font_size: u16,
-    pub text: [u8; 60], // Fits in 96-byte payload
-    pub _padding: [u8; 6],
-}
-unsafe impl Pod for StickyNoteData {}
-unsafe impl Zeroable for StickyNoteData {}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct SketchData {
-    pub stroke_color: [u8; 4],
+pub struct PathData<const MAX_POINTS: usize> {
+    pub path_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub layer_index: u32,
+    pub path_type: u8,
+    pub stencil_type: u8,              // Only used if path_type is STENCIL
+    pub stroke_color: [u8; 4],         // RGBA
+    pub fill_color: [u8; 4],           // RGBA
     pub stroke_width: f32,
+    pub start_point: [f32; 2],         // x, y
+    pub end_point: [f32; 2],           // x, y
+    pub transform: [f32; 2],           // Translation x, y
+    pub text: [u8; 256],               // For text/sticky/math content
     pub point_count: u32,
-    pub points: [(f32, f32); 60],
-    pub bounding_box: (f32, f32, f32, f32),
-    pub _padding: [u8; 4],
+    pub points: [[f32; 2]; MAX_POINTS], // For freehand paths
+    pub created_at: u64,
+    pub created_by: [u8; 32],          // XaeroID
+    pub _padding: [u8; 2],
 }
-unsafe impl Pod for SketchData {}
-unsafe impl Zeroable for SketchData {}
 
-#[repr(C)]
+unsafe impl<const MAX_POINTS: usize> Pod for PathData<MAX_POINTS> {}
+unsafe impl<const MAX_POINTS: usize> Zeroable for PathData<MAX_POINTS> {}
+
+// ================================================================================================
+// LAYER DATA (matching Swift's CanvasLayer)
+// ================================================================================================
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct LayerData {
+    pub layer_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub name: [u8; 64],
+    pub visible: bool,
+    pub locked: bool,
+    pub opacity: f32,                  // 0.0 to 1.0
+    pub z_index: u32,
+    pub object_count: u32,             // Number of objects in this layer
+    pub created_at: u64,
+    pub _padding: [u8; 42],
+}
+
+unsafe impl Pod for LayerData {}
+unsafe impl Zeroable for LayerData {}
+
+// ================================================================================================
+// WHITEBOARD DATA (matching Swift's WhiteboardView state)
+// ================================================================================================
+
+#[repr(C, align(64))]
 #[derive(Copy, Clone, Debug)]
 pub struct WhiteboardData {
-    pub title: [u8; 64],
+    pub board_id: [u8; 32],
+    pub title: [u8; 128],
     pub canvas_width: f32,
     pub canvas_height: f32,
     pub background_color: [u8; 4],
@@ -70,276 +111,260 @@ pub struct WhiteboardData {
     pub pan_x: f32,
     pub pan_y: f32,
     pub grid_enabled: bool,
+    pub grid_size: f32,
+    pub current_layer: u32,
+    pub total_layers: u32,
+    pub total_objects: u32,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub created_by: [u8; 32],
     pub _padding: [u8; 39],
 }
+
 unsafe impl Pod for WhiteboardData {}
 unsafe impl Zeroable for WhiteboardData {}
 
-#[repr(C)]
+// ================================================================================================
+// STICKY NOTE DATA (matching Swift's sticky note functionality)
+// ================================================================================================
+
+#[repr(C, align(64))]
 #[derive(Copy, Clone, Debug)]
-pub struct TextBoxData {
+pub struct StickyNoteData {
+    pub note_id: [u8; 32],
+    pub board_id: [u8; 32],
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
     pub rotation: f32,
-    pub z_index: u16,
-    pub text_color: [u8; 4],
-    pub background_color: [u8; 4],
-    pub border_color: [u8; 4],
+    pub z_index: u32,
+    pub background_color: [u8; 4],     // Default yellow
+    pub text_color: [u8; 4],           // Default black
     pub font_size: u16,
-    pub font_weight: u8, // 0=normal, 1=bold
-    pub text_align: u8,  // 0=left, 1=center, 2=right
-    pub text: [u8; 200], // Medium text capacity
-    pub _padding: [u8; 18],
+    pub text: [u8; 400],               // Note content
+    pub created_at: u64,
+    pub created_by: [u8; 32],
+    pub _padding: [u8; 6],
 }
+
+unsafe impl Pod for StickyNoteData {}
+unsafe impl Zeroable for StickyNoteData {}
+
+// ================================================================================================
+// TEXT BOX DATA (matching Swift's text functionality)
+// ================================================================================================
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct TextBoxData {
+    pub text_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub x: f32,
+    pub y: f32,
+    pub text_color: [u8; 4],
+    pub font_size: u16,
+    pub font_weight: u8,                // 0=normal, 1=bold
+    pub text_align: u8,                 // 0=left, 1=center, 2=right
+    pub text: [u8; 256],
+    pub created_at: u64,
+    pub created_by: [u8; 32],
+    pub _padding: [u8; 92],
+}
+
 unsafe impl Pod for TextBoxData {}
 unsafe impl Zeroable for TextBoxData {}
 
-/// Shape stuff
-pub mod shape {
-    use bytemuck::{Pod, Zeroable};
-
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug)]
-    pub struct RectangleData {
-        pub x: f32,
-        pub y: f32,
-        pub width: f32,
-        pub height: f32,
-        pub rotation: f32,
-        pub z_index: u16,
-        pub fill_color: [u8; 4],
-        pub border_color: [u8; 4],
-        pub border_width: f32,
-        pub corner_radius: f32,
-        pub label_text: [u8; 32],
-        pub _padding: [u8; 14],
-    }
-    unsafe impl Pod for RectangleData {}
-    unsafe impl Zeroable for RectangleData {}
-
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug)]
-    pub struct CircleData {
-        pub center_x: f32,
-        pub center_y: f32,
-        pub radius: f32,
-        pub z_index: u16,
-        pub fill_color: [u8; 4],
-        pub border_color: [u8; 4],
-        pub border_width: f32,
-        pub label_text: [u8; 32],
-        pub _padding: [u8; 18],
-    }
-    unsafe impl Pod for CircleData {}
-    unsafe impl Zeroable for CircleData {}
-
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug)]
-    pub struct ConnectorData {
-        pub from_object_id: [u8; 32],
-        pub to_object_id: [u8; 32],
-        pub from_point: (f32, f32),
-        pub to_point: (f32, f32),
-        pub control_points: [(f32, f32); 2], // For curved lines
-        pub line_color: [u8; 4],
-        pub line_width: f32,
-        pub arrow_start: bool,
-        pub arrow_end: bool,
-        pub line_style: u8, // 0=solid, 1=dashed, 2=dotted
-        pub _padding: [u8; 7],
-    }
-    unsafe impl Pod for ConnectorData {}
-    unsafe impl Zeroable for ConnectorData {}
-}
-
-/// chat messages
-pub mod chat {
-    use bytemuck::{Pod, Zeroable};
-    use xaeroflux::date_time::emit_secs;
-
-    use crate::{Object, TOMBSTONE_OFFSET};
-
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug)]
-    pub struct ChatMessageData {
-        pub message_id: [u8; 32],
-        pub sender_id: [u8; 32],    // XaeroID of sender
-        pub workspace_id: [u8; 32], // Workspace
-        pub timestamp: u64,
-        pub message_type: u8,        // 0=text, 1=system, 2=attachment
-        pub reply_to: [u8; 32],      // ID of message being replied to (0 if none)
-        pub message_text: [u8; 400], // Main message content
-        pub _padding: [u8; 107],
-    }
-    unsafe impl Pod for ChatMessageData {}
-    unsafe impl Zeroable for ChatMessageData {}
-
-    pub const CHAT_MESSAGE_EVENT: u32 = 12;
-    pub const CHAT_MESSAGE_TOMBSTONE: u32 = CHAT_MESSAGE_EVENT + TOMBSTONE_OFFSET;
-    pub type ChatMessageObject = Object<0, 500>;
-
-    impl ChatMessageObject {
-        pub fn new_chat_message(
-            object_id: [u8; 32],
-            group_id: [u8; 32],
-            workspace_id: [u8; 32],
-            xaero_id: [u8; 32],
-            parent_id: [u8; 32], // parent conversation
-            message_text: &str,
-            reply_to: Option<[u8; 32]>,
-        ) -> Self {
-            ChatMessageObject {
-                object_id,
-                workspace_id,
-                group_id,
-                object_type: 0,
-                parent_id,
-                child_count: 0,
-                version: 0,
-                created_at: emit_secs(),
-                updated_at: emit_secs(),
-                children: [],
-                payload: message_text.as_bytes()[..message_text.len()]
-                    .try_into()
-                    .expect("message text is too long"),
-                _padding: [0u8; 7],
-            }
-        }
-    }
-}
-
-pub mod file {
-    use bytemuck::{Pod, Zeroable};
-
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug)]
-    pub struct FileAttachmentData {
-        pub file_id: [u8; 32],
-        pub workspace_id: [u8; 32],
-        pub uploaded_by: [u8; 32],
-        pub x: f32,
-        pub y: f32,
-        pub width: f32,
-        pub height: f32,
-        pub rotation: f32,
-        pub z_index: u16,
-        pub file_type: u8,        // 0=image, 1=pdf, 2=excel, 3=powerpoint, 4=video
-        pub file_size: u64,       // Size in bytes
-        pub file_name: [u8; 128], // Original filename
-        pub file_hash: [u8; 32],  // Blake3 hash of file contents
-        pub thumbnail_data: [u8; 4096], // Small preview image
-        pub metadata: [u8; 11776], // File-specific metadata
-        pub _padding: [u8; 96],
-    }
-    unsafe impl Pod for FileAttachmentData {}
-    unsafe impl Zeroable for FileAttachmentData {}
-
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug)]
-    pub struct ImageData {
-        pub image_id: [u8; 32],
-        pub x: f32,
-        pub y: f32,
-        pub width: f32,
-        pub height: f32,
-        pub rotation: f32,
-        pub z_index: u16,
-        pub opacity: u8,
-        pub image_hash: [u8; 32], // Points to blob storage
-        pub original_width: u32,
-        pub original_height: u32,
-        pub image_format: u8,      // 0=png, 1=jpg, 2=gif, 3=svg
-        pub thumbnail: [u8; 8192], // Small preview
-        pub alt_text: [u8; 128],   // Accessibility
-        pub _padding: [u8; 7979],
-    }
-    unsafe impl Pod for ImageData {}
-    unsafe impl Zeroable for ImageData {}
-
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug)]
-    pub struct ExcelEmbedData {
-        pub embed_id: [u8; 32],
-        pub file_hash: [u8; 32],
-        pub x: f32,
-        pub y: f32,
-        pub width: f32,
-        pub height: f32,
-        pub z_index: u16,
-        pub sheet_name: [u8; 64],
-        pub cell_range: [u8; 32],        // e.g., "A1:D10"
-        pub worksheet_data: [u8; 15872], // Subset of spreadsheet data
-        pub formula_cache: [u8; 256],    // Cached calculations
-        pub _padding: [u8; 78],
-    }
-    unsafe impl Pod for ExcelEmbedData {}
-    unsafe impl Zeroable for ExcelEmbedData {}
-
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug)]
-    pub struct PowerPointSlideData {
-        pub slide_id: [u8; 32],
-        pub presentation_hash: [u8; 32],
-        pub x: f32,
-        pub y: f32,
-        pub width: f32,
-        pub height: f32,
-        pub z_index: u16,
-        pub slide_number: u32,
-        pub slide_title: [u8; 128],
-        pub slide_thumbnail: [u8; 8192], // Preview image
-        pub slide_notes: [u8; 512],      // Speaker notes
-        pub animation_data: [u8; 7168],  // Slide animations
-        pub _padding: [u8; 78],
-    }
-    unsafe impl Pod for PowerPointSlideData {}
-    unsafe impl Zeroable for PowerPointSlideData {}
-}
-
-pub mod user_presence {
-    use bytemuck::{Pod, Zeroable};
-
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug)]
-    pub struct UserCursorData {
-        pub user_id: [u8; 32],
-        pub cursor_x: f32,
-        pub cursor_y: f32,
-        pub cursor_color: [u8; 4],
-        pub user_name: [u8; 32],
-        pub is_active: bool,
-        pub last_seen: u64,
-        pub current_tool: u8, // 0=select, 1=pen, 2=text, etc.
-        pub _padding: [u8; 171],
-    }
-    unsafe impl Pod for UserCursorData {}
-    unsafe impl Zeroable for UserCursorData {}
-
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug)]
-    pub struct SelectionBoxData {
-        pub user_id: [u8; 32],
-        pub start_x: f32,
-        pub start_y: f32,
-        pub end_x: f32,
-        pub end_y: f32,
-        pub selection_color: [u8; 4],
-        pub selected_objects: [[u8; 32]; 4], // Up to 4 selected object IDs
-        pub _padding: [u8; 80],
-    }
-    unsafe impl Pod for SelectionBoxData {}
-    unsafe impl Zeroable for SelectionBoxData {}
-}
-
 // ================================================================================================
-// COMPILE-TIME SIZE VALIDATION
+// MATH SYMBOL DATA
 // ================================================================================================
 
-const _: () = assert!(std::mem::size_of::<WhiteboardData>() <= 128);
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct MathSymbolData {
+    pub symbol_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub x: f32,
+    pub y: f32,
+    pub symbol: [u8; 8],                // UTF-8 encoded math symbol
+    pub font_size: u16,
+    pub color: [u8; 4],
+    pub created_at: u64,
+    pub created_by: [u8; 32],
+    pub _padding: [u8; 114],
+}
 
-const _: () = assert!(std::mem::size_of::<StickyNoteData>() <= S_TSHIRT_SIZE);
-const _: () = assert!(std::mem::size_of::<SketchData>() <= M_TSHIRT_SIZE);
-const _: () = assert!(std::mem::size_of::<WhiteboardData>() <= L_TSHIRT_SIZE);
-const _: () = assert!(std::mem::size_of::<FileAttachmentData>() <= XL_TSHIRT_SIZE);
+unsafe impl Pod for MathSymbolData {}
+unsafe impl Zeroable for MathSymbolData {}
+
+// ================================================================================================
+// SHAPE DATA (matching Swift's shape tools)
+// ================================================================================================
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct RectangleData {
+    pub shape_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub rotation: f32,
+    pub stroke_color: [u8; 4],
+    pub fill_color: [u8; 4],
+    pub stroke_width: f32,
+    pub corner_radius: f32,
+    pub created_at: u64,
+    pub created_by: [u8; 32],
+    pub _padding: [u8; 88],
+}
+
+unsafe impl Pod for RectangleData {}
+unsafe impl Zeroable for RectangleData {}
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct CircleData {
+    pub shape_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub center_x: f32,
+    pub center_y: f32,
+    pub radius: f32,
+    pub stroke_color: [u8; 4],
+    pub fill_color: [u8; 4],
+    pub stroke_width: f32,
+    pub created_at: u64,
+    pub created_by: [u8; 32],
+    pub _padding: [u8; 100],
+}
+
+unsafe impl Pod for CircleData {}
+unsafe impl Zeroable for CircleData {}
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct ArrowData {
+    pub arrow_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub start_x: f32,
+    pub start_y: f32,
+    pub end_x: f32,
+    pub end_y: f32,
+    pub stroke_color: [u8; 4],
+    pub stroke_width: f32,
+    pub arrow_head_length: f32,
+    pub created_at: u64,
+    pub created_by: [u8; 32],
+    pub _padding: [u8; 96],
+}
+
+unsafe impl Pod for ArrowData {}
+unsafe impl Zeroable for ArrowData {}
+
+// ================================================================================================
+// COMMENT DATA (matching Swift's Reddit-style comments)
+// ================================================================================================
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct CommentData {
+    pub comment_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub parent_id: [u8; 32],           // For threading (0 if top-level)
+    pub author_id: [u8; 32],           // XaeroID
+    pub author_name: [u8; 64],
+    pub content: [u8; 500],
+    pub upvotes: u32,
+    pub downvotes: u32,
+    pub depth: u8,                     // Reply depth
+    pub is_collapsed: bool,
+    pub has_upvoted: bool,             // Current user's vote state
+    pub has_downvoted: bool,
+    pub created_at: u64,
+    pub _padding: [u8; 16],
+}
+
+unsafe impl Pod for CommentData {}
+unsafe impl Zeroable for CommentData {}
+
+// ================================================================================================
+// FILE ATTACHMENT DATA (matching Swift's FileNode)
+// ================================================================================================
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct FileAttachmentData {
+    pub file_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub name: [u8; 256],
+    pub file_type: u8,                 // 0=image, 1=pdf, 2=text, 3=code, 4=data
+    pub file_size: u64,
+    pub blake_hash: [u8; 32],          // Content hash
+    pub color: [u8; 4],                // Display color based on type
+    pub icon: [u8; 32],                // Icon name for display
+    pub uploaded_by: [u8; 32],
+    pub uploaded_at: u64,
+    pub _padding: [u8; 59],
+}
+
+unsafe impl Pod for FileAttachmentData {}
+unsafe impl Zeroable for FileAttachmentData {}
+
+// ================================================================================================
+// USER PRESENCE DATA (for collaborative features)
+// ================================================================================================
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct UserCursorData {
+    pub user_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub cursor_x: f32,
+    pub cursor_y: f32,
+    pub cursor_color: [u8; 4],
+    pub user_name: [u8; 64],
+    pub is_active: bool,
+    pub current_tool: u8,              // Canvas mode
+    pub last_seen: u64,
+    pub _padding: [u8; 106],
+}
+
+unsafe impl Pod for UserCursorData {}
+unsafe impl Zeroable for UserCursorData {}
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct SelectionData {
+    pub user_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub selected_objects: [[u8; 32]; 10], // Up to 10 selected object IDs
+    pub selection_count: u32,
+    pub _padding: [u8; 60],
+}
+
+unsafe impl Pod for SelectionData {}
+unsafe impl Zeroable for SelectionData {}
+
+// ================================================================================================
+// GRAPH DATA (for graph tool)
+// ================================================================================================
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct GraphData {
+    pub graph_id: [u8; 32],
+    pub board_id: [u8; 32],
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub equation: [u8; 128],           // Math equation string
+    pub color: [u8; 4],
+    pub created_at: u64,
+    pub created_by: [u8; 32],
+    pub _padding: [u8; 44],
+}
+
+unsafe impl Pod for GraphData {}
+unsafe impl Zeroable for GraphData {}
