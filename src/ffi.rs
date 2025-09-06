@@ -1,5 +1,5 @@
 // ffi.rs - FFI bridge for Cyan Swift integration
-
+#![allow(unused)]
 use std::{
     ffi::{CStr, CString, c_char, c_void},
     ptr, slice,
