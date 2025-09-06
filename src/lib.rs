@@ -9,6 +9,8 @@ use rkyv::{Archive, Deserialize, Serialize};
 use xaeroflux_actors::XaeroFlux;
 use xaeroid::XaeroID;
 
+use crate::storage::DATA_DIR;
+
 // Event type constants matching Swift UI needs
 pub const GROUP_EVENT: u32 = 1;
 pub const WORKSPACE_EVENT: u32 = 2;
@@ -24,7 +26,7 @@ pub const UPDATE_OFFSET: u32 = 2000;
 pub const PIN_FLAG: u32 = 0x80000000;
 
 pub fn initialize(xaero_id: XaeroID) {
-    XaeroFlux::initialize(xaero_id)
+    XaeroFlux::initialize(xaero_id, DATA_DIR)
         .expect("Cyan App failed to initialize due to Xaerflux failure!");
 }
 
