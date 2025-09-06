@@ -2,9 +2,12 @@
 
 mod ffi;
 mod objects;
+mod storage;
 
 use bytemuck::{Pod, Zeroable};
 use rkyv::{Archive, Deserialize, Serialize};
+use xaeroflux_actors::XaeroFlux;
+use xaeroid::XaeroID;
 
 // Event type constants matching Swift UI needs
 pub const GROUP_EVENT: u32 = 1;
@@ -19,6 +22,11 @@ pub const DRAWING_PATH_EVENT: u32 = 8;
 pub const TOMBSTONE_OFFSET: u32 = 1000;
 pub const UPDATE_OFFSET: u32 = 2000;
 pub const PIN_FLAG: u32 = 0x80000000;
+
+pub fn initialize(xaero_id: XaeroID) {
+    XaeroFlux::initialize(xaero_id)
+        .expect("Cyan App failed to initialize due to Xaerflux failure!");
+}
 
 // Group structure matching Swift's GroupNode
 #[repr(C, align(64))]
