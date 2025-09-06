@@ -1,8 +1,9 @@
-use bytemuck::Zeroable;
 use std::{char::MAX, sync::OnceLock};
+
+use bytemuck::Zeroable;
 use xaeroflux_actors::{
-    aof::storage::lmdb::{get_children_entitities_by_entity_id, get_current_state_by_entity_id},
     XaeroFlux,
+    aof::storage::lmdb::{get_children_entitities_by_entity_id, get_current_state_by_entity_id},
 };
 
 use crate::{Group, Workspace};
@@ -11,10 +12,9 @@ pub static DATA_DIR: &str = "cyan";
 pub fn get_group_by_group_id<const SIZE: usize>(
     group_id: [u8; 32],
 ) -> Result<Group<SIZE>, Box<dyn std::error::Error>> {
-    let mut xf_handle = XaeroFlux::instance(DATA_DIR)
-        .get()
-        .expect("expected to initialize xaeroflux first!");
-    match get_current_state_by_entity_id(
+    let mut xf_handle =
+        XaeroFlux::instance(DATA_DIR).expect("expected to initialize xaeroflux first!");
+    match get_current_state_by_entity_id::<SIZE>(
         &mut xf_handle
             .read_handle
             .clone()
@@ -46,14 +46,17 @@ pub fn get_workspaces_for_group<const SIZE: usize, const MAX_WORKSPACES: usize>(
 
     for chunk in workspace_ids.chunks_exact(32) {
         if count >= MAX_WORKSPACES {
-            tracing::warn!("Group has more than {} workspaces, truncating", MAX_WORKSPACES);
+            tracing::warn!(
+                "Group has more than {} workspaces, truncating",
+                MAX_WORKSPACES
+            );
             break;
         }
 
         let mut buffer = [0u8; 32];
         buffer.copy_from_slice(chunk);
 
-        match get_current_state_by_entity_id(&rh, buffer)? {
+        match get_current_state_by_entity_id::<SIZE>(&rh, buffer)? {
             Some(current_state_workspace) => {
                 let w = bytemuck::from_bytes::<Workspace<SIZE>>(&current_state_workspace.evt.data);
                 workspaces[count] = *w;
