@@ -20,6 +20,8 @@ pub extern "C" fn cyan_init(
 ) -> bool {
     unsafe {
         // Parse XaeroID
+        eprintln!("cyan_init called with size: {}", xaero_id_size);
+        eprintln!("Expected XaeroID size: {}", std::mem::size_of::<XaeroID>());
         let xid_bytes = slice::from_raw_parts(xaero_id_data, xaero_id_size);
         let xaero_id =  bytemuck::from_bytes::<xaeroid::XaeroID>(xid_bytes);
 
