@@ -21,16 +21,17 @@ pub extern "C" fn cyan_init(
     unsafe {
         // Parse XaeroID
         let xid_bytes = slice::from_raw_parts(xaero_id_data, xaero_id_size);
-        let xaero_id =  bytemuck::from_bytes::<XaeroID>(xid_bytes);
+        let xaero_id =  bytemuck::from_bytes::<xaeroid::XaeroID>(xid_bytes);
+
         // Get data directory
         let dir = if data_dir.is_null() {
-            DATA_DIR.to_string()
+            crate::storage::DATA_DIR.to_string()
         } else {
             CStr::from_ptr(data_dir).to_string_lossy().into_owned()
         };
 
-        // Initialize XaeroFlux
-        XaeroFlux::initialize(xaero_id, &dir).is_ok()
+        // Initialize XaeroFlux - pass by value, not reference
+        XaeroFlux::initialize(*xaero_id, &dir).is_ok()
     }
 }
 

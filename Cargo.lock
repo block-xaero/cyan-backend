@@ -953,7 +953,7 @@ dependencies = [
  "xaeroflux",
  "xaeroflux-actors 0.9.8-alpha.3",
  "xaeroflux-core 0.9.8-alpha.3",
- "xaeroid 0.4.1 (git+https://github.com/block-xaero/xaeroID.git?branch=main)",
+ "xaeroid 0.4.1",
 ]
 
 [[package]]
@@ -5305,7 +5305,7 @@ dependencies = [
  "tokio",
  "tracing",
  "xaeroflux-core 0.9.8-alpha.3",
- "xaeroid 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "xaeroid 0.4.1",
 ]
 
 [[package]]
@@ -5357,7 +5357,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber 0.3.19",
- "xaeroid 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "xaeroid 0.4.1",
 ]
 
 [[package]]
@@ -5391,33 +5391,6 @@ dependencies = [
 [[package]]
 name = "xaeroid"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4a3687d787767109d77a0cbdc19ee2926edc2ba4021db8565d5199a5b217c32"
-dependencies = [
- "ark-bn254",
- "ark-ff",
- "ark-groth16",
- "ark-r1cs-std",
- "ark-relations",
- "ark-serialize",
- "ark-snark",
- "ark-std",
- "blake3",
- "bytecheck",
- "bytemuck",
- "multibase",
- "pqcrypto-falcon",
- "pqcrypto-traits",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
- "rkyv",
- "thiserror 2.0.12",
-]
-
-[[package]]
-name = "xaeroid"
-version = "0.4.1"
-source = "git+https://github.com/block-xaero/xaeroID.git?branch=main#aebbdca95544a4a30881524c51727c25d381f15b"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -5433,6 +5406,32 @@ dependencies = [
  "bytemuck",
  "getrandom 0.2.16",
  "lz4_flex",
+ "multibase",
+ "pqcrypto-falcon",
+ "pqcrypto-traits",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "rkyv",
+ "thiserror 2.0.12",
+]
+
+[[package]]
+name = "xaeroid"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4a3687d787767109d77a0cbdc19ee2926edc2ba4021db8565d5199a5b217c32"
+dependencies = [
+ "ark-bn254",
+ "ark-ff",
+ "ark-groth16",
+ "ark-r1cs-std",
+ "ark-relations",
+ "ark-serialize",
+ "ark-snark",
+ "ark-std",
+ "blake3",
+ "bytecheck",
+ "bytemuck",
  "multibase",
  "pqcrypto-falcon",
  "pqcrypto-traits",

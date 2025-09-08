@@ -1,5 +1,6 @@
 // lib.rs - Updated with full parity to Swift UI
-
+#![feature(generic_const_exprs)]
+#![allow(incomplete_features)]
 mod ffi;
 mod objects;
 mod storage;
