@@ -60,9 +60,10 @@ pub struct PopulatedWorkspace {
 // READ OPERATIONS
 // ================================================================================================
 
+
 pub fn get_group_by_group_id<const SIZE: usize>(
     group_id: [u8; 32],
-) -> Result<Group<SIZE>, Box<dyn std::error::Error>> {
+) -> Result<Group<SIZE>, Box<dyn std::error::Error>> where [(); { std::mem::size_of::<Group<SIZE>>() }]: {
     let rh = XaeroFlux::read_handle().expect("read handle not ready yet!");
     match get_current_state_by_entity_id::<{ std::mem::size_of::<Group<SIZE>>() }>(&rh, group_id)? {
         Some(current_state) => {
@@ -76,7 +77,7 @@ pub fn get_group_by_group_id<const SIZE: usize>(
 
 pub fn get_workspaces_for_group<const SIZE: usize, const MAX_WORKSPACES: usize>(
     group_id: [u8; 32],
-) -> Result<([Workspace<SIZE>; MAX_WORKSPACES], usize), Box<dyn std::error::Error>> {
+) -> Result<([Workspace<SIZE>; MAX_WORKSPACES], usize), Box<dyn std::error::Error>> where [(); { std::mem::size_of::<Workspace<SIZE>>() }]: {
     let mut workspaces = [Workspace::<SIZE>::zeroed(); MAX_WORKSPACES];
     let mut count = 0;
 
