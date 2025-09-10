@@ -1,5 +1,5 @@
 use std::{
-    ffi::{CStr, c_char},
+    ffi::{c_char, CStr},
     ptr, slice,
 };
 
@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 use xaeroflux_actors::XaeroFlux;
 use xaeroid::XaeroID;
 
-use crate::{Board, Comment, Group, Workspace, objects::*, storage::*};
+use crate::{objects::*, storage::*, Group, Workspace};
 
 // ================================================================================================
 // INITIALIZATION
@@ -36,13 +36,9 @@ pub extern "C" fn cyan_init(
                         .add_directive("xaeroflux_actors=trace".parse().unwrap())
                         .add_directive("xaeroflux_core=trace".parse().unwrap())
                         // Silence iroh and related crates
-                        .add_directive("iroh=warn".parse().unwrap())
-                        .add_directive("iroh_relay=warn".parse().unwrap())
-                        .add_directive("iroh_net=warn".parse().unwrap())
-                        .add_directive("iroh_quinn=warn".parse().unwrap())
-                        .add_directive("iroh_quinn_proto=warn".parse().unwrap())
-                        .add_directive("swarm_discovery=warn".parse().unwrap())
-                        .add_directive("acto=warn".parse().unwrap())
+                        .add_directive("iroh=off".parse().unwrap())
+                        .add_directive("swarm_discovery=off".parse().unwrap())
+                        .add_directive("acto=warn".parse().unwrap()),
                 )
                 .init();
         });
@@ -258,6 +254,8 @@ pub extern "C" fn cyan_get_workspace_objects(
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_add_path_object(
     board_id: *const u8,
+    workspace_id: *const u8,
+    group_id: *const u8,
     path_data: *const u8,
     path_size: usize,
 ) -> bool {
@@ -265,7 +263,12 @@ pub extern "C" fn cyan_add_path_object(
         let mut bid = [0u8; 32];
         bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
 
-        // Parse PathData from bytes
+        let mut wid = [0u8; 32];
+        wid.copy_from_slice(slice::from_raw_parts(workspace_id, 32));
+
+        let mut gid = [0u8; 32];
+        gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
+
         if path_size != std::mem::size_of::<PathData<512>>() {
             return false;
         }
@@ -273,19 +276,27 @@ pub extern "C" fn cyan_add_path_object(
         let path_bytes = slice::from_raw_parts(path_data, path_size);
         let path = bytemuck::from_bytes::<PathData<512>>(path_bytes);
 
-        add_whiteboard_object(bid, OBJECT_TYPE_PATH, path).is_ok()
+        add_whiteboard_object(bid, wid, gid, OBJECT_TYPE_PATH, path).is_ok()
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_add_sticky_note(
     board_id: *const u8,
+    workspace_id: *const u8,
+    group_id: *const u8,
     sticky_data: *const u8,
     sticky_size: usize,
 ) -> bool {
     unsafe {
         let mut bid = [0u8; 32];
         bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
+
+        let mut wid = [0u8; 32];
+        wid.copy_from_slice(slice::from_raw_parts(workspace_id, 32));
+
+        let mut gid = [0u8; 32];
+        gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
 
         if sticky_size != std::mem::size_of::<StickyNoteData>() {
             return false;
@@ -294,19 +305,27 @@ pub extern "C" fn cyan_add_sticky_note(
         let sticky_bytes = slice::from_raw_parts(sticky_data, sticky_size);
         let sticky = bytemuck::from_bytes::<StickyNoteData>(sticky_bytes);
 
-        add_whiteboard_object(bid, OBJECT_TYPE_STICKY, sticky).is_ok()
+        add_whiteboard_object(bid, wid, gid, OBJECT_TYPE_STICKY, sticky).is_ok()
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_add_rectangle(
     board_id: *const u8,
+    workspace_id: *const u8,
+    group_id: *const u8,
     rect_data: *const u8,
     rect_size: usize,
 ) -> bool {
     unsafe {
         let mut bid = [0u8; 32];
         bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
+
+        let mut wid = [0u8; 32];
+        wid.copy_from_slice(slice::from_raw_parts(workspace_id, 32));
+
+        let mut gid = [0u8; 32];
+        gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
 
         if rect_size != std::mem::size_of::<RectangleData>() {
             return false;
@@ -315,7 +334,7 @@ pub extern "C" fn cyan_add_rectangle(
         let rect_bytes = slice::from_raw_parts(rect_data, rect_size);
         let rect = bytemuck::from_bytes::<RectangleData>(rect_bytes);
 
-        add_whiteboard_object(bid, OBJECT_TYPE_RECTANGLE, rect).is_ok()
+        add_whiteboard_object(bid, wid, gid, OBJECT_TYPE_RECTANGLE, rect).is_ok()
     }
 }
 
@@ -326,6 +345,8 @@ pub extern "C" fn cyan_add_rectangle(
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_add_comment(
     board_id: *const u8,
+    workspace_id: *const u8,
+    group_id: *const u8,
     author_id: *const u8,
     author_name: *const c_char,
     content: *const c_char,
@@ -335,6 +356,12 @@ pub extern "C" fn cyan_add_comment(
     unsafe {
         let mut bid = [0u8; 32];
         bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
+
+        let mut wid = [0u8; 32];
+        wid.copy_from_slice(slice::from_raw_parts(workspace_id, 32));
+
+        let mut gid = [0u8; 32];
+        gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
 
         let mut aid = [0u8; 32];
         aid.copy_from_slice(slice::from_raw_parts(author_id, 32));
@@ -350,7 +377,7 @@ pub extern "C" fn cyan_add_comment(
             Some(pid)
         };
 
-        match add_comment::<512>(bid, aid, &author_str, &content_str, parent) {
+        match add_comment::<512>(bid, wid, gid, aid, &author_str, &content_str, parent) {
             Ok(comment_id) => {
                 ptr::copy_nonoverlapping(comment_id.as_ptr(), out_comment_id, 32);
                 true
@@ -473,8 +500,6 @@ pub extern "C" fn cyan_create_invitation(
     unsafe {
         use ark_bn254::Fr;
         use ark_ff::PrimeField;
-        use xaeroid::zk_proofs::XaeroProofs;
-
         // Parse inputs
         let inviter_bytes = slice::from_raw_parts(inviter_xaero_id, 2572);
         let inviter = bytemuck::from_bytes::<xaeroid::XaeroID>(inviter_bytes);
@@ -540,7 +565,6 @@ pub extern "C" fn cyan_accept_invitation(
     unsafe {
         use ark_bn254::Fr;
         use ark_ff::PrimeField;
-        use xaeroid::circuits::invitation_circuit::InvitationProver;
 
         // Parse inputs
         let code_bytes = slice::from_raw_parts(invitation_code, 32);
@@ -553,8 +577,12 @@ pub extern "C" fn cyan_accept_invitation(
         let claimer_bytes = slice::from_raw_parts(claimer_xaero_id, 2572);
         let claimer = bytemuck::from_bytes::<xaeroid::XaeroID>(claimer_bytes);
 
-        // Verify invitation exists and is valid
-        match crate::storage::get_invitation(hash_bytes.try_into().unwrap()) {
+        // Create the hash array properly
+        let mut hash_array = [0u8; 32];
+        hash_array.copy_from_slice(hash_bytes);
+
+        // Verify invitation exists and is valid - use the correct size
+        match crate::storage::get_invitation::<{ rusted_ring::S_TSHIRT_SIZE }>(&hash_array) {
             Ok(invitation) => {
                 if invitation.expiry_time < xaeroflux_core::date_time::emit_secs() {
                     return false; // Expired
@@ -570,8 +598,6 @@ pub extern "C" fn cyan_accept_invitation(
                 let expiry_fr = Fr::from(expiry_time);
 
                 // Generate and verify proof
-                // In production, would use full ZK circuit
-                // For now, simplified verification
                 let computed_hash = code_fr + nonce_fr * claimer_fr + workspace_fr * expiry_fr;
 
                 if computed_hash == hash_fr {

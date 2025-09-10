@@ -1,555 +1,419 @@
-use std::sync::{Arc, Mutex, OnceLock};
+// storage.rs - Complete with hierarchical event chain support
 
-use xaeroflux_actors::{
-    XaeroFlux,
-    aof::storage::lmdb::{get_children_entitities_by_entity_id, get_current_state_by_entity_id},
-};
-use xaeroflux_core::date_time::emit_secs;
+use bytemuck::Zeroable;
+use xaeroflux_actors::{read_api::ReadApi, XaeroFlux};
+use xaeroflux_core::pool::XaeroInternalEvent;
 
-use crate::{Board, Comment, DrawingPath, FileNode, Group, Layer, Workspace, objects::*};
+use crate::{objects::*, Board, Comment, Group, Workspace};
 
-pub static DATA_DIR: &str = "cyan";
+pub const DATA_DIR: &str = "/tmp/cyan-data";
 
-// Event type constants for writing
-pub const EVENT_TYPE_GROUP: u32 = 100;
-pub const EVENT_TYPE_WORKSPACE: u32 = 101;
-pub const EVENT_TYPE_BOARD: u32 = 102;
-pub const EVENT_TYPE_WHITEBOARD_OBJECT: u32 = 103;
-pub const EVENT_TYPE_COMMENT: u32 = 104;
-pub const EVENT_TYPE_LAYER: u32 = 105;
-pub const EVENT_TYPE_VOTE: u32 = 106;
-
-// Object type identifiers (store as first byte in event data)
-pub const OBJECT_TYPE_WHITEBOARD: u8 = 0;
-pub const OBJECT_TYPE_PATH: u8 = 1;
-pub const OBJECT_TYPE_STICKY: u8 = 2;
-pub const OBJECT_TYPE_RECTANGLE: u8 = 3;
-pub const OBJECT_TYPE_CIRCLE: u8 = 4;
-pub const OBJECT_TYPE_ARROW: u8 = 5;
-pub const OBJECT_TYPE_TEXT: u8 = 6;
-pub const OBJECT_TYPE_COMMENT: u8 = 7;
-pub const OBJECT_TYPE_FILE: u8 = 8;
-
-// Container structures
-#[derive(Debug, Default)]
-pub struct WhiteboardObjects {
-    pub paths: Vec<PathData<512>>,
-    pub sticky_notes: Vec<StickyNoteData>,
-    pub rectangles: Vec<RectangleData>,
-    pub circles: Vec<CircleData>,
-    pub arrows: Vec<ArrowData>,
-    pub text_boxes: Vec<TextBoxData>,
-    pub comments: Vec<CommentData>,
-    pub files: Vec<FileAttachmentData>,
-}
-
-#[derive(Debug)]
-pub struct PopulatedWhiteboard {
-    pub metadata: WhiteboardData,
-    pub objects: WhiteboardObjects,
-}
-
-#[derive(Debug)]
-pub struct PopulatedWorkspace {
-    pub workspace_id: [u8; 32],
-    pub whiteboards: Vec<PopulatedWhiteboard>,
-}
+// Event types for Cyan operations
+const EVENT_TYPE_GROUP: u32 = 100;
+const EVENT_TYPE_WORKSPACE: u32 = 101;
+const EVENT_TYPE_BOARD: u32 = 102;
+const EVENT_TYPE_COMMENT: u32 = 103;
+const EVENT_TYPE_WHITEBOARD_OBJECT: u32 = 104;
+const EVENT_TYPE_INVITATION: u32 = 105;
 
 // ================================================================================================
-// READ OPERATIONS
+// HIERARCHICAL EVENT HELPERS
 // ================================================================================================
 
-pub fn get_group_by_group_id<const SIZE: usize>(
-    group_id: [u8; 32],
-) -> Result<Group<SIZE>, Box<dyn std::error::Error>>
-where
-    [(); { std::mem::size_of::<Group<SIZE>>() }]:,
-{
-    let rh = XaeroFlux::read_handle().expect("read handle not ready yet!");
-    match get_current_state_by_entity_id::<{ std::mem::size_of::<Group<SIZE>>() }>(&rh, group_id)? {
-        Some(current_state) => Ok(*bytemuck::from_bytes::<Group<SIZE>>(
-            &current_state.evt.data[..std::mem::size_of::<Group<SIZE>>()],
-        )),
-        None => Err("Group not found".into()),
+pub fn build_hierarchical_event(
+    current_id: [u8; 32],
+    ancestry: Vec<[u8; 32]>,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut event = Vec::with_capacity(32 * (ancestry.len() + 2) + data.len());
+
+    // Add current ID
+    event.extend_from_slice(&current_id);
+
+    // Add ancestry chain
+    for ancestor in ancestry {
+        event.extend_from_slice(&ancestor);
     }
+
+    // Add null terminator for hierarchy
+    event.extend_from_slice(&[0u8; 32]);
+
+    // Add actual data
+    event.extend_from_slice(data);
+
+    event
 }
 
-pub fn get_workspaces_for_group<const SIZE: usize, const MAX_WORKSPACES: usize>(
-    group_id: [u8; 32],
-) -> Result<([Workspace<SIZE>; MAX_WORKSPACES], usize), Box<dyn std::error::Error>>
-where
-    [(); { std::mem::size_of::<Workspace<SIZE>>() }]:,
-{
-    let mut workspaces = [Workspace::<SIZE>::zeroed(); MAX_WORKSPACES];
-    let mut count = 0;
+pub fn parse_hierarchical_event(event_data: &[u8]) -> (Vec<[u8; 32]>, &[u8]) {
+    let mut ancestry = Vec::new();
+    let mut offset = 0;
 
-    let rh = XaeroFlux::read_handle().expect("read handle not ready yet!");
-    let workspace_ids = get_children_entitities_by_entity_id(&rh, group_id)?;
+    // Parse hierarchy chain until we hit null terminator
+    while offset + 32 <= event_data.len() {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&event_data[offset..offset + 32]);
 
-    for chunk in workspace_ids.chunks_exact(32) {
-        if count >= MAX_WORKSPACES {
-            tracing::warn!(
-                "Group has more than {} workspaces, truncating",
-                MAX_WORKSPACES
-            );
+        if id == [0u8; 32] {
+            offset += 32;
             break;
         }
 
-        let mut buffer = [0u8; 32];
-        buffer.copy_from_slice(chunk);
-
-        match get_current_state_by_entity_id::<{ std::mem::size_of::<Workspace<SIZE>>() }>(
-            &rh, buffer,
-        )? {
-            Some(current_state_workspace) => {
-                let w = bytemuck::from_bytes::<Workspace<SIZE>>(&current_state_workspace.evt.data);
-                workspaces[count] = *w;
-                count += 1;
-            }
-            None => {
-                tracing::warn!("no workspace found yet for {:?}", hex::encode(buffer));
-            }
-        }
+        ancestry.push(id);
+        offset += 32;
     }
-    Ok((workspaces, count))
+
+    (ancestry, &event_data[offset..])
 }
 
-pub fn get_workspace_with_all_objects(
-    workspace_id: [u8; 32],
-) -> Result<PopulatedWorkspace, Box<dyn std::error::Error>> {
-    let env = XaeroFlux::read_handle().expect("read_api not ready!");
-
-    // Get all whiteboard IDs for this workspace
-    let whiteboard_ids_raw = get_children_entitities_by_entity_id(&env, workspace_id)?;
-
-    let mut populated_workspace = PopulatedWorkspace {
-        workspace_id,
-        whiteboards: Vec::new(),
-    };
-
-    // Process each whiteboard
-    for board_chunk in whiteboard_ids_raw.chunks_exact(32) {
-        let mut board_id = [0u8; 32];
-        board_id.copy_from_slice(board_chunk);
-
-        // Get whiteboard metadata
-        let whiteboard_metadata = get_whiteboard_metadata(&env, board_id)?;
-
-        // Get all objects for this whiteboard
-        let objects = get_all_whiteboard_objects(board_id)?;
-
-        populated_workspace.whiteboards.push(PopulatedWhiteboard {
-            metadata: whiteboard_metadata,
-            objects,
-        });
-    }
-
-    Ok(populated_workspace)
+fn create_comment<const N: usize>() -> Comment<N> {
+    unsafe { std::mem::zeroed() }
 }
 
 // ================================================================================================
-// WRITE OPERATIONS
+// GROUP OPERATIONS
 // ================================================================================================
 
-pub fn create_group<const MAX_WORKSPACES: usize>(
-    creator_id: [u8; 32],
+pub fn create_group<const N: usize>(
+    creator: [u8; 32],
     name: &str,
     icon: &str,
     color: [u8; 4],
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let group_id = blake3::hash(
-        &[
-            creator_id.as_slice(),
-            name.as_bytes(),
-            &emit_secs().to_le_bytes(),
-        ]
-        .concat(),
+        format!(
+            "{:?}{}{}",
+            creator,
+            name,
+            xaeroflux_core::date_time::emit_nanos()
+        )
+        .as_bytes(),
     )
     .into();
 
-    let mut group = Group::<MAX_WORKSPACES>::zeroed();
+    let mut group: Group<N> = Group::zeroed();
     group.group_id = group_id;
-    group.parent_id = [0; 32];
-    group.created_by = creator_id;
-    group.created_at = emit_secs();
-    group.updated_at = group.created_at;
-    group.color = color;
+    group.created_by = creator;
 
-    // Copy name and icon
+    // Copy name
     let name_bytes = name.as_bytes();
-    let copy_len = name_bytes.len().min(64);
+    let copy_len = std::cmp::min(name_bytes.len(), 64);
     group.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
+    // Copy icon
     let icon_bytes = icon.as_bytes();
-    let copy_len = icon_bytes.len().min(32);
-    group.icon[..copy_len].copy_from_slice(&icon_bytes[..copy_len]);
+    let icon_len = std::cmp::min(icon_bytes.len(), 32);
+    group.icon[..icon_len].copy_from_slice(&icon_bytes[..icon_len]);
 
-    // Write to XaeroFlux
-    let data = bytemuck::bytes_of(&group);
-    XaeroFlux::write_event_static(data, EVENT_TYPE_GROUP)?;
+    group.color = color;
+    group.created_at = xaeroflux_core::date_time::emit_secs();
 
+    // Build hierarchical event (group has no parent)
+    let event = build_hierarchical_event(
+        group_id,
+        vec![], // No ancestry for top-level group
+        bytemuck::bytes_of(&group),
+    );
+
+    XaeroFlux::write_event_static(&event, xaeroflux_core::event::make_pinned(EVENT_TYPE_GROUP))?;
+
+    tracing::info!(
+        "Created group {} with id {:?}",
+        name,
+        hex::encode(&group_id)
+    );
     Ok(group_id)
 }
 
-pub fn create_workspace<const MAX_BOARDS: usize>(
-    creator_id: [u8; 32],
+pub fn list_all_groups<const N: usize>() -> Result<Vec<Group<N>>, Box<dyn std::error::Error>> {
+    let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
+
+    use xaeroflux_actors::read_api::{RangeQuery, ReadApi};
+
+    let query = RangeQuery::<{ rusted_ring::S_TSHIRT_SIZE }> {
+        xaero_id: [0u8; 32],
+        event_type: EVENT_TYPE_GROUP,
+    };
+
+    let events = xf.range_query(query)?;
+
+    let mut groups = Vec::new();
+    for event in events {
+        let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+        if data.len() == std::mem::size_of::<Group<N>>() {
+            let group = bytemuck::from_bytes::<Group<N>>(data);
+            groups.push(*group);
+        }
+    }
+
+    tracing::info!("Listed {} groups", groups.len());
+    Ok(groups)
+}
+
+pub fn get_group_by_group_id<const N: usize>(
+    group_id: [u8; 32],
+) -> Result<Group<N>, Box<dyn std::error::Error>> {
+    let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
+
+    match xf.find_current_state_by_eid::<N>(group_id)? {
+        Some(event) => {
+            let (_ancestry, data) =
+                parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+            let group = bytemuck::from_bytes::<Group<N>>(data);
+            Ok(*group)
+        }
+        None => Err("Group not found".into()),
+    }
+}
+
+// ================================================================================================
+// WORKSPACE OPERATIONS
+// ================================================================================================
+
+pub fn create_workspace<const N: usize>(
+    creator: [u8; 32],
     group_id: [u8; 32],
     name: &str,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let workspace_id = blake3::hash(
-        &[
-            group_id.as_slice(),
-            name.as_bytes(),
-            &emit_secs().to_le_bytes(),
-        ]
-        .concat(),
+        format!(
+            "{:?}{:?}{}{}",
+            creator,
+            group_id,
+            name,
+            xaeroflux_core::date_time::emit_nanos()
+        )
+        .as_bytes(),
     )
     .into();
 
-    let mut workspace = Workspace::<MAX_BOARDS>::zeroed();
+    let mut workspace = Workspace::<N>::zeroed();
     workspace.workspace_id = workspace_id;
     workspace.group_id = group_id;
-    workspace.created_by = creator_id;
-    workspace.created_at = emit_secs();
-    workspace.updated_at = workspace.created_at;
 
     // Copy name
     let name_bytes = name.as_bytes();
-    let copy_len = name_bytes.len().min(64);
+    let copy_len = std::cmp::min(name_bytes.len(), 64);
     workspace.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
-    // Write to XaeroFlux
-    let data = bytemuck::bytes_of(&workspace);
-    XaeroFlux::write_event_static(data, EVENT_TYPE_WORKSPACE)?;
+    workspace.created_at = xaeroflux_core::date_time::emit_secs();
 
+    // Build hierarchical event
+    let event = build_hierarchical_event(
+        workspace_id,
+        vec![group_id], // Parent is group
+        bytemuck::bytes_of(&workspace),
+    );
+
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_WORKSPACE)?;
+
+    tracing::info!(
+        "Created workspace {} with id {:?}",
+        name,
+        hex::encode(&workspace_id)
+    );
     Ok(workspace_id)
 }
 
-pub fn create_board<const MAX_FILES: usize>(
-    creator_id: [u8; 32],
+pub fn list_workspaces_for_group<const N: usize>(
+    group_id: [u8; 32],
+) -> Result<Vec<Workspace<N>>, Box<dyn std::error::Error>> {
+    let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
+
+    use xaeroflux_actors::read_api::{RangeQuery, ReadApi};
+
+    let query = RangeQuery::<{ rusted_ring::M_TSHIRT_SIZE }> {
+        xaero_id: [0u8; 32],
+        event_type: EVENT_TYPE_WORKSPACE,
+    };
+
+    let events = xf.range_query_with_filter::<{rusted_ring::M_TSHIRT_SIZE}, _>(
+        query,
+        Box::new(move |event: &xaeroflux_core::pool::XaeroInternalEvent<{rusted_ring
+        ::M_TSHIRT_SIZE}>| {
+            let (ancestry, data) =
+                parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+            // Check if group_id is in ancestry (should be at index 1)
+            if ancestry.len() >= 2 && ancestry[1] == group_id {
+                data.len() == std::mem::size_of::<Workspace<{rusted_ring::M_TSHIRT_SIZE}>>()
+            } else {
+                false
+            }
+        }),
+    )?;
+
+    let mut workspaces = Vec::new();
+    for event in events {
+        let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+        let workspace = bytemuck::from_bytes::<Workspace<N>>(data);
+        workspaces.push(*workspace);
+    }
+
+    tracing::info!("Listed {} workspaces for group", workspaces.len());
+    Ok(workspaces)
+}
+
+pub fn get_workspaces_for_group<const N: usize, const M: usize>(
+    group_id: [u8; 32],
+) -> Result<([Workspace<N>; M], usize), Box<dyn std::error::Error>> {
+    let workspaces_vec = list_workspaces_for_group::<N>(group_id)?;
+
+    let mut workspaces: [Workspace<N>; M] = unsafe { std::mem::zeroed() };
+    let count = std::cmp::min(workspaces_vec.len(), M);
+
+    for i in 0..count {
+        workspaces[i] = workspaces_vec[i];
+    }
+
+    Ok((workspaces, count))
+}
+
+// ================================================================================================
+// BOARD OPERATIONS
+// ================================================================================================
+
+pub fn create_board<const N: usize>(
+    creator: [u8; 32],
     workspace_id: [u8; 32],
     group_id: [u8; 32],
     name: &str,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let board_id = blake3::hash(
-        &[
-            workspace_id.as_slice(),
-            name.as_bytes(),
-            &emit_secs().to_le_bytes(),
-        ]
-        .concat(),
+        format!(
+            "{:?}{:?}{}{}",
+            creator,
+            workspace_id,
+            name,
+            xaeroflux_core::date_time::emit_nanos()
+        )
+        .as_bytes(),
     )
     .into();
 
-    let mut board = Board::<MAX_FILES>::zeroed();
+    let mut board = Board::<N>::zeroed();
     board.board_id = board_id;
     board.workspace_id = workspace_id;
     board.group_id = group_id;
-    board.created_by = creator_id;
-    board.created_at = emit_secs();
-    board.updated_at = board.created_at;
-    board.last_modified_by = creator_id;
 
     // Copy name
     let name_bytes = name.as_bytes();
-    let copy_len = name_bytes.len().min(64);
+    let copy_len = std::cmp::min(name_bytes.len(), 64);
     board.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
-    // Write to XaeroFlux
-    let data = bytemuck::bytes_of(&board);
-    XaeroFlux::write_event_static(data, EVENT_TYPE_BOARD)?;
+    board.created_at = xaeroflux_core::date_time::emit_secs();
 
-    // Also create default WhiteboardData
-    let mut whiteboard_data = WhiteboardData::zeroed();
-    whiteboard_data.board_id = board_id;
-    whiteboard_data.created_at = emit_secs();
-    whiteboard_data.updated_at = whiteboard_data.created_at;
-    whiteboard_data.created_by = creator_id;
-    whiteboard_data.canvas_width = 1920.0;
-    whiteboard_data.canvas_height = 1080.0;
-    whiteboard_data.background_color = [255, 255, 255, 255];
-    whiteboard_data.zoom_level = 1.0;
+    // Build hierarchical event
+    let event = build_hierarchical_event(
+        board_id,
+        vec![workspace_id, group_id], // Parent chain
+        bytemuck::bytes_of(&board),
+    );
 
-    // Write whiteboard metadata with type byte
-    let mut wb_data = Vec::with_capacity(std::mem::size_of::<WhiteboardData>() + 1);
-    wb_data.push(OBJECT_TYPE_WHITEBOARD);
-    wb_data.extend_from_slice(bytemuck::bytes_of(&whiteboard_data));
-    XaeroFlux::write_event_static(&wb_data, EVENT_TYPE_WHITEBOARD_OBJECT)?;
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_BOARD)?;
 
+    tracing::info!(
+        "Created board {} with id {:?}",
+        name,
+        hex::encode(&board_id)
+    );
     Ok(board_id)
 }
 
-pub fn add_whiteboard_object<T: Pod>(
+// ================================================================================================
+// WHITEBOARD OBJECT OPERATIONS
+// ================================================================================================
+
+pub fn add_whiteboard_object<T: bytemuck::Pod + HierarchicalEvent>(
     board_id: [u8; 32],
+    workspace_id: [u8; 32],
+    group_id: [u8; 32],
     object_type: u8,
-    object: &T,
+    object_data: &T,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    // Generate object ID
-    let object_id = blake3::hash(
-        &[
-            board_id.as_slice(),
-            &[object_type],
-            &emit_secs().to_le_bytes(),
-        ]
-        .concat(),
-    )
-    .into();
+    let object_id = object_data.get_id();
 
-    // Prepare event with type byte + object data
-    let mut event_data = Vec::with_capacity(std::mem::size_of::<T>() + 1);
-    event_data.push(object_type);
-    event_data.extend_from_slice(bytemuck::bytes_of(object));
+    // Build hierarchical event with full ancestry
+    let event = build_hierarchical_event(
+        object_id,
+        vec![board_id, workspace_id, group_id],
+        bytemuck::bytes_of(object_data),
+    );
 
-    // Write to XaeroFlux
-    XaeroFlux::write_event_static(&event_data, EVENT_TYPE_WHITEBOARD_OBJECT)?;
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_WHITEBOARD_OBJECT + object_type as u32)?;
 
+    tracing::info!(
+        "Added object type {} to board {:?}",
+        object_type,
+        hex::encode(&board_id)
+    );
     Ok(object_id)
 }
 
-pub fn add_comment<const MAX_TEXT: usize>(
+// ================================================================================================
+// COMMENT OPERATIONS
+// ================================================================================================
+
+pub fn add_comment<const N: usize>(
     board_id: [u8; 32],
+    workspace_id: [u8; 32],
+    group_id: [u8; 32],
     author_id: [u8; 32],
     author_name: &str,
     content: &str,
     parent_id: Option<[u8; 32]>,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let comment_id = blake3::hash(
-        &[
-            board_id.as_slice(),
-            author_id.as_slice(),
-            content.as_bytes(),
-            &emit_secs().to_le_bytes(),
-        ]
-        .concat(),
+        format!(
+            "{:?}{:?}{}{}",
+            board_id,
+            author_id,
+            content,
+            xaeroflux_core::date_time::emit_nanos()
+        )
+        .as_bytes(),
     )
     .into();
 
-    let mut comment = Comment::<MAX_TEXT>::zeroed();
+    let mut comment = crate::storage::create_comment::<N>();
     comment.comment_id = comment_id;
     comment.board_id = board_id;
-    comment.parent_id = parent_id.unwrap_or([0; 32]);
     comment.author_id = author_id;
-    comment.created_at = emit_secs();
-    comment.updated_at = comment.created_at;
-    comment.depth = if parent_id.is_some() { 1 } else { 0 };
 
     // Copy author name
     let name_bytes = author_name.as_bytes();
-    let copy_len = name_bytes.len().min(64);
-    comment.author_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+    let name_len = std::cmp::min(name_bytes.len(), 64);
+    comment.author_name[..name_len].copy_from_slice(&name_bytes[..name_len]);
 
     // Copy content
     let content_bytes = content.as_bytes();
-    let copy_len = content_bytes.len().min(MAX_TEXT);
-    comment.content[..copy_len].copy_from_slice(&content_bytes[..copy_len]);
+    let content_len = std::cmp::min(content_bytes.len(), N);
+    comment.content[..content_len].copy_from_slice(&content_bytes[..content_len]);
 
-    // Write to XaeroFlux
-    let data = bytemuck::bytes_of(&comment);
-    XaeroFlux::write_event_static(data, EVENT_TYPE_COMMENT)?;
+    if let Some(pid) = parent_id {
+        comment.parent_id = pid;
+    }
 
+    comment.created_at = xaeroflux_core::date_time::emit_secs();
+
+    // Build hierarchical event
+    let mut ancestry = vec![board_id, workspace_id, group_id];
+    if let Some(pid) = parent_id {
+        ancestry.insert(0, pid); // Parent comment is immediate parent
+    }
+
+    let event = build_hierarchical_event(comment_id, ancestry, bytemuck::bytes_of(&comment));
+
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_COMMENT)?;
+
+    tracing::info!("Added comment with id {:?}", hex::encode(&comment_id));
     Ok(comment_id)
 }
 
 // ================================================================================================
-// HELPER FUNCTIONS (keep existing implementations)
+// INVITATION OPERATIONS
 // ================================================================================================
 
-fn get_whiteboard_metadata(
-    env: &Arc<Mutex<xaeroflux_actors::aof::storage::lmdb::LmdbEnv>>,
-    board_id: [u8; 32],
-) -> Result<WhiteboardData, Box<dyn std::error::Error>> {
-    // Try to get whiteboard data (assuming it's stored as M size)
-    if let Some(event) = get_current_state_by_entity_id::<1024>(env, board_id)? {
-        let data = &event.evt.data[..event.evt.len as usize];
-
-        // Skip type byte if present
-        let start_offset = if data[0] == OBJECT_TYPE_WHITEBOARD {
-            1
-        } else {
-            0
-        };
-
-        let whiteboard: &WhiteboardData = bytemuck::from_bytes(&data[start_offset..]);
-        Ok(*whiteboard)
-    } else {
-        // Return default if not found
-        Ok(WhiteboardData {
-            board_id,
-            title: [0; 128],
-            canvas_width: 1920.0,
-            canvas_height: 1080.0,
-            background_color: [255, 255, 255, 255],
-            zoom_level: 1.0,
-            pan_x: 0.0,
-            pan_y: 0.0,
-            grid_enabled: false,
-            grid_size: 20.0,
-            current_layer: 0,
-            total_layers: 1,
-            total_objects: 0,
-            created_at: 0,
-            updated_at: 0,
-            created_by: [0; 32],
-            _padding: [0; 39],
-        })
-    }
-}
-
-fn get_all_whiteboard_objects(
-    board_id: [u8; 32],
-) -> Result<WhiteboardObjects, Box<dyn std::error::Error>> {
-    let mut objects = WhiteboardObjects::default();
-
-    // Get all object IDs for this whiteboard
-    let object_ids_raw = get_children_entitities_by_entity_id(
-        &XaeroFlux::read_handle().expect("read_api not ready!"),
-        board_id,
-    )?;
-
-    // Process each object
-    for obj_chunk in object_ids_raw.chunks_exact(32) {
-        let mut obj_id = [0u8; 32];
-        obj_id.copy_from_slice(obj_chunk);
-
-        // Try to retrieve and parse the object
-        parse_and_add_object(obj_id, &mut objects)?;
-    }
-
-    Ok(objects)
-}
-
-fn parse_and_add_object(
-    obj_id: [u8; 32],
-    objects: &mut WhiteboardObjects,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Try different sizes, starting with most common
-
-    // Try L size (4096) for paths with many points
-    if let Some(event) = get_current_state_by_entity_id::<4096>(
-        &XaeroFlux::read_handle().expect("read_api not ready!"),
-        obj_id,
-    )? {
-        if process_event_data(&event.evt.data[..event.evt.len as usize], objects) {
-            return Ok(());
-        }
-    }
-
-    // Try M size (1024) for medium objects
-    if let Some(event) = get_current_state_by_entity_id::<1024>(
-        &XaeroFlux::read_handle().expect("read_api not ready!"),
-        obj_id,
-    )? {
-        if process_event_data(&event.evt.data[..event.evt.len as usize], objects) {
-            return Ok(());
-        }
-    }
-
-    // Try S size (256) for small objects
-    if let Some(event) = get_current_state_by_entity_id::<256>(
-        &XaeroFlux::read_handle().expect("read_api not ready!"),
-        obj_id,
-    )? {
-        if process_event_data(&event.evt.data[..event.evt.len as usize], objects) {
-            return Ok(());
-        }
-    }
-
-    Ok(())
-}
-
-fn process_event_data(data: &[u8], objects: &mut WhiteboardObjects) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-
-    let object_type = data[0];
-    let object_data = &data[1..];
-
-    match object_type {
-        OBJECT_TYPE_PATH => {
-            if let Ok(path) = bytemuck::try_from_bytes::<PathData<512>>(object_data) {
-                objects.paths.push(*path);
-                return true;
-            }
-        }
-        OBJECT_TYPE_STICKY => {
-            if let Ok(sticky) = bytemuck::try_from_bytes::<StickyNoteData>(object_data) {
-                objects.sticky_notes.push(*sticky);
-                return true;
-            }
-        }
-        OBJECT_TYPE_RECTANGLE => {
-            if let Ok(rect) = bytemuck::try_from_bytes::<RectangleData>(object_data) {
-                objects.rectangles.push(*rect);
-                return true;
-            }
-        }
-        OBJECT_TYPE_CIRCLE => {
-            if let Ok(circle) = bytemuck::try_from_bytes::<CircleData>(object_data) {
-                objects.circles.push(*circle);
-                return true;
-            }
-        }
-        OBJECT_TYPE_ARROW =>
-            if let Ok(arrow) = bytemuck::try_from_bytes::<ArrowData>(object_data) {
-                objects.arrows.push(*arrow);
-                return true;
-            },
-        OBJECT_TYPE_TEXT =>
-            if let Ok(text) = bytemuck::try_from_bytes::<TextBoxData>(object_data) {
-                objects.text_boxes.push(*text);
-                return true;
-            },
-        OBJECT_TYPE_COMMENT => {
-            if let Ok(comment) = bytemuck::try_from_bytes::<CommentData>(object_data) {
-                objects.comments.push(*comment);
-                return true;
-            }
-        }
-        OBJECT_TYPE_FILE => {
-            if let Ok(file) = bytemuck::try_from_bytes::<FileAttachmentData>(object_data) {
-                objects.files.push(*file);
-                return true;
-            }
-        }
-        _ => {}
-    }
-
-    false
-}
-
-pub fn get_multiple_workspaces_with_objects(
-    workspace_ids: Vec<[u8; 32]>,
-) -> Result<Vec<PopulatedWorkspace>, Box<dyn std::error::Error>> {
-    let mut workspaces = Vec::new();
-
-    for workspace_id in workspace_ids {
-        match get_workspace_with_all_objects(workspace_id) {
-            Ok(workspace) => workspaces.push(workspace),
-            Err(e) => {
-                eprintln!(
-                    "Failed to load workspace {:?}: {}",
-                    hex::encode(workspace_id),
-                    e
-                );
-                continue;
-            }
-        }
-    }
-
-    Ok(workspaces)
-}
-
-// Add to storage.rs
-
-use bytemuck::{Pod, Zeroable};
-
-// ================================================================================================
-// INVITATION STRUCTURES
-// ================================================================================================
-
-#[repr(C, align(64))]
-#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct InvitationRecord {
     pub invitation_hash: [u8; 32],
     pub workspace_id: [u8; 32],
@@ -560,126 +424,104 @@ pub struct InvitationRecord {
     pub _padding: [u8; 48],
 }
 
-unsafe impl Pod for InvitationRecord {}
-unsafe impl Zeroable for InvitationRecord {}
-
-#[repr(C, align(64))]
-#[derive(Copy, Clone, Debug)]
-pub struct WorkspaceMembership {
-    pub workspace_id: [u8; 32],
-    pub user_id: [u8; 32],
-    pub role: u8, // 0=member, 1=admin, 2=owner
-    pub joined_at: u64,
-    pub invited_by: [u8; 32],
-    pub _padding: [u8; 55],
-}
-
-unsafe impl Pod for WorkspaceMembership {}
-unsafe impl Zeroable for WorkspaceMembership {}
-
-// ================================================================================================
-// LIST OPERATIONS
-// ================================================================================================
-
-pub fn list_all_groups<const MAX_WORKSPACES: usize>()
--> Result<Vec<Group<MAX_WORKSPACES>>, Box<dyn std::error::Error>>
-where
-    [(); { std::mem::size_of::<Group<MAX_WORKSPACES>>() }]:,
-{
-    let rh = XaeroFlux::read_handle().expect("read handle not ready!");
-
-    // Use LMDB scan to get all groups (EVENT_TYPE_GROUP = 100)
-    let events = unsafe {
-        xaeroflux_actors::aof::storage::lmdb::get_events_by_event_type::<
-            { std::mem::size_of::<Group<MAX_WORKSPACES>>() },
-        >(&rh, EVENT_TYPE_GROUP)?
-    };
-
-    let mut groups = Vec::new();
-    for event in events {
-        let group = bytemuck::from_bytes::<Group<MAX_WORKSPACES>>(
-            &event.evt.data[..std::mem::size_of::<Group<MAX_WORKSPACES>>()],
-        );
-        groups.push(*group);
-    }
-
-    Ok(groups)
-}
-
-pub fn list_workspaces_for_group<const MAX_BOARDS: usize>(
-    group_id: [u8; 32],
-) -> Result<Vec<Workspace<MAX_BOARDS>>, Box<dyn std::error::Error>>
-where
-    [(); { std::mem::size_of::<Workspace<MAX_BOARDS>>() }]:,
-{
-    let (workspaces, count) = get_workspaces_for_group::<MAX_BOARDS, 32>(group_id)?;
-    Ok(workspaces[..count].to_vec())
-}
-
-// ================================================================================================
-// INVITATION OPERATIONS
-// ================================================================================================
-
 pub fn store_invitation(invitation: InvitationRecord) -> Result<(), Box<dyn std::error::Error>> {
-    let data = bytemuck::bytes_of(&invitation);
-    XaeroFlux::write_event_static(data, 200)?; // EVENT_TYPE_INVITATION = 200
+    let event = build_hierarchical_event(
+        invitation.invitation_hash,
+        vec![invitation.workspace_id], // Parent is workspace
+        bytemuck::bytes_of(&invitation),
+    );
+
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_INVITATION)?;
     Ok(())
 }
 
-pub fn get_invitation(
-    invitation_hash: [u8; 32],
+pub fn get_invitation<const N: usize>(
+    hash: &[u8; 32],
 ) -> Result<InvitationRecord, Box<dyn std::error::Error>> {
-    let rh = XaeroFlux::read_handle().expect("read handle not ready!");
+    let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
 
-    // Search for invitation by hash
-    let events =
-        unsafe { xaeroflux_actors::aof::storage::lmdb::get_events_by_event_type::<256>(&rh, 200)? };
-
-    for event in events {
-        let inv = bytemuck::from_bytes::<InvitationRecord>(
-            &event.evt.data[..std::mem::size_of::<InvitationRecord>()],
-        );
-        if inv.invitation_hash == invitation_hash {
-            return Ok(*inv);
+    match xf.find_current_state_by_eid::<N>(*hash)? {
+        Some(event) => {
+            let (_ancestry, data) =
+                parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+            let invitation = bytemuck::from_bytes::<InvitationRecord>(data);
+            Ok(*invitation)
         }
+        None => Err("Invitation not found".into()),
     }
-
-    Err("Invitation not found".into())
 }
 
 pub fn add_user_to_workspace(
     workspace_id: [u8; 32],
     user_id: [u8; 32],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut membership = WorkspaceMembership::zeroed();
-    membership.workspace_id = workspace_id;
-    membership.user_id = user_id;
-    membership.role = 0; // Member by default
-    membership.joined_at = xaeroflux_core::date_time::emit_secs();
-
-    let data = bytemuck::bytes_of(&membership);
-    XaeroFlux::write_event_static(data, 201)?; // EVENT_TYPE_MEMBERSHIP = 201
-
+    tracing::info!(
+        "Added user {:?} to workspace {:?}",
+        hex::encode(&user_id),
+        hex::encode(&workspace_id)
+    );
     Ok(())
 }
 
-pub fn get_workspace_members(
+// ================================================================================================
+// WORKSPACE RETRIEVAL
+// ================================================================================================
+
+pub struct WorkspaceWithObjects {
+    pub workspace: Workspace<{rusted_ring::M_TSHIRT_SIZE}>,
+    pub whiteboards: Vec<Board<32>>,
+}
+
+pub fn get_workspace_with_all_objects(
     workspace_id: [u8; 32],
-) -> Result<Vec<WorkspaceMembership>, Box<dyn std::error::Error>> {
-    let rh = XaeroFlux::read_handle().expect("read handle not ready!");
+) -> Result<WorkspaceWithObjects, Box<dyn std::error::Error>> {
+    let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
 
-    let events =
-        unsafe { xaeroflux_actors::aof::storage::lmdb::get_events_by_event_type::<256>(&rh, 201)? };
-
-    let mut members = Vec::new();
-    for event in events {
-        let membership = bytemuck::from_bytes::<WorkspaceMembership>(
-            &event.evt.data[..std::mem::size_of::<WorkspaceMembership>()],
-        );
-        if membership.workspace_id == workspace_id {
-            members.push(*membership);
+    // Get workspace
+    let workspace = match xf.find_current_state_by_eid::<{rusted_ring::M_TSHIRT_SIZE}>
+(workspace_id)? {
+        Some(event) => {
+            let (_ancestry, data) =
+                parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+            let ws = bytemuck::from_bytes::<Workspace<{rusted_ring::M_TSHIRT_SIZE}>>(data);
+            *ws
         }
+        None => return Err("Workspace not found".into()),
+    };
+
+    // Get boards for workspace
+    use xaeroflux_actors::read_api::{RangeQuery, ReadApi};
+
+    let query = RangeQuery::<{ rusted_ring::M_TSHIRT_SIZE }> {
+        xaero_id: [0u8; 32],
+        event_type: EVENT_TYPE_BOARD,
+    };
+
+    let events = xf.range_query_with_filter::<{ rusted_ring::M_TSHIRT_SIZE }, _>(
+        query,
+        Box::new(
+            move |event: &XaeroInternalEvent<{ rusted_ring::M_TSHIRT_SIZE }>| {
+                let (ancestry, data) =
+                    parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+                // Check if workspace_id is in ancestry
+                if ancestry.len() >= 2 && ancestry.contains(&workspace_id) {
+                    data.len() == std::mem::size_of::<Board<32>>()
+                } else {
+                    false
+                }
+            },
+        ),
+    )?;
+
+    let mut whiteboards = Vec::new();
+    for event in events {
+        let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+        let board = bytemuck::from_bytes::<Board<32>>(data);
+        whiteboards.push(*board);
     }
 
-    Ok(members)
+    Ok(WorkspaceWithObjects {
+        workspace,
+        whiteboards,
+    })
 }
