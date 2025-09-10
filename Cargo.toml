@@ -8,7 +8,7 @@ path = "src/lib.rs"
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-bytemuck = "1.23.1"
+bytemuck = { version = "1.23.1", features = ["derive"] }
 rkyv = "0.8.11"
 xaeroid =  { path = "../xaeroID" }
 rusted-ring = "0.5.6"

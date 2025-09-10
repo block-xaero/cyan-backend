@@ -1,4 +1,4 @@
-// objects.rs - Updated with parity to Swift WhiteboardView
+// objects.rs - Complete with hierarchical support
 
 use bytemuck::{Pod, Zeroable};
 
@@ -18,6 +18,21 @@ pub const CANVAS_MODE_MATH_SYMBOL: u8 = 8;
 pub const CANVAS_MODE_FRACTION: u8 = 9;
 pub const CANVAS_MODE_GRAPH: u8 = 10;
 pub const CANVAS_MODE_STENCIL: u8 = 11;
+
+// ================================================================================================
+// OBJECT TYPES
+// ================================================================================================
+
+pub const OBJECT_TYPE_PATH: u8 = 1;
+pub const OBJECT_TYPE_STICKY: u8 = 2;
+pub const OBJECT_TYPE_RECTANGLE: u8 = 3;
+pub const OBJECT_TYPE_CIRCLE: u8 = 4;
+pub const OBJECT_TYPE_ARROW: u8 = 5;
+pub const OBJECT_TYPE_TEXT: u8 = 6;
+pub const OBJECT_TYPE_MATH: u8 = 7;
+pub const OBJECT_TYPE_GRAPH: u8 = 8;
+pub const OBJECT_TYPE_FILE: u8 = 9;
+pub const OBJECT_TYPE_COMMENT: u8 = 10;
 
 // ================================================================================================
 // PATH TYPES (matching Swift's PathType enum)
@@ -45,104 +60,78 @@ pub const STENCIL_STAR: u8 = 4;
 pub const STENCIL_HEXAGON: u8 = 5;
 
 // ================================================================================================
-// DRAWING PATH DATA (matching Swift's DrawnPath)
+// HIERARCHICAL EVENT TRAIT
+// ================================================================================================
+
+pub trait HierarchicalEvent {
+    fn get_id(&self) -> [u8; 32];
+    fn get_parent_id(&self) -> Option<[u8; 32]>;
+    fn get_ancestry(&self) -> Vec<[u8; 32]> {
+        let mut chain = vec![self.get_id()];
+        if let Some(parent) = self.get_parent_id() {
+            chain.push(parent);
+        }
+        chain
+    }
+}
+
+// ================================================================================================
+// DRAWING PATH DATA (matching Swift's DrawnPath) - Size L (4096 bytes)
 // ================================================================================================
 
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug)]
 pub struct PathData<const MAX_POINTS: usize> {
     pub path_id: [u8; 32],
-    pub board_id: [u8; 32],
+    pub board_id: [u8; 32],      // parent
+    pub workspace_id: [u8; 32],   // grandparent
+    pub group_id: [u8; 32],       // great-grandparent
     pub layer_index: u32,
     pub path_type: u8,
-    pub stencil_type: u8,      // Only used if path_type is STENCIL
-    pub stroke_color: [u8; 4], // RGBA
-    pub fill_color: [u8; 4],   // RGBA
+    pub stencil_type: u8,
+    pub stroke_color: [u8; 4],
+    pub fill_color: [u8; 4],
     pub stroke_width: f32,
-    pub start_point: [f32; 2], // x, y
-    pub end_point: [f32; 2],   // x, y
-    pub transform: [f32; 2],   // Translation x, y
-    pub text: [u8; 256],       // For text/sticky/math content
+    pub start_point: [f32; 2],
+    pub end_point: [f32; 2],
+    pub transform: [f32; 2],
+    pub text: [u8; 256],
     pub point_count: u32,
-    pub points: [[f32; 2]; MAX_POINTS], // For freehand paths
+    pub points: [[f32; 2]; MAX_POINTS],
     pub created_at: u64,
-    pub created_by: [u8; 32], // XaeroID
+    pub created_by: [u8; 32],
     pub _padding: [u8; 2],
 }
 
 unsafe impl<const MAX_POINTS: usize> Pod for PathData<MAX_POINTS> {}
 unsafe impl<const MAX_POINTS: usize> Zeroable for PathData<MAX_POINTS> {}
 
-// ================================================================================================
-// LAYER DATA (matching Swift's CanvasLayer)
-// ================================================================================================
-
-#[repr(C, align(64))]
-#[derive(Copy, Clone, Debug)]
-pub struct LayerData {
-    pub layer_id: [u8; 32],
-    pub board_id: [u8; 32],
-    pub name: [u8; 64],
-    pub visible: bool,
-    pub locked: bool,
-    pub opacity: f32, // 0.0 to 1.0
-    pub z_index: u32,
-    pub object_count: u32, // Number of objects in this layer
-    pub created_at: u64,
-    pub _padding: [u8; 42],
+impl<const MAX_POINTS: usize> HierarchicalEvent for PathData<MAX_POINTS> {
+    fn get_id(&self) -> [u8; 32] { self.path_id }
+    fn get_parent_id(&self) -> Option<[u8; 32]> { Some(self.board_id) }
 }
 
-unsafe impl Pod for LayerData {}
-unsafe impl Zeroable for LayerData {}
-
 // ================================================================================================
-// WHITEBOARD DATA (matching Swift's WhiteboardView state)
-// ================================================================================================
-
-#[repr(C, align(64))]
-#[derive(Copy, Clone, Debug)]
-pub struct WhiteboardData {
-    pub board_id: [u8; 32],
-    pub title: [u8; 128],
-    pub canvas_width: f32,
-    pub canvas_height: f32,
-    pub background_color: [u8; 4],
-    pub zoom_level: f32,
-    pub pan_x: f32,
-    pub pan_y: f32,
-    pub grid_enabled: bool,
-    pub grid_size: f32,
-    pub current_layer: u32,
-    pub total_layers: u32,
-    pub total_objects: u32,
-    pub created_at: u64,
-    pub updated_at: u64,
-    pub created_by: [u8; 32],
-    pub _padding: [u8; 39],
-}
-
-unsafe impl Pod for WhiteboardData {}
-unsafe impl Zeroable for WhiteboardData {}
-
-// ================================================================================================
-// STICKY NOTE DATA (matching Swift's sticky note functionality)
+// STICKY NOTE DATA - Size S (256 bytes)
 // ================================================================================================
 
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug)]
 pub struct StickyNoteData {
     pub note_id: [u8; 32],
-    pub board_id: [u8; 32],
+    pub board_id: [u8; 32],       // parent
+    pub workspace_id: [u8; 32],   // grandparent
+    pub group_id: [u8; 32],       // great-grandparent
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
     pub rotation: f32,
     pub z_index: u32,
-    pub background_color: [u8; 4], // Default yellow
-    pub text_color: [u8; 4],       // Default black
+    pub background_color: [u8; 4],
+    pub text_color: [u8; 4],
     pub font_size: u16,
-    pub text: [u8; 400], // Note content
+    pub text: [u8; 80],           // Reduced to fit in S size
     pub created_at: u64,
     pub created_by: [u8; 32],
     pub _padding: [u8; 6],
@@ -151,61 +140,22 @@ pub struct StickyNoteData {
 unsafe impl Pod for StickyNoteData {}
 unsafe impl Zeroable for StickyNoteData {}
 
-// ================================================================================================
-// TEXT BOX DATA (matching Swift's text functionality)
-// ================================================================================================
-
-#[repr(C, align(64))]
-#[derive(Copy, Clone, Debug)]
-pub struct TextBoxData {
-    pub text_id: [u8; 32],
-    pub board_id: [u8; 32],
-    pub x: f32,
-    pub y: f32,
-    pub text_color: [u8; 4],
-    pub font_size: u16,
-    pub font_weight: u8, // 0=normal, 1=bold
-    pub text_align: u8,  // 0=left, 1=center, 2=right
-    pub text: [u8; 256],
-    pub created_at: u64,
-    pub created_by: [u8; 32],
-    pub _padding: [u8; 92],
+impl HierarchicalEvent for StickyNoteData {
+    fn get_id(&self) -> [u8; 32] { self.note_id }
+    fn get_parent_id(&self) -> Option<[u8; 32]> { Some(self.board_id) }
 }
 
-unsafe impl Pod for TextBoxData {}
-unsafe impl Zeroable for TextBoxData {}
-
 // ================================================================================================
-// MATH SYMBOL DATA
-// ================================================================================================
-
-#[repr(C, align(64))]
-#[derive(Copy, Clone, Debug)]
-pub struct MathSymbolData {
-    pub symbol_id: [u8; 32],
-    pub board_id: [u8; 32],
-    pub x: f32,
-    pub y: f32,
-    pub symbol: [u8; 8], // UTF-8 encoded math symbol
-    pub font_size: u16,
-    pub color: [u8; 4],
-    pub created_at: u64,
-    pub created_by: [u8; 32],
-    pub _padding: [u8; 114],
-}
-
-unsafe impl Pod for MathSymbolData {}
-unsafe impl Zeroable for MathSymbolData {}
-
-// ================================================================================================
-// SHAPE DATA (matching Swift's shape tools)
+// SHAPE DATA - Size S (256 bytes)
 // ================================================================================================
 
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug)]
 pub struct RectangleData {
     pub shape_id: [u8; 32],
-    pub board_id: [u8; 32],
+    pub board_id: [u8; 32],       // parent
+    pub workspace_id: [u8; 32],   // grandparent
+    pub group_id: [u8; 32],       // great-grandparent
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -217,17 +167,24 @@ pub struct RectangleData {
     pub corner_radius: f32,
     pub created_at: u64,
     pub created_by: [u8; 32],
-    pub _padding: [u8; 88],
+    pub _padding: [u8; 56],
 }
 
 unsafe impl Pod for RectangleData {}
 unsafe impl Zeroable for RectangleData {}
 
+impl HierarchicalEvent for RectangleData {
+    fn get_id(&self) -> [u8; 32] { self.shape_id }
+    fn get_parent_id(&self) -> Option<[u8; 32]> { Some(self.board_id) }
+}
+
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug)]
 pub struct CircleData {
     pub shape_id: [u8; 32],
-    pub board_id: [u8; 32],
+    pub board_id: [u8; 32],       // parent
+    pub workspace_id: [u8; 32],   // grandparent
+    pub group_id: [u8; 32],       // great-grandparent
     pub center_x: f32,
     pub center_y: f32,
     pub radius: f32,
@@ -236,17 +193,24 @@ pub struct CircleData {
     pub stroke_width: f32,
     pub created_at: u64,
     pub created_by: [u8; 32],
-    pub _padding: [u8; 100],
+    pub _padding: [u8; 68],
 }
 
 unsafe impl Pod for CircleData {}
 unsafe impl Zeroable for CircleData {}
 
+impl HierarchicalEvent for CircleData {
+    fn get_id(&self) -> [u8; 32] { self.shape_id }
+    fn get_parent_id(&self) -> Option<[u8; 32]> { Some(self.board_id) }
+}
+
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug)]
 pub struct ArrowData {
     pub arrow_id: [u8; 32],
-    pub board_id: [u8; 32],
+    pub board_id: [u8; 32],       // parent
+    pub workspace_id: [u8; 32],   // grandparent
+    pub group_id: [u8; 32],       // great-grandparent
     pub start_x: f32,
     pub start_y: f32,
     pub end_x: f32,
@@ -256,115 +220,50 @@ pub struct ArrowData {
     pub arrow_head_length: f32,
     pub created_at: u64,
     pub created_by: [u8; 32],
-    pub _padding: [u8; 96],
+    pub _padding: [u8; 64],
 }
 
 unsafe impl Pod for ArrowData {}
 unsafe impl Zeroable for ArrowData {}
 
+impl HierarchicalEvent for ArrowData {
+    fn get_id(&self) -> [u8; 32] { self.arrow_id }
+    fn get_parent_id(&self) -> Option<[u8; 32]> { Some(self.board_id) }
+}
+
 // ================================================================================================
-// COMMENT DATA (matching Swift's Reddit-style comments)
+// COMMENT DATA - Size M (512 bytes)
 // ================================================================================================
 
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug)]
 pub struct CommentData {
     pub comment_id: [u8; 32],
-    pub board_id: [u8; 32],
-    pub parent_id: [u8; 32], // For threading (0 if top-level)
-    pub author_id: [u8; 32], // XaeroID
+    pub board_id: [u8; 32],       // parent (board being commented on)
+    pub parent_comment_id: [u8; 32], // parent comment (for threading)
+    pub workspace_id: [u8; 32],   // grandparent
+    pub group_id: [u8; 32],       // great-grandparent
+    pub author_id: [u8; 32],
     pub author_name: [u8; 64],
-    pub content: [u8; 500],
+    pub content: [u8; 200],       // Adjusted for size
     pub upvotes: u32,
     pub downvotes: u32,
-    pub depth: u8, // Reply depth
+    pub depth: u8,
     pub is_collapsed: bool,
-    pub has_upvoted: bool, // Current user's vote state
-    pub has_downvoted: bool,
     pub created_at: u64,
-    pub _padding: [u8; 16],
+    pub _padding: [u8; 14],
 }
 
 unsafe impl Pod for CommentData {}
 unsafe impl Zeroable for CommentData {}
 
-// ================================================================================================
-// FILE ATTACHMENT DATA (matching Swift's FileNode)
-// ================================================================================================
-
-#[repr(C, align(64))]
-#[derive(Copy, Clone, Debug)]
-pub struct FileAttachmentData {
-    pub file_id: [u8; 32],
-    pub board_id: [u8; 32],
-    pub name: [u8; 256],
-    pub file_type: u8, // 0=image, 1=pdf, 2=text, 3=code, 4=data
-    pub file_size: u64,
-    pub blake_hash: [u8; 32], // Content hash
-    pub color: [u8; 4],       // Display color based on type
-    pub icon: [u8; 32],       // Icon name for display
-    pub uploaded_by: [u8; 32],
-    pub uploaded_at: u64,
-    pub _padding: [u8; 59],
+impl HierarchicalEvent for CommentData {
+    fn get_id(&self) -> [u8; 32] { self.comment_id }
+    fn get_parent_id(&self) -> Option<[u8; 32]> {
+        if self.parent_comment_id != [0u8; 32] {
+            Some(self.parent_comment_id)
+        } else {
+            Some(self.board_id)
+        }
+    }
 }
-
-unsafe impl Pod for FileAttachmentData {}
-unsafe impl Zeroable for FileAttachmentData {}
-
-// ================================================================================================
-// USER PRESENCE DATA (for collaborative features)
-// ================================================================================================
-
-#[repr(C, align(64))]
-#[derive(Copy, Clone, Debug)]
-pub struct UserCursorData {
-    pub user_id: [u8; 32],
-    pub board_id: [u8; 32],
-    pub cursor_x: f32,
-    pub cursor_y: f32,
-    pub cursor_color: [u8; 4],
-    pub user_name: [u8; 64],
-    pub is_active: bool,
-    pub current_tool: u8, // Canvas mode
-    pub last_seen: u64,
-    pub _padding: [u8; 106],
-}
-
-unsafe impl Pod for UserCursorData {}
-unsafe impl Zeroable for UserCursorData {}
-
-#[repr(C, align(64))]
-#[derive(Copy, Clone, Debug)]
-pub struct SelectionData {
-    pub user_id: [u8; 32],
-    pub board_id: [u8; 32],
-    pub selected_objects: [[u8; 32]; 10], // Up to 10 selected object IDs
-    pub selection_count: u32,
-    pub _padding: [u8; 60],
-}
-
-unsafe impl Pod for SelectionData {}
-unsafe impl Zeroable for SelectionData {}
-
-// ================================================================================================
-// GRAPH DATA (for graph tool)
-// ================================================================================================
-
-#[repr(C, align(64))]
-#[derive(Copy, Clone, Debug)]
-pub struct GraphData {
-    pub graph_id: [u8; 32],
-    pub board_id: [u8; 32],
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-    pub equation: [u8; 128], // Math equation string
-    pub color: [u8; 4],
-    pub created_at: u64,
-    pub created_by: [u8; 32],
-    pub _padding: [u8; 44],
-}
-
-unsafe impl Pod for GraphData {}
-unsafe impl Zeroable for GraphData {}
