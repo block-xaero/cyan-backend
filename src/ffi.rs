@@ -4,6 +4,7 @@ use std::{
 };
 
 use ark_ff::BigInteger;
+use tracing_subscriber::EnvFilter;
 use xaeroflux_actors::XaeroFlux;
 use xaeroid::XaeroID;
 
@@ -29,7 +30,20 @@ pub extern "C" fn cyan_init(
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
             tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::TRACE)
+                .with_env_filter(
+                    EnvFilter::from_default_env()
+                        // Keep your xaeroflux at whatever level you want
+                        .add_directive("xaeroflux_actors=trace".parse().unwrap())
+                        .add_directive("xaeroflux_core=trace".parse().unwrap())
+                        // Silence iroh and related crates
+                        .add_directive("iroh=warn".parse().unwrap())
+                        .add_directive("iroh_relay=warn".parse().unwrap())
+                        .add_directive("iroh_net=warn".parse().unwrap())
+                        .add_directive("iroh_quinn=warn".parse().unwrap())
+                        .add_directive("iroh_quinn_proto=warn".parse().unwrap())
+                        .add_directive("swarm_discovery=warn".parse().unwrap())
+                        .add_directive("acto=warn".parse().unwrap())
+                )
                 .init();
         });
 
