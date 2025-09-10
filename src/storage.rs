@@ -1,13 +1,12 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
-use bytemuck::{Pod, Zeroable};
 use xaeroflux_actors::{
-    aof::storage::lmdb::{get_children_entitities_by_entity_id, get_current_state_by_entity_id},
     XaeroFlux,
+    aof::storage::lmdb::{get_children_entitities_by_entity_id, get_current_state_by_entity_id},
 };
 use xaeroflux_core::date_time::emit_secs;
 
-use crate::{objects::*, Group, Workspace, Board, Comment, Layer, DrawingPath, FileNode};
+use crate::{Board, Comment, DrawingPath, FileNode, Group, Layer, Workspace, objects::*};
 
 pub static DATA_DIR: &str = "cyan";
 
@@ -60,24 +59,27 @@ pub struct PopulatedWorkspace {
 // READ OPERATIONS
 // ================================================================================================
 
-
 pub fn get_group_by_group_id<const SIZE: usize>(
     group_id: [u8; 32],
-) -> Result<Group<SIZE>, Box<dyn std::error::Error>> where [(); { std::mem::size_of::<Group<SIZE>>() }]: {
+) -> Result<Group<SIZE>, Box<dyn std::error::Error>>
+where
+    [(); { std::mem::size_of::<Group<SIZE>>() }]:,
+{
     let rh = XaeroFlux::read_handle().expect("read handle not ready yet!");
     match get_current_state_by_entity_id::<{ std::mem::size_of::<Group<SIZE>>() }>(&rh, group_id)? {
-        Some(current_state) => {
-            Ok(*bytemuck::from_bytes::<Group<SIZE>>(
-                &current_state.evt.data[..std::mem::size_of::<Group<SIZE>>()],
-            ))
-        }
+        Some(current_state) => Ok(*bytemuck::from_bytes::<Group<SIZE>>(
+            &current_state.evt.data[..std::mem::size_of::<Group<SIZE>>()],
+        )),
         None => Err("Group not found".into()),
     }
 }
 
 pub fn get_workspaces_for_group<const SIZE: usize, const MAX_WORKSPACES: usize>(
     group_id: [u8; 32],
-) -> Result<([Workspace<SIZE>; MAX_WORKSPACES], usize), Box<dyn std::error::Error>> where [(); { std::mem::size_of::<Workspace<SIZE>>() }]: {
+) -> Result<([Workspace<SIZE>; MAX_WORKSPACES], usize), Box<dyn std::error::Error>>
+where
+    [(); { std::mem::size_of::<Workspace<SIZE>>() }]:,
+{
     let mut workspaces = [Workspace::<SIZE>::zeroed(); MAX_WORKSPACES];
     let mut count = 0;
 
@@ -96,7 +98,9 @@ pub fn get_workspaces_for_group<const SIZE: usize, const MAX_WORKSPACES: usize>(
         let mut buffer = [0u8; 32];
         buffer.copy_from_slice(chunk);
 
-        match get_current_state_by_entity_id::<{ std::mem::size_of::<Workspace<SIZE>>() }>(&rh, buffer)? {
+        match get_current_state_by_entity_id::<{ std::mem::size_of::<Workspace<SIZE>>() }>(
+            &rh, buffer,
+        )? {
             Some(current_state_workspace) => {
                 let w = bytemuck::from_bytes::<Workspace<SIZE>>(&current_state_workspace.evt.data);
                 workspaces[count] = *w;
@@ -153,11 +157,15 @@ pub fn create_group<const MAX_WORKSPACES: usize>(
     icon: &str,
     color: [u8; 4],
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    let group_id = blake3::hash(&[
-        creator_id.as_slice(),
-        name.as_bytes(),
-        &emit_secs().to_le_bytes(),
-    ].concat()).into();
+    let group_id = blake3::hash(
+        &[
+            creator_id.as_slice(),
+            name.as_bytes(),
+            &emit_secs().to_le_bytes(),
+        ]
+        .concat(),
+    )
+    .into();
 
     let mut group = Group::<MAX_WORKSPACES>::zeroed();
     group.group_id = group_id;
@@ -188,11 +196,15 @@ pub fn create_workspace<const MAX_BOARDS: usize>(
     group_id: [u8; 32],
     name: &str,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    let workspace_id = blake3::hash(&[
-        group_id.as_slice(),
-        name.as_bytes(),
-        &emit_secs().to_le_bytes(),
-    ].concat()).into();
+    let workspace_id = blake3::hash(
+        &[
+            group_id.as_slice(),
+            name.as_bytes(),
+            &emit_secs().to_le_bytes(),
+        ]
+        .concat(),
+    )
+    .into();
 
     let mut workspace = Workspace::<MAX_BOARDS>::zeroed();
     workspace.workspace_id = workspace_id;
@@ -219,11 +231,15 @@ pub fn create_board<const MAX_FILES: usize>(
     group_id: [u8; 32],
     name: &str,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    let board_id = blake3::hash(&[
-        workspace_id.as_slice(),
-        name.as_bytes(),
-        &emit_secs().to_le_bytes(),
-    ].concat()).into();
+    let board_id = blake3::hash(
+        &[
+            workspace_id.as_slice(),
+            name.as_bytes(),
+            &emit_secs().to_le_bytes(),
+        ]
+        .concat(),
+    )
+    .into();
 
     let mut board = Board::<MAX_FILES>::zeroed();
     board.board_id = board_id;
@@ -269,11 +285,15 @@ pub fn add_whiteboard_object<T: Pod>(
     object: &T,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     // Generate object ID
-    let object_id = blake3::hash(&[
-        board_id.as_slice(),
-        &[object_type],
-        &emit_secs().to_le_bytes(),
-    ].concat()).into();
+    let object_id = blake3::hash(
+        &[
+            board_id.as_slice(),
+            &[object_type],
+            &emit_secs().to_le_bytes(),
+        ]
+        .concat(),
+    )
+    .into();
 
     // Prepare event with type byte + object data
     let mut event_data = Vec::with_capacity(std::mem::size_of::<T>() + 1);
@@ -293,12 +313,16 @@ pub fn add_comment<const MAX_TEXT: usize>(
     content: &str,
     parent_id: Option<[u8; 32]>,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    let comment_id = blake3::hash(&[
-        board_id.as_slice(),
-        author_id.as_slice(),
-        content.as_bytes(),
-        &emit_secs().to_le_bytes(),
-    ].concat()).into();
+    let comment_id = blake3::hash(
+        &[
+            board_id.as_slice(),
+            author_id.as_slice(),
+            content.as_bytes(),
+            &emit_secs().to_le_bytes(),
+        ]
+        .concat(),
+    )
+    .into();
 
     let mut comment = Comment::<MAX_TEXT>::zeroed();
     comment.comment_id = comment_id;
@@ -466,18 +490,16 @@ fn process_event_data(data: &[u8], objects: &mut WhiteboardObjects) -> bool {
                 return true;
             }
         }
-        OBJECT_TYPE_ARROW => {
+        OBJECT_TYPE_ARROW =>
             if let Ok(arrow) = bytemuck::try_from_bytes::<ArrowData>(object_data) {
                 objects.arrows.push(*arrow);
                 return true;
-            }
-        }
-        OBJECT_TYPE_TEXT => {
+            },
+        OBJECT_TYPE_TEXT =>
             if let Ok(text) = bytemuck::try_from_bytes::<TextBoxData>(object_data) {
                 objects.text_boxes.push(*text);
                 return true;
-            }
-        }
+            },
         OBJECT_TYPE_COMMENT => {
             if let Ok(comment) = bytemuck::try_from_bytes::<CommentData>(object_data) {
                 objects.comments.push(*comment);
@@ -516,4 +538,148 @@ pub fn get_multiple_workspaces_with_objects(
     }
 
     Ok(workspaces)
+}
+
+// Add to storage.rs
+
+use bytemuck::{Pod, Zeroable};
+
+// ================================================================================================
+// INVITATION STRUCTURES
+// ================================================================================================
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct InvitationRecord {
+    pub invitation_hash: [u8; 32],
+    pub workspace_id: [u8; 32],
+    pub inviter_id: [u8; 32],
+    pub invitee_id: [u8; 32],
+    pub expiry_time: u64,
+    pub created_at: u64,
+    pub _padding: [u8; 48],
+}
+
+unsafe impl Pod for InvitationRecord {}
+unsafe impl Zeroable for InvitationRecord {}
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug)]
+pub struct WorkspaceMembership {
+    pub workspace_id: [u8; 32],
+    pub user_id: [u8; 32],
+    pub role: u8, // 0=member, 1=admin, 2=owner
+    pub joined_at: u64,
+    pub invited_by: [u8; 32],
+    pub _padding: [u8; 55],
+}
+
+unsafe impl Pod for WorkspaceMembership {}
+unsafe impl Zeroable for WorkspaceMembership {}
+
+// ================================================================================================
+// LIST OPERATIONS
+// ================================================================================================
+
+pub fn list_all_groups<const MAX_WORKSPACES: usize>()
+-> Result<Vec<Group<MAX_WORKSPACES>>, Box<dyn std::error::Error>>
+where
+    [(); { std::mem::size_of::<Group<MAX_WORKSPACES>>() }]:,
+{
+    let rh = XaeroFlux::read_handle().expect("read handle not ready!");
+
+    // Use LMDB scan to get all groups (EVENT_TYPE_GROUP = 100)
+    let events = unsafe {
+        xaeroflux_actors::aof::storage::lmdb::get_events_by_event_type::<
+            { std::mem::size_of::<Group<MAX_WORKSPACES>>() },
+        >(&rh, EVENT_TYPE_GROUP)?
+    };
+
+    let mut groups = Vec::new();
+    for event in events {
+        let group = bytemuck::from_bytes::<Group<MAX_WORKSPACES>>(
+            &event.evt.data[..std::mem::size_of::<Group<MAX_WORKSPACES>>()],
+        );
+        groups.push(*group);
+    }
+
+    Ok(groups)
+}
+
+pub fn list_workspaces_for_group<const MAX_BOARDS: usize>(
+    group_id: [u8; 32],
+) -> Result<Vec<Workspace<MAX_BOARDS>>, Box<dyn std::error::Error>>
+where
+    [(); { std::mem::size_of::<Workspace<MAX_BOARDS>>() }]:,
+{
+    let (workspaces, count) = get_workspaces_for_group::<MAX_BOARDS, 32>(group_id)?;
+    Ok(workspaces[..count].to_vec())
+}
+
+// ================================================================================================
+// INVITATION OPERATIONS
+// ================================================================================================
+
+pub fn store_invitation(invitation: InvitationRecord) -> Result<(), Box<dyn std::error::Error>> {
+    let data = bytemuck::bytes_of(&invitation);
+    XaeroFlux::write_event_static(data, 200)?; // EVENT_TYPE_INVITATION = 200
+    Ok(())
+}
+
+pub fn get_invitation(
+    invitation_hash: [u8; 32],
+) -> Result<InvitationRecord, Box<dyn std::error::Error>> {
+    let rh = XaeroFlux::read_handle().expect("read handle not ready!");
+
+    // Search for invitation by hash
+    let events =
+        unsafe { xaeroflux_actors::aof::storage::lmdb::get_events_by_event_type::<256>(&rh, 200)? };
+
+    for event in events {
+        let inv = bytemuck::from_bytes::<InvitationRecord>(
+            &event.evt.data[..std::mem::size_of::<InvitationRecord>()],
+        );
+        if inv.invitation_hash == invitation_hash {
+            return Ok(*inv);
+        }
+    }
+
+    Err("Invitation not found".into())
+}
+
+pub fn add_user_to_workspace(
+    workspace_id: [u8; 32],
+    user_id: [u8; 32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut membership = WorkspaceMembership::zeroed();
+    membership.workspace_id = workspace_id;
+    membership.user_id = user_id;
+    membership.role = 0; // Member by default
+    membership.joined_at = xaeroflux_core::date_time::emit_secs();
+
+    let data = bytemuck::bytes_of(&membership);
+    XaeroFlux::write_event_static(data, 201)?; // EVENT_TYPE_MEMBERSHIP = 201
+
+    Ok(())
+}
+
+pub fn get_workspace_members(
+    workspace_id: [u8; 32],
+) -> Result<Vec<WorkspaceMembership>, Box<dyn std::error::Error>> {
+    let rh = XaeroFlux::read_handle().expect("read handle not ready!");
+
+    let events =
+        unsafe { xaeroflux_actors::aof::storage::lmdb::get_events_by_event_type::<256>(&rh, 201)? };
+
+    let mut members = Vec::new();
+    for event in events {
+        let membership = bytemuck::from_bytes::<WorkspaceMembership>(
+            &event.evt.data[..std::mem::size_of::<WorkspaceMembership>()],
+        );
+        if membership.workspace_id == workspace_id {
+            members.push(*membership);
+        }
+    }
+
+    Ok(members)
 }
