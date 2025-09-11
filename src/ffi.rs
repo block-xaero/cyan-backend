@@ -31,14 +31,7 @@ pub extern "C" fn cyan_init(
         INIT.call_once(|| {
             tracing_subscriber::fmt()
                 .with_env_filter(
-                    EnvFilter::from_default_env()
-                        // Keep your xaeroflux at whatever level you want
-                        .add_directive("xaeroflux_actors=trace".parse().unwrap())
-                        .add_directive("xaeroflux_core=trace".parse().unwrap())
-                        // Silence iroh and related crates
-                        .add_directive("iroh=off".parse().unwrap())
-                        .add_directive("swarm_discovery=off".parse().unwrap())
-                        .add_directive("acto=warn".parse().unwrap()),
+                    EnvFilter::new("error,cyan_backend=trace,xaeroflux_actors=info,xaeroflux_core=info")
                 )
                 .init();
         });
@@ -418,34 +411,43 @@ pub extern "C" fn cyan_list_groups(
     buffer_size: usize,
     actual_size: *mut usize,
 ) -> bool {
-    unsafe {
-        // Get all groups from storage
-        match crate::storage::list_all_groups::<16>() {
-            Ok(groups) => {
-                let total_size = groups.len() * std::mem::size_of::<Group<16>>();
-                if total_size > buffer_size {
-                    return false;
-                }
+    std::panic::catch_unwind(|| {
+        unsafe {
+            // Debug: print actual struct size
+            eprintln!("Group<16> actual size: {}", std::mem::size_of::<Group<16>>());
 
-                let mut offset = 0;
-                for group in groups {
-                    let group_bytes = bytemuck::bytes_of(&group);
-                    ptr::copy_nonoverlapping(
-                        group_bytes.as_ptr(),
-                        out_buffer.add(offset),
-                        group_bytes.len(),
-                    );
-                    offset += group_bytes.len();
-                }
+            match crate::storage::list_all_groups::<16>() {
+                Ok(groups) => {
+                    tracing::info!("Found {} groups", groups.len());
 
-                *actual_size = total_size;
-                true
+                    let total_size = groups.len() * std::mem::size_of::<Group<16>>();
+
+                    if total_size > buffer_size {
+                        return false;
+                    }
+
+                    let mut offset = 0;
+                    for group in groups.iter() {
+                        let group_bytes = bytemuck::bytes_of(group);
+                        std::ptr::copy_nonoverlapping(
+                            group_bytes.as_ptr(),
+                            out_buffer.add(offset),
+                            group_bytes.len(),
+                        );
+                        offset += group_bytes.len();
+                    }
+
+                    *actual_size = total_size;
+                    true
+                }
+                Err(e) => {
+                    tracing::error!("list_all_groups failed: {:?}", e);
+                    false
+                }
             }
-            Err(_) => false,
         }
-    }
+    }).unwrap_or(false)
 }
-
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_list_workspaces(
     group_id: *const u8,

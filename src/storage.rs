@@ -129,19 +129,38 @@ pub fn list_all_groups<const N: usize>() -> Result<Vec<Group<N>>, Box<dyn std::e
 
     use xaeroflux_actors::read_api::{RangeQuery, ReadApi};
 
-    let query = RangeQuery::<{ rusted_ring::S_TSHIRT_SIZE }> {
+    // Use M_TSHIRT_SIZE as your hierarchical events are ~600-800 bytes
+    let query = RangeQuery::<{rusted_ring::M_TSHIRT_SIZE}> {
         xaero_id: [0u8; 32],
         event_type: EVENT_TYPE_GROUP,
     };
 
     let events = xf.range_query(query)?;
 
+    tracing::info!("Query returned {} events", events.len());
+
     let mut groups = Vec::new();
     for event in events {
-        let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
-        if data.len() == std::mem::size_of::<Group<N>>() {
-            let group = bytemuck::from_bytes::<Group<N>>(data);
-            groups.push(*group);
+        let hierarchical_data = &event.evt.data[..event.evt.len as usize];
+        let (_ancestry, group_data) = parse_hierarchical_event(hierarchical_data);
+
+        if group_data.len() >= std::mem::size_of::<Group<N>>() {
+            // Copy to aligned buffer to avoid alignment issues
+            let mut aligned_buffer = vec![0u8; std::mem::size_of::<Group<N>>()];
+            aligned_buffer.copy_from_slice(&group_data[..std::mem::size_of::<Group<N>>()]);
+
+            // Now parse from the aligned buffer
+            let group = unsafe {
+                std::ptr::read(aligned_buffer.as_ptr() as *const Group<N>)
+            };
+
+            groups.push(group);
+
+            // Debug: print group info
+            let name = std::str::from_utf8(&group.name)
+                .unwrap_or("invalid")
+                .trim_end_matches('\0');
+            tracing::info!("Found group: {}", name);
         }
     }
 
@@ -219,6 +238,11 @@ pub fn list_workspaces_for_group<const N: usize>(
 ) -> Result<Vec<Workspace<N>>, Box<dyn std::error::Error>> {
     let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
 
+    unsafe {
+        if let Some(env) = &xf.read_handle {
+            let _ = xaeroflux_actors::aof::storage::lmdb::debug_scan_all_events(env);
+        }
+    }
     use xaeroflux_actors::read_api::{RangeQuery, ReadApi};
 
     let query = RangeQuery::<{ rusted_ring::M_TSHIRT_SIZE }> {
