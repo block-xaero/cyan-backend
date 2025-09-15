@@ -1,17 +1,13 @@
 // ffi.rs - Complete FFI interface
-use std::{
-    ffi::{c_char, CStr},
-    ptr, slice,
-};
+use std::{ffi::CStr, ptr, slice};
 
 use tracing_subscriber::EnvFilter;
 use xaeroflux_actors::XaeroFlux;
 use xaeroid::XaeroID;
 
 use crate::{
-    GroupStandard, WorkspaceStandard, BoardStandard, CommentStandard,
-    DrawingPathStandard, Layer, FileNode, Vote, PATH_MAX_POINTS,
-    objects::*, storage::*,
+    BoardStandard, CommentStandard, DrawingPathStandard, FileNode, GroupStandard, Layer,
+    PATH_MAX_POINTS, Vote, WorkspaceStandard, objects::*, storage::*,
 };
 
 // INITIALIZATION
@@ -28,9 +24,9 @@ pub extern "C" fn cyan_init(
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
             tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::new("error,cyan_backend=trace,xaeroflux_actors=info")
-                )
+                .with_env_filter(EnvFilter::new(
+                    "error,cyan_backend=trace,xaeroflux_actors=info",
+                ))
                 .init();
         });
 
@@ -69,7 +65,7 @@ pub extern "C" fn cyan_create_group(
                 ptr::copy_nonoverlapping(group_id.as_ptr(), out_group_id, 32);
                 true
             }
-            Err(_) => false
+            Err(_) => false,
         }
     }
 }
@@ -103,7 +99,7 @@ pub extern "C" fn cyan_list_groups(
                 *actual_size = total_size;
                 true
             }
-            Err(_) => false
+            Err(_) => false,
         }
     }
 }
@@ -130,7 +126,7 @@ pub extern "C" fn cyan_create_workspace(
                 ptr::copy_nonoverlapping(workspace_id.as_ptr(), out_workspace_id, 32);
                 true
             }
-            Err(_) => false
+            Err(_) => false,
         }
     }
 }
@@ -168,7 +164,7 @@ pub extern "C" fn cyan_list_workspaces(
                 *actual_size = total_size;
                 true
             }
-            Err(_) => false
+            Err(_) => false,
         }
     }
 }
@@ -199,7 +195,7 @@ pub extern "C" fn cyan_create_board(
                 ptr::copy_nonoverlapping(board_id.as_ptr(), out_board_id, 32);
                 true
             }
-            Err(_) => false
+            Err(_) => false,
         }
     }
 }
@@ -275,7 +271,7 @@ pub extern "C" fn cyan_add_comment(
                 ptr::copy_nonoverlapping(comment_id.as_ptr(), out_comment_id, 32);
                 true
             }
-            Err(_) => false
+            Err(_) => false,
         }
     }
 }
@@ -368,7 +364,7 @@ pub extern "C" fn cyan_create_invitation(
 ) -> bool {
     unsafe {
         use ark_bn254::Fr;
-        use ark_ff::{PrimeField, BigInteger};
+        use ark_ff::{BigInteger, PrimeField};
 
         let inviter_bytes = slice::from_raw_parts(inviter_xaero_id, 2572);
         let inviter = bytemuck::from_bytes::<xaeroid::XaeroID>(inviter_bytes);
@@ -389,7 +385,8 @@ pub extern "C" fn cyan_create_invitation(
         let invitation_nonce = Fr::from(rand::random::<u64>());
 
         // Compute invitation hash
-        let invitation_hash = invitation_code + invitation_nonce * invitee_fr + workspace_fr * expiry_fr;
+        let invitation_hash =
+            invitation_code + invitation_nonce * invitee_fr + workspace_fr * expiry_fr;
 
         // Prepare output
         let mut output = Vec::new();
@@ -474,7 +471,7 @@ pub extern "C" fn cyan_accept_invitation(
                         wid,
                         claimer.did_peer[..32].try_into().unwrap(),
                     )
-                        .is_ok()
+                    .is_ok()
                 } else {
                     false
                 }
@@ -482,4 +479,74 @@ pub extern "C" fn cyan_accept_invitation(
             Err(_) => false,
         }
     }
+}
+
+// ffi.rs - Add these dummy functions to your cyan-backend
+
+use std::ffi::c_char;
+
+// MARK: - Tombstone Operations
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_tombstone_group(group_id: *const u8) -> bool {
+    // Dummy: Just return success
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_tombstone_workspace(workspace_id: *const u8) -> bool {
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_tombstone_board(board_id: *const u8) -> bool {
+    true
+}
+
+// MARK: - Rename Operations
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_rename_group(group_id: *const u8, new_name: *const c_char) -> bool {
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_rename_workspace(workspace_id: *const u8, new_name: *const c_char) -> bool {
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_rename_board(board_id: *const u8, new_name: *const c_char) -> bool {
+    true
+}
+
+// MARK: - File Operations
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_add_file_to_group(
+    group_id: *const u8,
+    file_path: *const c_char,
+    file_data: *const u8,
+    file_size: usize,
+    out_file_id: *mut u8,
+) -> bool {
+    unsafe {
+        // Generate dummy file ID (32 bytes)
+        let dummy_id = b"file12345678901234567890123456789";
+        std::ptr::copy_nonoverlapping(dummy_id.as_ptr(), out_file_id, 32);
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_add_file_to_workspace(
+    workspace_id: *const u8,
+    file_path: *const c_char,
+    file_data: *const u8,
+    file_size: usize,
+    out_file_id: *mut u8,
+) -> bool {
+    unsafe {
+        // Generate dummy file ID (32 bytes)
+        let dummy_id = b"file98765432109876543210987654321";
+        std::ptr::copy_nonoverlapping(dummy_id.as_ptr(), out_file_id, 32);
+    }
+    true
 }
