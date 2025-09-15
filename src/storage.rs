@@ -17,30 +17,65 @@ pub const DATA_DIR: &str = "/tmp/cyan-data";
 // ================================================================================================
 
 pub fn build_hierarchical_event(
-    current_id: [u8; 32],
+    id: [u8; 32],
     ancestry: Vec<[u8; 32]>,
     data: &[u8],
 ) -> Vec<u8> {
-    let mut event = Vec::with_capacity(32 * (ancestry.len() + 2) + data.len());
-    event.extend_from_slice(&current_id);
-    for ancestor in ancestry {
-        event.extend_from_slice(&ancestor);
+    use std::alloc::{alloc, Layout};
+
+    // Calculate header size and padding needed
+    let header_size = 32 * (ancestry.len() + 2); // +2 for id and null terminator
+    let padding = (64 - (header_size % 64)) % 64;
+    let total_size = header_size + padding + data.len();
+
+    // Create 64-byte aligned buffer
+    let layout = Layout::from_size_align(total_size, 64).unwrap();
+
+    unsafe {
+        let ptr = alloc(layout);
+        let mut offset = 0;
+
+        // Write id
+        ptr.add(offset).copy_from_nonoverlapping(id.as_ptr(), 32);
+        offset += 32;
+
+        // Write ancestry
+        for ancestor in &ancestry {
+            ptr.add(offset).copy_from_nonoverlapping(ancestor.as_ptr(), 32);
+            offset += 32;
+        }
+
+        // Write null terminator
+        std::ptr::write_bytes(ptr.add(offset), 0, 32);
+        offset += 32;
+
+        // Write padding to align data to 64-byte boundary
+        if padding > 0 {
+            std::ptr::write_bytes(ptr.add(offset), 0, padding);
+            offset += padding;
+        }
+
+        // Write data (now at 64-byte aligned offset)
+        ptr.add(offset).copy_from_nonoverlapping(data.as_ptr(), data.len());
+
+        Vec::from_raw_parts(ptr, total_size, total_size)
     }
-    event.extend_from_slice(&[0u8; 32]);
-    event.extend_from_slice(data);
-    event
 }
 
 pub fn parse_hierarchical_event(event_data: &[u8]) -> (Vec<[u8; 32]>, &[u8]) {
+    tracing::info!("Original event_data ptr: {:p}, alignment offset: {}",
+                  event_data.as_ptr(),
+                  event_data.as_ptr() as usize % 64);
     let mut ancestry = Vec::new();
     let mut offset = 0;
 
+    // Parse ancestry until we hit null terminator
     while offset + 32 <= event_data.len() {
         let mut id = [0u8; 32];
         id.copy_from_slice(&event_data[offset..offset + 32]);
 
         if id == [0u8; 32] {
-            offset += 32;
+            offset += 32; // Skip null terminator
             break;
         }
 
@@ -48,9 +83,13 @@ pub fn parse_hierarchical_event(event_data: &[u8]) -> (Vec<[u8; 32]>, &[u8]) {
         offset += 32;
     }
 
+    // Calculate and skip padding
+    // offset already includes all parsed bytes (ancestry + null)
+    let padding = (64 - (offset % 64)) % 64;
+    offset += padding;
+
     (ancestry, &event_data[offset..])
 }
-
 // ================================================================================================
 // GROUP OPERATIONS
 // ================================================================================================
@@ -188,7 +227,7 @@ pub fn create_workspace(
 
     XaeroFlux::write_event_static(
         &event,
-        xaeroflux_core::event::make_pinned(EVENT_TYPE_WORKSPACE),
+       EVENT_TYPE_WORKSPACE,
     )?;
 
     tracing::info!(
@@ -205,15 +244,14 @@ pub fn list_workspaces_for_group(
     let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
     use xaeroflux_actors::read_api::RangeQuery;
 
-    // 352-byte events fit in S_TSHIRT_SIZE (512)
-    let query = RangeQuery::<512> {
+    let query = RangeQuery::<{rusted_ring::M_TSHIRT_SIZE}> {
         xaero_id: [0u8; 32],
         event_type: EVENT_TYPE_WORKSPACE,
     };
 
-    let events = xf.range_query_with_filter::<512, _>(
+    let events = xf.range_query_with_filter::<{rusted_ring::M_TSHIRT_SIZE}, _>(
         query,
-        Box::new(move |event: &XaeroInternalEvent<512>| {
+        Box::new(move |event: &XaeroInternalEvent<{rusted_ring::M_TSHIRT_SIZE}>| {
             let (ancestry, data) =
                 parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
             ancestry.len() >= 2
@@ -226,10 +264,16 @@ pub fn list_workspaces_for_group(
     for event in events {
         let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
         if data.len() >= std::mem::size_of::<WorkspaceStandard>() {
-            let workspace = bytemuck::from_bytes::<WorkspaceStandard>(
-                &data[..std::mem::size_of::<WorkspaceStandard>()],
-            );
-            workspaces.push(*workspace);
+            // Do the same copy approach as groups
+            let mut aligned_workspace = WorkspaceStandard::zeroed();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    &mut aligned_workspace as *mut WorkspaceStandard as *mut u8,
+                    std::mem::size_of::<WorkspaceStandard>(),
+                );
+            }
+            workspaces.push(aligned_workspace);
         }
     }
 
