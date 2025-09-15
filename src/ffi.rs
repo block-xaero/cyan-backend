@@ -3,12 +3,8 @@ use std::{ffi::CStr, ptr, slice};
 
 use tracing_subscriber::EnvFilter;
 use xaeroflux_actors::XaeroFlux;
-use xaeroid::XaeroID;
 
-use crate::{
-    BoardStandard, CommentStandard, DrawingPathStandard, FileNode, GroupStandard, Layer,
-    PATH_MAX_POINTS, Vote, WorkspaceStandard, objects::*, storage::*,
-};
+use crate::{DrawingPathStandard, GroupStandard, WorkspaceStandard, objects::*, storage::*};
 
 // INITIALIZATION
 #[unsafe(no_mangle)]
@@ -139,10 +135,9 @@ pub extern "C" fn cyan_list_workspaces(
     actual_size: *mut usize,
 ) -> bool {
     unsafe {
-        let mut gid = [0u8; 32];
-        gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
-
-        match list_workspaces_for_group(gid) {
+        let mut g_id = [0u8; 32];
+        g_id.copy_from_slice(slice::from_raw_parts(group_id, 32));
+        match list_workspaces_for_group(g_id) {
             Ok(workspaces) => {
                 let total_size = workspaces.len() * std::mem::size_of::<WorkspaceStandard>();
                 if total_size > buffer_size {
@@ -151,8 +146,8 @@ pub extern "C" fn cyan_list_workspaces(
                 }
 
                 let mut offset = 0;
-                for workspace in workspaces {
-                    let ws_bytes = bytemuck::bytes_of(&workspace);
+                for workspace in workspaces.iter() {
+                    let ws_bytes = bytemuck::bytes_of(workspace);
                     ptr::copy_nonoverlapping(
                         ws_bytes.as_ptr(),
                         out_buffer.add(offset),
