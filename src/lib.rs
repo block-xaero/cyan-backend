@@ -12,18 +12,15 @@ use xaeroid::XaeroID;
 
 use crate::storage::DATA_DIR;
 
-// Minimal constants for pre-allocation without waste
-pub const GROUP_MAX_WORKSPACES: usize = 8;    // 8 workspaces per group
-pub const WORKSPACE_MAX_BOARDS: usize = 8;    // 8 boards per workspace
-pub const BOARD_MAX_FILES: usize = 16;        // 16 files per board
+// Constants for text/content sizes only
 pub const COMMENT_MAX_TEXT: usize = 512;      // 512 bytes for comment text
 pub const PATH_MAX_POINTS: usize = 256;       // 256 points for drawing paths
 
-// Standard types used everywhere
-pub type GroupStandard = Group<GROUP_MAX_WORKSPACES>;
-pub type WorkspaceStandard = Workspace<WORKSPACE_MAX_BOARDS>;
-pub type BoardStandard = Board<BOARD_MAX_FILES>;
-pub type CommentStandard = Comment<COMMENT_MAX_TEXT>;
+// Standard types used everywhere (no more generics!)
+pub type GroupStandard = Group;
+pub type WorkspaceStandard = Workspace;
+pub type BoardStandard = Board;
+pub type CommentStandard = Comment;
 pub type DrawingPathStandard = DrawingPath<PATH_MAX_POINTS>;
 
 // Event type constants
@@ -46,10 +43,10 @@ pub fn initialize(xaero_id: XaeroID) {
         .expect("Cyan App failed to initialize due to Xaeroflux failure!");
 }
 
-// Group structure - 448 bytes with MAX_WORKSPACES=8
+// Group structure - 256 bytes
 #[repr(C, align(64))]
 #[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
-pub struct Group<const MAX_WORKSPACES: usize> {
+pub struct Group {
     pub group_id: [u8; 32],
     pub parent_id: [u8; 32],
     pub name: [u8; 64],
@@ -60,17 +57,16 @@ pub struct Group<const MAX_WORKSPACES: usize> {
     pub created_at: u64,
     pub updated_at: u64,
     pub created_by: [u8; 32],
-    pub workspaces: [[u8; 32]; MAX_WORKSPACES],
-    pub _padding: [u8; 23],
+    pub _padding: [u8; 28],
 }
 
-unsafe impl<const MAX_WORKSPACES: usize> Pod for Group<MAX_WORKSPACES> {}
-unsafe impl<const MAX_WORKSPACES: usize> Zeroable for Group<MAX_WORKSPACES> {}
+unsafe impl Pod for Group {}
+unsafe impl Zeroable for Group {}
 
-// Workspace structure - 464 bytes with MAX_BOARDS=8
+// Workspace structure - 256 bytes (no pre-allocated boards!)
 #[repr(C, align(64))]
 #[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
-pub struct Workspace<const MAX_BOARDS: usize> {
+pub struct Workspace {
     pub workspace_id: [u8; 32],
     pub group_id: [u8; 32],
     pub name: [u8; 64],
@@ -79,46 +75,44 @@ pub struct Workspace<const MAX_BOARDS: usize> {
     pub created_at: u64,
     pub updated_at: u64,
     pub created_by: [u8; 32],
-    pub boards: [[u8; 32]; MAX_BOARDS],
-    pub _padding: [u8; 24],
+    pub _padding: [u8; 56],
 }
 
-unsafe impl<const MAX_BOARDS: usize> Pod for Workspace<MAX_BOARDS> {}
-unsafe impl<const MAX_BOARDS: usize> Zeroable for Workspace<MAX_BOARDS> {}
+unsafe impl Pod for Workspace {}
+unsafe impl Zeroable for Workspace {}
 
-// Board structure - 784 bytes with MAX_FILES=16
+// Board structure - 320 bytes (no pre-allocated files!)
 #[repr(C, align(64))]
 #[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
-pub struct Board<const MAX_FILES: usize> {
+pub struct Board {
     pub board_id: [u8; 32],
     pub workspace_id: [u8; 32],
     pub group_id: [u8; 32],
     pub name: [u8; 64],
     pub upvotes: u32,
     pub comment_count: u32,
+    pub file_count: u32,
     pub version: u32,
     pub created_at: u64,
     pub updated_at: u64,
     pub created_by: [u8; 32],
     pub last_modified_by: [u8; 32],
-    pub files: [[u8; 32]; MAX_FILES],
-    pub file_count: u32,
-    pub _padding: [u8; 20],
+    pub _padding: [u8; 48],
 }
 
-unsafe impl<const MAX_FILES: usize> Pod for Board<MAX_FILES> {}
-unsafe impl<const MAX_FILES: usize> Zeroable for Board<MAX_FILES> {}
+unsafe impl Pod for Board {}
+unsafe impl Zeroable for Board {}
 
-// Comment structure - 768 bytes with MAX_TEXT=512
+// Comment structure - 768 bytes (includes 512 bytes of text)
 #[repr(C, align(64))]
 #[derive(Archive, Serialize, Deserialize, Debug, Copy, Clone)]
-pub struct Comment<const MAX_TEXT: usize> {
+pub struct Comment {
     pub comment_id: [u8; 32],
     pub board_id: [u8; 32],
     pub parent_id: [u8; 32],
     pub author_id: [u8; 32],
     pub author_name: [u8; 64],
-    pub content: [u8; MAX_TEXT],
+    pub content: [u8; 512],  // Fixed size for text content
     pub upvotes: u32,
     pub downvotes: u32,
     pub depth: u8,
@@ -128,8 +122,8 @@ pub struct Comment<const MAX_TEXT: usize> {
     pub _padding: [u8; 6],
 }
 
-unsafe impl<const MAX_TEXT: usize> Pod for Comment<MAX_TEXT> {}
-unsafe impl<const MAX_TEXT: usize> Zeroable for Comment<MAX_TEXT> {}
+unsafe impl Pod for Comment {}
+unsafe impl Zeroable for Comment {}
 
 // Layer structure - 192 bytes
 #[repr(C, align(64))]
