@@ -1,4 +1,4 @@
-// storage.rs - Complete implementation
+// storage.rs - Complete implementation with all drawing objects
 use bytemuck::Zeroable;
 use xaeroflux_actors::{read_api::ReadApi, XaeroFlux};
 use xaeroflux_core::pool::XaeroInternalEvent;
@@ -6,11 +6,19 @@ use xaeroflux_core::pool::XaeroInternalEvent;
 use crate::{
     objects::*, BoardStandard, CommentStandard, DrawingPathStandard, FileNode,
     GroupStandard, Layer, Vote, WorkspaceStandard, EVENT_TYPE_BOARD,
-    EVENT_TYPE_COMMENT, EVENT_TYPE_FILE, EVENT_TYPE_GROUP, EVENT_TYPE_INVITATION, EVENT_TYPE_LAYER, EVENT_TYPE_VOTE,
-    EVENT_TYPE_WHITEBOARD_OBJECT, EVENT_TYPE_WORKSPACE,
+    EVENT_TYPE_COMMENT, EVENT_TYPE_FILE, EVENT_TYPE_GROUP, EVENT_TYPE_INVITATION,
+    EVENT_TYPE_LAYER, EVENT_TYPE_VOTE, EVENT_TYPE_WHITEBOARD_OBJECT, EVENT_TYPE_WORKSPACE,
 };
 
 pub const DATA_DIR: &str = "/tmp/cyan-data";
+
+// Event type constants for whiteboard objects
+pub const EVENT_TYPE_PATH_OBJECT: u32 = EVENT_TYPE_WHITEBOARD_OBJECT + 1;
+pub const EVENT_TYPE_STICKY_NOTE: u32 = EVENT_TYPE_WHITEBOARD_OBJECT + 2;
+pub const EVENT_TYPE_RECTANGLE: u32 = EVENT_TYPE_WHITEBOARD_OBJECT + 3;
+pub const EVENT_TYPE_CIRCLE: u32 = EVENT_TYPE_WHITEBOARD_OBJECT + 4;
+pub const EVENT_TYPE_ARROW: u32 = EVENT_TYPE_WHITEBOARD_OBJECT + 5;
+pub const EVENT_TYPE_TEXT: u32 = EVENT_TYPE_WHITEBOARD_OBJECT + 6;
 
 // ================================================================================================
 // HIERARCHICAL EVENT HELPERS
@@ -90,6 +98,7 @@ pub fn parse_hierarchical_event(event_data: &[u8]) -> (Vec<[u8; 32]>, &[u8]) {
 
     (ancestry, &event_data[offset..])
 }
+
 // ================================================================================================
 // GROUP OPERATIONS
 // ================================================================================================
@@ -107,9 +116,9 @@ pub fn create_group(
             name,
             xaeroflux_core::date_time::emit_nanos()
         )
-        .as_bytes(),
+            .as_bytes(),
     )
-    .into();
+        .into();
 
     let mut group = GroupStandard::zeroed();
     group.group_id = group_id;
@@ -143,6 +152,7 @@ pub fn create_group(
 }
 
 pub fn list_all_groups() -> Result<Vec<GroupStandard>, Box<dyn std::error::Error>> {
+    tracing::info!("Listing all groups called");
     let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
     use xaeroflux_actors::read_api::RangeQuery;
 
@@ -205,9 +215,9 @@ pub fn create_workspace(
             name,
             xaeroflux_core::date_time::emit_nanos()
         )
-        .as_bytes(),
+            .as_bytes(),
     )
-    .into();
+        .into();
 
     let mut workspace = WorkspaceStandard::zeroed();
     workspace.workspace_id = workspace_id;
@@ -227,7 +237,7 @@ pub fn create_workspace(
 
     XaeroFlux::write_event_static(
         &event,
-       EVENT_TYPE_WORKSPACE,
+        EVENT_TYPE_WORKSPACE,
     )?;
 
     tracing::info!(
@@ -241,6 +251,7 @@ pub fn create_workspace(
 pub fn list_workspaces_for_group(
     group_id: [u8; 32],
 ) -> Result<Vec<WorkspaceStandard>, Box<dyn std::error::Error>> {
+    tracing::info!("Listing workspaces for group {:?}", hex::encode(&group_id));
     let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
     use xaeroflux_actors::read_api::RangeQuery;
 
@@ -264,7 +275,6 @@ pub fn list_workspaces_for_group(
     for event in events {
         let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
         if data.len() >= std::mem::size_of::<WorkspaceStandard>() {
-            // Do the same copy approach as groups
             let mut aligned_workspace = WorkspaceStandard::zeroed();
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -299,9 +309,9 @@ pub fn create_board(
             name,
             xaeroflux_core::date_time::emit_nanos()
         )
-        .as_bytes(),
+            .as_bytes(),
     )
-    .into();
+        .into();
 
     let mut board = BoardStandard::zeroed();
     board.board_id = board_id;
@@ -324,7 +334,7 @@ pub fn create_board(
         bytemuck::bytes_of(&board),
     );
 
-    XaeroFlux::write_event_static(&event, xaeroflux_core::event::make_pinned(EVENT_TYPE_BOARD))?;
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_BOARD)?;
 
     tracing::info!(
         "Created board {} with id {:?}",
@@ -337,35 +347,410 @@ pub fn create_board(
 pub fn list_boards_for_workspace(
     workspace_id: [u8; 32],
 ) -> Result<Vec<BoardStandard>, Box<dyn std::error::Error>> {
+    tracing::info!("Looking for boards in workspace: {:x?}", &workspace_id[..8]);
+
     let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
     use xaeroflux_actors::read_api::RangeQuery;
 
-    let query = RangeQuery::<512> {
+    let query = RangeQuery::<1024> {  // Use 1024 since that's where they're stored
         xaero_id: [0u8; 32],
         event_type: EVENT_TYPE_BOARD,
     };
 
-    let events = xf.range_query_with_filter::<512, _>(
+    let events = xf.range_query_with_filter::<1024, _>(
         query,
-        Box::new(move |event: &XaeroInternalEvent<512>| {
+        Box::new(move |event: &XaeroInternalEvent<1024>| {
             let (ancestry, data) =
                 parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
             ancestry.contains(&workspace_id) && data.len() >= std::mem::size_of::<BoardStandard>()
         }),
     )?;
 
+    tracing::info!("Found {} matching events", events.len());
+
     let mut boards = Vec::new();
     for event in events {
         let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
         if data.len() >= std::mem::size_of::<BoardStandard>() {
-            let board = bytemuck::from_bytes::<BoardStandard>(
-                &data[..std::mem::size_of::<BoardStandard>()],
-            );
-            boards.push(*board);
+            // Fix alignment issue by copying to aligned buffer
+            let mut aligned_board = BoardStandard::zeroed();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    &mut aligned_board as *mut BoardStandard as *mut u8,
+                    std::mem::size_of::<BoardStandard>(),
+                );
+            }
+
+            let name = String::from_utf8_lossy(&aligned_board.name[..aligned_board.name.iter().position(|&x| x == 0).unwrap_or(64)]);
+            tracing::info!("Parsed board: '{}'", name);
+            boards.push(aligned_board);
         }
     }
 
+    tracing::info!("Returning {} boards", boards.len());
     Ok(boards)
+}
+
+// ================================================================================================
+// PATH DRAWING OPERATIONS
+// ================================================================================================
+
+pub fn add_path_object(
+    board_id: [u8; 32],
+    workspace_id: [u8; 32],
+    group_id: [u8; 32],
+    path_data: &PathData<256>,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let path_id = path_data.path_id;
+
+    let event = build_hierarchical_event(
+        path_id,
+        vec![board_id, workspace_id, group_id],
+        bytemuck::bytes_of(path_data),
+    );
+
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_PATH_OBJECT)?;
+
+    tracing::info!("Added path object to board {:?}", hex::encode(&board_id));
+    Ok(path_id)
+}
+
+pub fn list_paths_for_board(
+    board_id: [u8; 32],
+) -> Result<Vec<PathData<256>>, Box<dyn std::error::Error>> {
+    let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
+    use xaeroflux_actors::read_api::RangeQuery;
+
+    // PathData<256> is 2368 bytes, use XL size
+    let query = RangeQuery::<{rusted_ring::XL_TSHIRT_SIZE}> {
+        xaero_id: [0u8; 32],
+        event_type: EVENT_TYPE_PATH_OBJECT,
+    };
+
+    let events = xf.range_query_with_filter::<{rusted_ring::XL_TSHIRT_SIZE}, _>(
+        query,
+        Box::new(move |event: &XaeroInternalEvent<{rusted_ring::XL_TSHIRT_SIZE}>| {
+            let (ancestry, _) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+            ancestry.contains(&board_id)
+        }),
+    )?;
+
+    let mut paths = Vec::new();
+    for event in events {
+        let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+        if data.len() >= std::mem::size_of::<PathData<256>>() {
+            let path = bytemuck::from_bytes::<PathData<256>>(
+                &data[..std::mem::size_of::<PathData<256>>()]
+            );
+            paths.push(*path);
+        }
+    }
+    Ok(paths)
+}
+
+// ================================================================================================
+// STICKY NOTE OPERATIONS
+// ================================================================================================
+
+pub fn add_sticky_note(
+    board_id: [u8; 32],
+    workspace_id: [u8; 32],
+    group_id: [u8; 32],
+    sticky_data: &StickyNoteData,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let note_id = sticky_data.note_id;
+
+    let event = build_hierarchical_event(
+        note_id,
+        vec![board_id, workspace_id, group_id],
+        bytemuck::bytes_of(sticky_data),
+    );
+
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_STICKY_NOTE)?;
+
+    tracing::info!("Added sticky note to board {:?}", hex::encode(&board_id));
+    Ok(note_id)
+}
+
+pub fn list_sticky_notes_for_board(
+    board_id: [u8; 32],
+) -> Result<Vec<StickyNoteData>, Box<dyn std::error::Error>> {
+    let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
+    use xaeroflux_actors::read_api::RangeQuery;
+
+    let query = RangeQuery::<{rusted_ring::M_TSHIRT_SIZE}> {
+        xaero_id: [0u8; 32],
+        event_type: EVENT_TYPE_STICKY_NOTE,
+    };
+
+    let events = xf.range_query_with_filter::<{rusted_ring::M_TSHIRT_SIZE}, _>(
+        query,
+        Box::new(move |event: &XaeroInternalEvent<{rusted_ring::M_TSHIRT_SIZE}>| {
+            let (ancestry, _) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+            ancestry.contains(&board_id)
+        }),
+    )?;
+
+    let mut notes = Vec::new();
+    for event in events {
+        let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+        if data.len() >= std::mem::size_of::<StickyNoteData>() {
+            let note = bytemuck::from_bytes::<StickyNoteData>(
+                &data[..std::mem::size_of::<StickyNoteData>()]
+            );
+            notes.push(*note);
+        }
+    }
+    Ok(notes)
+}
+
+// ================================================================================================
+// RECTANGLE OPERATIONS
+// ================================================================================================
+
+pub fn add_rectangle(
+    board_id: [u8; 32],
+    workspace_id: [u8; 32],
+    group_id: [u8; 32],
+    rect_data: &RectangleData,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let shape_id = rect_data.shape_id;
+
+    let event = build_hierarchical_event(
+        shape_id,
+        vec![board_id, workspace_id, group_id],
+        bytemuck::bytes_of(rect_data),
+    );
+
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_RECTANGLE)?;
+
+    tracing::info!("Added rectangle to board {:?}", hex::encode(&board_id));
+    Ok(shape_id)
+}
+
+pub fn list_rectangles_for_board(
+    board_id: [u8; 32],
+) -> Result<Vec<RectangleData>, Box<dyn std::error::Error>> {
+    let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
+    use xaeroflux_actors::read_api::RangeQuery;
+
+    let query = RangeQuery::<{rusted_ring::S_TSHIRT_SIZE}> {
+        xaero_id: [0u8; 32],
+        event_type: EVENT_TYPE_RECTANGLE,
+    };
+
+    let events = xf.range_query_with_filter::<{rusted_ring::S_TSHIRT_SIZE}, _>(
+        query,
+        Box::new(move |event: &XaeroInternalEvent<{rusted_ring::S_TSHIRT_SIZE}>| {
+            let (ancestry, _) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+            ancestry.contains(&board_id)
+        }),
+    )?;
+
+    let mut rectangles = Vec::new();
+    for event in events {
+        let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+        if data.len() >= std::mem::size_of::<RectangleData>() {
+            let rect = bytemuck::from_bytes::<RectangleData>(
+                &data[..std::mem::size_of::<RectangleData>()]
+            );
+            rectangles.push(*rect);
+        }
+    }
+    Ok(rectangles)
+}
+
+// ================================================================================================
+// CIRCLE OPERATIONS
+// ================================================================================================
+
+pub fn add_circle(
+    board_id: [u8; 32],
+    workspace_id: [u8; 32],
+    group_id: [u8; 32],
+    circle_data: &CircleData,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let shape_id = circle_data.shape_id;
+
+    let event = build_hierarchical_event(
+        shape_id,
+        vec![board_id, workspace_id, group_id],
+        bytemuck::bytes_of(circle_data),
+    );
+
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_CIRCLE)?;
+
+    tracing::info!("Added circle to board {:?}", hex::encode(&board_id));
+    Ok(shape_id)
+}
+
+pub fn list_circles_for_board(
+    board_id: [u8; 32],
+) -> Result<Vec<CircleData>, Box<dyn std::error::Error>> {
+    let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
+    use xaeroflux_actors::read_api::RangeQuery;
+
+    let query = RangeQuery::<{rusted_ring::S_TSHIRT_SIZE}> {
+        xaero_id: [0u8; 32],
+        event_type: EVENT_TYPE_CIRCLE,
+    };
+
+    let events = xf.range_query_with_filter::<{rusted_ring::S_TSHIRT_SIZE}, _>(
+        query,
+        Box::new(move |event: &XaeroInternalEvent<{rusted_ring::S_TSHIRT_SIZE}>| {
+            let (ancestry, _) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+            ancestry.contains(&board_id)
+        }),
+    )?;
+
+    let mut circles = Vec::new();
+    for event in events {
+        let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+        if data.len() >= std::mem::size_of::<CircleData>() {
+            let circle = bytemuck::from_bytes::<CircleData>(
+                &data[..std::mem::size_of::<CircleData>()]
+            );
+            circles.push(*circle);
+        }
+    }
+    Ok(circles)
+}
+
+// ================================================================================================
+// ARROW OPERATIONS
+// ================================================================================================
+
+pub fn add_arrow(
+    board_id: [u8; 32],
+    workspace_id: [u8; 32],
+    group_id: [u8; 32],
+    arrow_data: &ArrowData,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let arrow_id = arrow_data.arrow_id;
+
+    let event = build_hierarchical_event(
+        arrow_id,
+        vec![board_id, workspace_id, group_id],
+        bytemuck::bytes_of(arrow_data),
+    );
+
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_ARROW)?;
+
+    tracing::info!("Added arrow to board {:?}", hex::encode(&board_id));
+    Ok(arrow_id)
+}
+
+pub fn list_arrows_for_board(
+    board_id: [u8; 32],
+) -> Result<Vec<ArrowData>, Box<dyn std::error::Error>> {
+    let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
+    use xaeroflux_actors::read_api::RangeQuery;
+
+    let query = RangeQuery::<{rusted_ring::S_TSHIRT_SIZE}> {
+        xaero_id: [0u8; 32],
+        event_type: EVENT_TYPE_ARROW,
+    };
+
+    let events = xf.range_query_with_filter::<{rusted_ring::S_TSHIRT_SIZE}, _>(
+        query,
+        Box::new(move |event: &XaeroInternalEvent<{rusted_ring::S_TSHIRT_SIZE}>| {
+            let (ancestry, _) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+            ancestry.contains(&board_id)
+        }),
+    )?;
+
+    let mut arrows = Vec::new();
+    for event in events {
+        let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+        if data.len() >= std::mem::size_of::<ArrowData>() {
+            let arrow = bytemuck::from_bytes::<ArrowData>(
+                &data[..std::mem::size_of::<ArrowData>()]
+            );
+            arrows.push(*arrow);
+        }
+    }
+    Ok(arrows)
+}
+
+// ================================================================================================
+// TEXT OPERATIONS
+// ================================================================================================
+
+pub fn add_text(
+    board_id: [u8; 32],
+    workspace_id: [u8; 32],
+    group_id: [u8; 32],
+    text_data: &TextData,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let text_id = text_data.text_id;
+
+    let event = build_hierarchical_event(
+        text_id,
+        vec![board_id, workspace_id, group_id],
+        bytemuck::bytes_of(text_data),
+    );
+
+    XaeroFlux::write_event_static(&event, EVENT_TYPE_TEXT)?;
+
+    tracing::info!("Added text to board {:?}", hex::encode(&board_id));
+    Ok(text_id)
+}
+
+pub fn list_text_objects_for_board(
+    board_id: [u8; 32],
+) -> Result<Vec<TextData>, Box<dyn std::error::Error>> {
+    let xf = XaeroFlux::instance(DATA_DIR).ok_or("XaeroFlux not initialized")?;
+    use xaeroflux_actors::read_api::RangeQuery;
+
+    let query = RangeQuery::<{rusted_ring::M_TSHIRT_SIZE}> {
+        xaero_id: [0u8; 32],
+        event_type: EVENT_TYPE_TEXT,
+    };
+
+    let events = xf.range_query_with_filter::<{rusted_ring::M_TSHIRT_SIZE}, _>(
+        query,
+        Box::new(move |event: &XaeroInternalEvent<{rusted_ring::M_TSHIRT_SIZE}>| {
+            let (ancestry, _) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+            ancestry.contains(&board_id)
+        }),
+    )?;
+
+    let mut text_objects = Vec::new();
+    for event in events {
+        let (_ancestry, data) = parse_hierarchical_event(&event.evt.data[..event.evt.len as usize]);
+        if data.len() >= std::mem::size_of::<TextData>() {
+            let text = bytemuck::from_bytes::<TextData>(
+                &data[..std::mem::size_of::<TextData>()]
+            );
+            text_objects.push(*text);
+        }
+    }
+    Ok(text_objects)
+}
+
+// ================================================================================================
+// LOAD ALL BOARD OBJECTS
+// ================================================================================================
+
+pub struct BoardObjects {
+    pub paths: Vec<PathData<256>>,
+    pub sticky_notes: Vec<StickyNoteData>,
+    pub rectangles: Vec<RectangleData>,
+    pub circles: Vec<CircleData>,
+    pub arrows: Vec<ArrowData>,
+    pub text_objects: Vec<TextData>,
+}
+
+pub fn load_all_board_objects(board_id: [u8; 32]) -> Result<BoardObjects, Box<dyn std::error::Error>> {
+    Ok(BoardObjects {
+        paths: list_paths_for_board(board_id)?,
+        sticky_notes: list_sticky_notes_for_board(board_id)?,
+        rectangles: list_rectangles_for_board(board_id)?,
+        circles: list_circles_for_board(board_id)?,
+        arrows: list_arrows_for_board(board_id)?,
+        text_objects: list_text_objects_for_board(board_id)?,
+    })
 }
 
 // ================================================================================================
@@ -389,9 +774,9 @@ pub fn add_comment(
             content,
             xaeroflux_core::date_time::emit_nanos()
         )
-        .as_bytes(),
+            .as_bytes(),
     )
-    .into();
+        .into();
 
     let mut comment = CommentStandard::zeroed();
     comment.comment_id = comment_id;
@@ -432,7 +817,7 @@ pub fn add_comment(
 }
 
 // ================================================================================================
-// WHITEBOARD OBJECT OPERATIONS
+// WHITEBOARD OBJECT OPERATIONS (Generic)
 // ================================================================================================
 
 pub fn add_whiteboard_object<T: bytemuck::Pod + HierarchicalEvent>(

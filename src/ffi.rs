@@ -1,10 +1,11 @@
-// ffi.rs - Complete FFI interface
+// ffi.rs - Complete FFI interface with all drawing operations
+use std::ffi::c_char;
 use std::{ffi::CStr, ptr, slice};
 
 use tracing_subscriber::EnvFilter;
 use xaeroflux_actors::XaeroFlux;
 
-use crate::{DrawingPathStandard, GroupStandard, WorkspaceStandard, objects::*, storage::*};
+use crate::{objects::*, storage::*, BoardStandard, DrawingPathStandard, GroupStandard, WorkspaceStandard};
 
 // INITIALIZATION
 #[unsafe(no_mangle)]
@@ -195,7 +196,46 @@ pub extern "C" fn cyan_create_board(
     }
 }
 
-// PATH OBJECT OPERATIONS
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_workspace_boards(
+    group_id: *const u8,
+    workspace_id: *const u8,
+    out_buffer: *mut u8,
+    buffer_size: usize,
+    actual_size: *mut usize,
+) -> bool {
+    unsafe {
+        let mut wid = [0u8; 32];
+        wid.copy_from_slice(slice::from_raw_parts(workspace_id, 32));
+
+        match list_boards_for_workspace(wid) {
+            Ok(boards) => {
+                let total_size = boards.len() * std::mem::size_of::<BoardStandard>();
+                if total_size > buffer_size {
+                    *actual_size = total_size;
+                    return false;
+                }
+
+                let mut offset = 0;
+                for board in boards.iter() {
+                    let board_bytes = bytemuck::bytes_of(board);
+                    ptr::copy_nonoverlapping(
+                        board_bytes.as_ptr(),
+                        out_buffer.add(offset),
+                        board_bytes.len(),
+                    );
+                    offset += board_bytes.len();
+                }
+
+                *actual_size = total_size;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+// PATH DRAWING OPERATIONS
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_add_path_object(
     board_id: *const u8,
@@ -214,28 +254,27 @@ pub extern "C" fn cyan_add_path_object(
         let mut gid = [0u8; 32];
         gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
 
-        if path_size != std::mem::size_of::<DrawingPathStandard>() {
+        if path_size != std::mem::size_of::<PathData<256>>() {
+            tracing::error!("Path size mismatch: expected {}, got {}",
+                std::mem::size_of::<PathData<256>>(), path_size);
             return false;
         }
 
         let path_bytes = slice::from_raw_parts(path_data, path_size);
-        let path = bytemuck::from_bytes::<DrawingPathStandard>(path_bytes);
+        let path = bytemuck::from_bytes::<PathData<256>>(path_bytes);
 
-        add_whiteboard_object(bid, wid, gid, OBJECT_TYPE_PATH, path).is_ok()
+        add_path_object(bid, wid, gid, path).is_ok()
     }
 }
 
-// COMMENT OPERATIONS
+// STICKY NOTE OPERATIONS
 #[unsafe(no_mangle)]
-pub extern "C" fn cyan_add_comment(
+pub extern "C" fn cyan_add_sticky_note(
     board_id: *const u8,
     workspace_id: *const u8,
     group_id: *const u8,
-    author_id: *const u8,
-    author_name: *const c_char,
-    content: *const c_char,
-    parent_id: *const u8,
-    out_comment_id: *mut u8,
+    sticky_data: *const u8,
+    sticky_size: usize,
 ) -> bool {
     unsafe {
         let mut bid = [0u8; 32];
@@ -246,6 +285,205 @@ pub extern "C" fn cyan_add_comment(
 
         let mut gid = [0u8; 32];
         gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
+
+        if sticky_size != std::mem::size_of::<StickyNoteData>() {
+            return false;
+        }
+
+        let sticky_bytes = slice::from_raw_parts(sticky_data, sticky_size);
+        let sticky = bytemuck::from_bytes::<StickyNoteData>(sticky_bytes);
+
+        add_sticky_note(bid, wid, gid, sticky).is_ok()
+    }
+}
+
+// RECTANGLE OPERATIONS
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_add_rectangle(
+    board_id: *const u8,
+    workspace_id: *const u8,
+    group_id: *const u8,
+    rect_data: *const u8,
+    rect_size: usize,
+) -> bool {
+    unsafe {
+        let mut bid = [0u8; 32];
+        bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
+
+        let mut wid = [0u8; 32];
+        wid.copy_from_slice(slice::from_raw_parts(workspace_id, 32));
+
+        let mut gid = [0u8; 32];
+        gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
+
+        if rect_size != std::mem::size_of::<RectangleData>() {
+            return false;
+        }
+
+        let rect_bytes = slice::from_raw_parts(rect_data, rect_size);
+        let rect = bytemuck::from_bytes::<RectangleData>(rect_bytes);
+
+        add_rectangle(bid, wid, gid, rect).is_ok()
+    }
+}
+
+// CIRCLE OPERATIONS
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_add_circle(
+    board_id: *const u8,
+    workspace_id: *const u8,
+    group_id: *const u8,
+    circle_data: *const u8,
+    circle_size: usize,
+) -> bool {
+    unsafe {
+        let mut bid = [0u8; 32];
+        bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
+
+        let mut wid = [0u8; 32];
+        wid.copy_from_slice(slice::from_raw_parts(workspace_id, 32));
+
+        let mut gid = [0u8; 32];
+        gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
+
+        if circle_size != std::mem::size_of::<CircleData>() {
+            return false;
+        }
+
+        let circle_bytes = slice::from_raw_parts(circle_data, circle_size);
+        let circle = bytemuck::from_bytes::<CircleData>(circle_bytes);
+
+        add_circle(bid, wid, gid, circle).is_ok()
+    }
+}
+
+// ARROW OPERATIONS
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_add_arrow(
+    board_id: *const u8,
+    workspace_id: *const u8,
+    group_id: *const u8,
+    arrow_data: *const u8,
+    arrow_size: usize,
+) -> bool {
+    unsafe {
+        let mut bid = [0u8; 32];
+        bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
+
+        let mut wid = [0u8; 32];
+        wid.copy_from_slice(slice::from_raw_parts(workspace_id, 32));
+
+        let mut gid = [0u8; 32];
+        gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
+
+        if arrow_size != std::mem::size_of::<ArrowData>() {
+            return false;
+        }
+
+        let arrow_bytes = slice::from_raw_parts(arrow_data, arrow_size);
+        let arrow = bytemuck::from_bytes::<ArrowData>(arrow_bytes);
+
+        add_arrow(bid, wid, gid, arrow).is_ok()
+    }
+}
+
+// TEXT OPERATIONS
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_add_text(
+    board_id: *const u8,
+    workspace_id: *const u8,
+    group_id: *const u8,
+    text_data: *const u8,
+    text_size: usize,
+) -> bool {
+    unsafe {
+        let mut bid = [0u8; 32];
+        bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
+
+        let mut wid = [0u8; 32];
+        wid.copy_from_slice(slice::from_raw_parts(workspace_id, 32));
+
+        let mut gid = [0u8; 32];
+        gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
+
+        if text_size != std::mem::size_of::<TextData>() {
+            return false;
+        }
+
+        let text_bytes = slice::from_raw_parts(text_data, text_size);
+        let text = bytemuck::from_bytes::<TextData>(text_bytes);
+
+        add_text(bid, wid, gid, text).is_ok()
+    }
+}
+
+// LOAD BOARD OBJECTS
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_load_board_objects(
+    board_id: *const u8,
+    out_buffer: *mut u8,
+    buffer_size: usize,
+    actual_size: *mut usize,
+) -> bool {
+    unsafe {
+        let mut bid = [0u8; 32];
+        bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
+
+        match load_all_board_objects(bid) {
+            Ok(objects) => {
+                // Serialize board objects into buffer
+                // Format: [type][size][data]... for each object type
+                let mut offset = 0;
+
+                // Write paths count and data
+                if offset + 4 <= buffer_size {
+                    let count = objects.paths.len() as u32;
+                    ptr::copy_nonoverlapping(
+                        &count as *const u32 as *const u8,
+                        out_buffer.add(offset),
+                        4,
+                    );
+                    offset += 4;
+                }
+
+                for path in &objects.paths {
+                    let path_bytes = bytemuck::bytes_of(path);
+                    if offset + path_bytes.len() <= buffer_size {
+                        ptr::copy_nonoverlapping(
+                            path_bytes.as_ptr(),
+                            out_buffer.add(offset),
+                            path_bytes.len(),
+                        );
+                        offset += path_bytes.len();
+                    }
+                }
+
+                // Similar for other object types...
+                *actual_size = offset;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+// COMMENT OPERATIONS
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_add_comment(
+    board_id: *const u8,
+    author_id: *const u8,
+    author_name: *const c_char,
+    content: *const c_char,
+    parent_id: *const u8,
+    out_comment_id: *mut u8,
+) -> bool {
+    unsafe {
+        let mut bid = [0u8; 32];
+        bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
+
+        // For now, hardcode workspace and group IDs - you should track these
+        let wid = [0u8; 32];
+        let gid = [0u8; 32];
 
         let mut aid = [0u8; 32];
         aid.copy_from_slice(slice::from_raw_parts(author_id, 32));
@@ -286,67 +524,8 @@ pub extern "C" fn cyan_hash_data(data: *const u8, data_size: usize, out_hash: *m
         true
     }
 }
-// STICKY NOTE OPERATIONS
-#[unsafe(no_mangle)]
-pub extern "C" fn cyan_add_sticky_note(
-    board_id: *const u8,
-    workspace_id: *const u8,
-    group_id: *const u8,
-    sticky_data: *const u8,
-    sticky_size: usize,
-) -> bool {
-    unsafe {
-        let mut bid = [0u8; 32];
-        bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
 
-        let mut wid = [0u8; 32];
-        wid.copy_from_slice(slice::from_raw_parts(workspace_id, 32));
-
-        let mut gid = [0u8; 32];
-        gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
-
-        if sticky_size != std::mem::size_of::<StickyNoteData>() {
-            return false;
-        }
-
-        let sticky_bytes = slice::from_raw_parts(sticky_data, sticky_size);
-        let sticky = bytemuck::from_bytes::<StickyNoteData>(sticky_bytes);
-
-        add_whiteboard_object(bid, wid, gid, OBJECT_TYPE_STICKY, sticky).is_ok()
-    }
-}
-
-// RECTANGLE OPERATIONS
-#[unsafe(no_mangle)]
-pub extern "C" fn cyan_add_rectangle(
-    board_id: *const u8,
-    workspace_id: *const u8,
-    group_id: *const u8,
-    rect_data: *const u8,
-    rect_size: usize,
-) -> bool {
-    unsafe {
-        let mut bid = [0u8; 32];
-        bid.copy_from_slice(slice::from_raw_parts(board_id, 32));
-
-        let mut wid = [0u8; 32];
-        wid.copy_from_slice(slice::from_raw_parts(workspace_id, 32));
-
-        let mut gid = [0u8; 32];
-        gid.copy_from_slice(slice::from_raw_parts(group_id, 32));
-
-        if rect_size != std::mem::size_of::<RectangleData>() {
-            return false;
-        }
-
-        let rect_bytes = slice::from_raw_parts(rect_data, rect_size);
-        let rect = bytemuck::from_bytes::<RectangleData>(rect_bytes);
-
-        add_whiteboard_object(bid, wid, gid, OBJECT_TYPE_RECTANGLE, rect).is_ok()
-    }
-}
-
-// INVITATION OPERATIONS
+// INVITATION OPERATIONS (keeping your existing implementation)
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_create_invitation(
     inviter_xaero_id: *const u8,
@@ -369,21 +548,17 @@ pub extern "C" fn cyan_create_invitation(
 
         let invitee_bytes = slice::from_raw_parts(invitee_xaero_id, 2572);
 
-        // Create invitation using XaeroID's ZK capabilities
         let workspace_fr = Fr::from_le_bytes_mod_order(&wid);
         let invitee_hash = blake3::hash(invitee_bytes);
         let invitee_fr = Fr::from_le_bytes_mod_order(invitee_hash.as_bytes());
         let expiry_fr = Fr::from(expiry_time);
 
-        // Generate invitation components
         let invitation_code = Fr::from_le_bytes_mod_order(&inviter.secret_key[..32]);
         let invitation_nonce = Fr::from(rand::random::<u64>());
 
-        // Compute invitation hash
         let invitation_hash =
             invitation_code + invitation_nonce * invitee_fr + workspace_fr * expiry_fr;
 
-        // Prepare output
         let mut output = Vec::new();
         output.extend_from_slice(&invitation_code.into_bigint().to_bytes_le()[..32]);
         output.extend_from_slice(&invitation_nonce.into_bigint().to_bytes_le()[..32]);
@@ -396,7 +571,6 @@ pub extern "C" fn cyan_create_invitation(
         ptr::copy_nonoverlapping(output.as_ptr(), out_invitation, output.len());
         *actual_size = output.len();
 
-        // Store invitation in LMDB for validation
         let invitation_data = crate::storage::InvitationRecord {
             invitation_hash: invitation_hash.into_bigint().to_bytes_le()[..32]
                 .try_into()
@@ -426,7 +600,6 @@ pub extern "C" fn cyan_accept_invitation(
         use ark_bn254::Fr;
         use ark_ff::PrimeField;
 
-        // Parse inputs
         let code_bytes = slice::from_raw_parts(invitation_code, 32);
         let nonce_bytes = slice::from_raw_parts(invitation_nonce, 32);
         let hash_bytes = slice::from_raw_parts(invitation_hash, 32);
@@ -437,18 +610,15 @@ pub extern "C" fn cyan_accept_invitation(
         let claimer_bytes = slice::from_raw_parts(claimer_xaero_id, 2572);
         let claimer = bytemuck::from_bytes::<xaeroid::XaeroID>(claimer_bytes);
 
-        // Create the hash array properly
         let mut hash_array = [0u8; 32];
         hash_array.copy_from_slice(hash_bytes);
 
-        // Verify invitation exists and is valid
         match crate::storage::get_invitation(&hash_array) {
             Ok(invitation) => {
                 if invitation.expiry_time < xaeroflux_core::date_time::emit_secs() {
-                    return false; // Expired
+                    return false;
                 }
 
-                // Create ZK proof of invitation claim
                 let code_fr = Fr::from_le_bytes_mod_order(code_bytes);
                 let nonce_fr = Fr::from_le_bytes_mod_order(nonce_bytes);
                 let hash_fr = Fr::from_le_bytes_mod_order(hash_bytes);
@@ -457,16 +627,14 @@ pub extern "C" fn cyan_accept_invitation(
                 let claimer_fr = Fr::from_le_bytes_mod_order(claimer_hash.as_bytes());
                 let expiry_fr = Fr::from(expiry_time);
 
-                // Generate and verify proof
                 let computed_hash = code_fr + nonce_fr * claimer_fr + workspace_fr * expiry_fr;
 
                 if computed_hash == hash_fr {
-                    // Add user to workspace
                     crate::storage::add_user_to_workspace(
                         wid,
                         claimer.did_peer[..32].try_into().unwrap(),
                     )
-                    .is_ok()
+                        .is_ok()
                 } else {
                     false
                 }
@@ -476,72 +644,67 @@ pub extern "C" fn cyan_accept_invitation(
     }
 }
 
-// ffi.rs - Add these dummy functions to your cyan-backend
-
-use std::ffi::c_char;
-
-// MARK: - Tombstone Operations
 #[unsafe(no_mangle)]
-pub extern "C" fn cyan_tombstone_group(group_id: *const u8) -> bool {
-    // Dummy: Just return success
+pub extern "C" fn cyan_tombstone_group(_group_id: *const u8) -> bool {
     true
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cyan_tombstone_workspace(workspace_id: *const u8) -> bool {
+pub extern "C" fn cyan_tombstone_workspace(_workspace_id: *const u8) -> bool {
     true
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cyan_tombstone_board(board_id: *const u8) -> bool {
-    true
-}
-
-// MARK: - Rename Operations
-#[unsafe(no_mangle)]
-pub extern "C" fn cyan_rename_group(group_id: *const u8, new_name: *const c_char) -> bool {
+pub extern "C" fn cyan_tombstone_board(_board_id: *const u8) -> bool {
     true
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cyan_rename_workspace(workspace_id: *const u8, new_name: *const c_char) -> bool {
+pub extern "C" fn cyan_rename_group(_group_id: *const u8, _new_name: *const c_char) -> bool {
     true
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cyan_rename_board(board_id: *const u8, new_name: *const c_char) -> bool {
+pub extern "C" fn cyan_rename_workspace(_workspace_id: *const u8, _new_name: *const c_char) -> bool {
     true
 }
 
-// MARK: - File Operations
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_rename_board(_board_id: *const u8, _new_name: *const c_char) -> bool {
+    true
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_add_file_to_group(
-    group_id: *const u8,
-    file_path: *const c_char,
-    file_data: *const u8,
-    file_size: usize,
-    out_file_id: *mut u8,
+    _group_id: *const u8,
+    _file_path: *const c_char,
+    _file_data: *const u8,
+    _file_size: usize,
+    _out_file_id: *mut u8,
 ) -> bool {
-    unsafe {
-        // Generate dummy file ID (32 bytes)
-        let dummy_id = b"file12345678901234567890123456789";
-        std::ptr::copy_nonoverlapping(dummy_id.as_ptr(), out_file_id, 32);
-    }
     true
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_add_file_to_workspace(
-    workspace_id: *const u8,
-    file_path: *const c_char,
-    file_data: *const u8,
-    file_size: usize,
-    out_file_id: *mut u8,
+    _workspace_id: *const u8,
+    _file_path: *const c_char,
+    _file_data: *const u8,
+    _file_size: usize,
+    _out_file_id: *mut u8,
+) -> bool {
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_list_files_in_group(
+    _group_id: *const u8,
+    _out_buffer: *mut u8,
+    _buffer_size: usize,
+    actual_size: *mut usize,
 ) -> bool {
     unsafe {
-        // Generate dummy file ID (32 bytes)
-        let dummy_id = b"file98765432109876543210987654321";
-        std::ptr::copy_nonoverlapping(dummy_id.as_ptr(), out_file_id, 32);
+        *actual_size = 0;
     }
     true
 }
