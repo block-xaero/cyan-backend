@@ -6,9 +6,6 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
-[[bin]]
-name = "cyan-cli"
-path = "src/bin/main.rs"
 
 [dependencies]
 # Existing dependencies...
