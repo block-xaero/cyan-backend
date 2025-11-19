@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, LockResult, Mutex},
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use iroh::{Endpoint, RelayMode, SecretKey};
@@ -32,6 +32,7 @@ static DATA_DIR: OnceCell<PathBuf> = OnceCell::new();
 
 // ---------- Core types ----------
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub struct Group {
     pub id: String,
     pub name: String,
@@ -41,6 +42,7 @@ pub struct Group {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub struct Workspace {
     pub id: String,
     pub group_id: String,
@@ -77,6 +79,7 @@ pub enum Object {
 
 // ---------- Gossip events ----------
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum NetworkEvent {
     GroupCreated(Group),
     GroupRenamed {
@@ -112,6 +115,8 @@ pub enum NetworkEvent {
 // ---------- Internal commands ----------
 #[derive(Debug)]
 enum NetworkCommand {
+    RequestSnapshot { from_peer: String },
+    SendSnapshot { to_peer: String, snapshot: TreeSnapshotDTO },
     JoinGroup {
         group_id: String,
     },
@@ -130,6 +135,7 @@ enum NetworkCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 enum CommandMsg {
     CreateGroup {
         name: String,
@@ -173,7 +179,7 @@ enum CommandMsg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", content = "data")]
 pub enum SwiftEvent {
     Network(NetworkEvent),
     TreeLoaded(String), // The JSON tree
@@ -232,16 +238,9 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn db_path() -> PathBuf {
-    DATA_DIR
-        .get()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("cyan.db")
-}
 
 impl CyanSystem {
-    async fn new() -> Result<Self> {
+    async fn new(db_path: String) -> Result<Self> {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -250,7 +249,7 @@ impl CyanSystem {
         let secret_key = SecretKey::generate(&mut rng);
         let node_id = secret_key.public().to_string();
 
-        let db = Connection::open(db_path())?;
+        let db = Connection::open(db_path)?;
         ensure_schema(&db)?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<CommandMsg>();
@@ -659,7 +658,7 @@ impl NetworkActor {
         let discovery_topic_id = TopicId::from_bytes(
             blake3::hash(format!("cyan/discovery/{}", dkey).as_bytes()).as_bytes()[..32]
                 .try_into()
-                .unwrap(),
+                ?,
         );
 
         if let Ok(mut disc_reader) = gossip.subscribe(discovery_topic_id, vec![]).await {
@@ -953,6 +952,8 @@ impl NetworkActor {
                         }
                     }
                 }
+                NetworkCommand::RequestSnapshot { .. } => {}
+                NetworkCommand::SendSnapshot { .. } => {}
             }
         }
     }
@@ -1165,10 +1166,17 @@ pub extern "C" fn cyan_set_discovery_key(key: *const c_char) -> bool {
 }
 
 #[no_mangle]
-pub extern "C" fn cyan_init() -> bool {
+pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
     if SYSTEM.get().is_some() {
         return true;
     }
+    let path = unsafe {
+        if db_path.is_null() {
+            eprintln!("Database path is null");
+            return false;
+        }
+        CStr::from_ptr(db_path).to_string_lossy().to_string()
+    };
     let res = std::thread::spawn(|| {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -1178,7 +1186,7 @@ pub extern "C" fn cyan_init() -> bool {
         RUNTIME.set(runtime).ok();
 
         let rt = RUNTIME.get().unwrap();
-        let sys = rt.block_on(async { CyanSystem::new().await });
+        let sys = rt.block_on(async { CyanSystem::new(path).await });
 
         match sys {
             Ok(s) => {
@@ -1511,7 +1519,7 @@ pub extern "C" fn cyan_free_string(ptr: *mut c_char) {
 #[no_mangle]
 pub extern "C" fn cyan_poll_events(component: *const c_char) -> *mut c_char {
     let component = unsafe { CStr::from_ptr(component).to_string_lossy() };
-    let cyan = SYSTEM.get().expect("System not initialized");
+    let cyan  = SYSTEM.get().unwrap();
     let event_ffi_buffer = cyan.event_ffi_buffer.clone();
     let buffer = event_ffi_buffer.lock();
     match buffer {
