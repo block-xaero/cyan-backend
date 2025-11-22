@@ -34,3 +34,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand_chacha = "0.9.0"
 iroh-relay = "0.95.1"
+time = "0.3.44"
