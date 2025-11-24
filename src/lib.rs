@@ -2,19 +2,13 @@
 #![allow(clippy::too_many_arguments)]
 extern crate core;
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    ffi::{c_char, CStr, CString},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-
-use anyhow::Result;
+use crate::NetworkCommand::RequestSnapshot;
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures::StreamExt;
-use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, SecretKey};
 use iroh_blobs::store::fs::FsStore as BlobStore;
+use iroh_blobs::util::SendStream;
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipTopic},
     proto::state::TopicId,
@@ -24,6 +18,15 @@ use once_cell::sync::OnceCell;
 use rand_chacha::rand_core::SeedableRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    ffi::{c_char, CStr, CString},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     runtime::Runtime,
     sync::{mpsc, mpsc::error::SendError},
@@ -87,6 +90,14 @@ pub enum Object {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum NetworkEvent {
+    /// A group snapshot available sent as a
+    /// network event from source/peer_id
+    /// the current running peer who receives this ack then
+    /// QUIC connects and receives the snapshot
+    GroupSnapshotAvailable {
+        source: String,
+        group_id: String,
+    },
     GroupCreated(Group),
     GroupRenamed {
         id: String,
@@ -100,6 +111,9 @@ pub enum NetworkEvent {
         id: String,
         name: String,
     },
+    WorkspaceDeleted {
+        id: String,
+    },
     BoardCreated {
         id: String,
         workspace_id: String,
@@ -109,6 +123,9 @@ pub enum NetworkEvent {
     BoardRenamed {
         id: String,
         name: String,
+    },
+    BoardDeleted {
+        id: String,
     },
     FileAvailable {
         id: String,
@@ -122,14 +139,11 @@ pub enum NetworkEvent {
 }
 
 // ---------- Internal commands ----------
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum NetworkCommand {
+    /// Requests group snapshot
     RequestSnapshot {
         from_peer: String,
-    },
-    SendSnapshot {
-        to_peer: String,
-        snapshot: TreeSnapshotDTO,
     },
     JoinGroup {
         group_id: String,
@@ -146,7 +160,9 @@ enum NetworkCommand {
         workspace_id: String,
         path: String,
     },
-    DeleteGroup{ id: String },
+    DeleteGroup { id: String },
+    DeleteWorkspace { id: String },
+    DeleteBoard { id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,9 +269,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
 impl CyanSystem {
     async fn new(db_path: String) -> Result<Self> {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
         );
         let secret_key = SecretKey::generate(&mut rng);
         let node_id = secret_key.public().to_string();
@@ -266,8 +280,7 @@ impl CyanSystem {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<CommandMsg>();
         let (net_tx, net_rx) = mpsc::unbounded_channel::<NetworkCommand>();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SwiftEvent>();
-        let event_ffi_buffer: Arc<Mutex<VecDeque<String>>> =
-            Arc::new(Mutex::new(Default::default()));
+        let event_ffi_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(Default::default()));
 
         let event_ffi_buffer_clone = event_ffi_buffer.clone();
         let node_id_clone = node_id.clone();
@@ -291,16 +304,12 @@ impl CyanSystem {
                 rx: cmd_rx,
                 network_tx: net_tx,
                 event_tx: event_tx_clone,
-            }
-                .run()
-                .await;
+            }.run().await;
         });
 
         let db_clone = system.db.clone();
         RUNTIME.get().unwrap().spawn(async move {
-            match NetworkActor::new(node_id_clone, secret_key_clone, db_clone, net_rx, event_tx)
-                .await
-            {
+            match NetworkActor::new(node_id_clone, secret_key_clone, db_clone, net_rx, event_tx).await {
                 Ok(n) => n.start().await,
                 Err(e) => eprintln!("Network actor failed: {e}"),
             }
@@ -335,9 +344,7 @@ impl CommandActor {
         while let Some(msg) = self.rx.recv().await {
             match msg {
                 CommandMsg::CreateGroup { name, icon, color } => {
-                    let id = blake3::hash(format!("{}-{}", name, chrono::Utc::now()).as_bytes())
-                        .to_hex()
-                        .to_string();
+                    let id = blake3::hash(format!("{}-{}", name, chrono::Utc::now()).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let g = Group {
                         id: id.clone(),
@@ -364,9 +371,7 @@ impl CommandActor {
                         event: NetworkEvent::GroupCreated(g.clone()),
                     });
 
-                    let _ = self
-                        .event_tx
-                        .send(SwiftEvent::Network(NetworkEvent::GroupCreated(g)));
+                    let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::GroupCreated(g)));
                 }
 
                 CommandMsg::RenameGroup { id, name } => {
@@ -375,18 +380,14 @@ impl CommandActor {
                         db.execute("UPDATE groups SET name=?1 WHERE id=?2", params![
                             name.clone(),
                             id.clone()
-                        ])
-                            .unwrap_or(0)
-                            > 0
+                        ]).unwrap_or(0) > 0
                     };
 
                     if ok {
-                        let _ =
-                            self.event_tx
-                                .send(SwiftEvent::Network(NetworkEvent::GroupRenamed {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                }));
+                        let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::GroupRenamed {
+                            id: id.clone(),
+                            name: name.clone(),
+                        }));
 
                         let _ = self.network_tx.send(NetworkCommand::Broadcast {
                             group_id: id.clone(),
@@ -400,24 +401,17 @@ impl CommandActor {
                         let db = self.db.lock().unwrap();
                         let _ = db.execute("DELETE FROM objects WHERE group_id=?1", params![id]);
                         let _ = db.execute("DELETE FROM workspaces WHERE group_id=?1", params![id]);
-                        db.execute("DELETE FROM groups WHERE id=?1", params![id])
-                            .unwrap_or(0)
-                            > 0
+                        db.execute("DELETE FROM groups WHERE id=?1", params![id]).unwrap_or(0) > 0
                     };
 
                     if ok {
-                        // Local feedback to UI immediately
                         let _ = self.event_tx.send(SwiftEvent::GroupDeleted { id: id.clone() });
-
-                        // Broadcast deletion to discovery topic (all peers)
                         let _ = self.network_tx.send(NetworkCommand::DeleteGroup { id });
                     }
                 }
 
                 CommandMsg::CreateWorkspace { group_id, name } => {
-                    let id = blake3::hash(format!("ws:{}-{}", &group_id, name).as_bytes())
-                        .to_hex()
-                        .to_string();
+                    let id = blake3::hash(format!("ws:{}-{}", &group_id, name).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
                     let ws = Workspace {
                         id: id.clone(),
@@ -443,20 +437,22 @@ impl CommandActor {
                         event: NetworkEvent::WorkspaceCreated(ws.clone()),
                     });
 
-                    let _ = self
-                        .event_tx
-                        .send(SwiftEvent::Network(NetworkEvent::WorkspaceCreated(ws)));
+                    let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::WorkspaceCreated(ws)));
                 }
 
                 CommandMsg::RenameWorkspace { id, name } => {
+                    let group_id: Option<String> = {
+                        let db = self.db.lock().unwrap();
+                        let mut stmt = db.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").unwrap();
+                        stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                    };
+
                     let ok = {
                         let db = self.db.lock().unwrap();
                         db.execute("UPDATE workspaces SET name=?1 WHERE id=?2", params![
                             name.clone(),
                             id.clone()
-                        ])
-                            .unwrap_or(0)
-                            > 0
+                        ]).unwrap_or(0) > 0
                     };
 
                     if ok {
@@ -466,48 +462,40 @@ impl CommandActor {
                                 name: name.clone(),
                             },
                         ));
+
+                        if let Some(gid) = group_id {
+                            let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                                group_id: gid,
+                                event: NetworkEvent::WorkspaceRenamed { id, name },
+                            });
+                        }
                     }
                 }
 
                 CommandMsg::DeleteWorkspace { id } => {
-                    let ok = {
-                        let group_id: Option<String> = {
-                            let db = self.db.lock().unwrap();
-                            let mut stmt = db
-                                .prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1")
-                                .unwrap();
-                            stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0))
-                                .optional()
-                                .unwrap()
-                        };
+                    let group_id: Option<String> = {
                         let db = self.db.lock().unwrap();
-                        let _ =
-                            db.execute("DELETE FROM objects WHERE workspace_id=?1", params![id]);
-                        let ok = db
-                            .execute("DELETE FROM workspaces WHERE id=?1", params![id])
-                            .unwrap_or(0)
-                            > 0;
-                        if ok {
-                            if let Some(gid) = group_id {
-                                let _ = self
-                                    .network_tx
-                                    .send(NetworkCommand::JoinGroup { group_id: gid });
-                            }
-                        }
-                        ok
+                        let mut stmt = db.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").unwrap();
+                        stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                    };
+
+                    let ok = {
+                        let db = self.db.lock().unwrap();
+                        let _ = db.execute("DELETE FROM objects WHERE workspace_id=?1", params![id]);
+                        db.execute("DELETE FROM workspaces WHERE id=?1", params![id]).unwrap_or(0) > 0
                     };
 
                     if ok {
-                        let _ = self
-                            .event_tx
-                            .send(SwiftEvent::WorkspaceDeleted { id: id.clone() });
+                        let _ = self.event_tx.send(SwiftEvent::WorkspaceDeleted { id: id.clone() });
+
+                        if let Some(gid) = group_id {
+                            let _ = self.network_tx.send(NetworkCommand::DeleteWorkspace { id });
+                        }
                     }
                 }
 
                 CommandMsg::CreateBoard { workspace_id, name } => {
-                    let id = blake3::hash(format!("wb:{}-{}", &workspace_id, name).as_bytes())
-                        .to_hex()
-                        .to_string();
+                    let id = blake3::hash(format!("wb:{}-{}", &workspace_id, name).as_bytes()).to_hex().to_string();
                     let now = chrono::Utc::now().timestamp();
 
                     {
@@ -519,62 +507,94 @@ impl CommandActor {
                         );
                     }
 
-                    let _ = self
-                        .event_tx
-                        .send(SwiftEvent::Network(NetworkEvent::BoardCreated {
-                            id: id.clone(),
-                            workspace_id: workspace_id.clone(),
-                            name: name.clone(),
-                            created_at: now,
-                        }));
+                    // Get group_id for broadcast
+                    let group_id: Option<String> = {
+                        let db = self.db.lock().unwrap();
+                        let mut stmt = db.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").unwrap();
+                        stmt.query_row(params![workspace_id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                    };
 
-                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
-                        group_id: workspace_id.clone(),
-                        event: NetworkEvent::BoardCreated {
-                            id: id.clone(),
-                            workspace_id,
-                            name,
-                            created_at: now,
-                        },
-                    });
+                    let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::BoardCreated {
+                        id: id.clone(),
+                        workspace_id: workspace_id.clone(),
+                        name: name.clone(),
+                        created_at: now,
+                    }));
+
+                    if let Some(gid) = group_id {
+                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                            group_id: gid,
+                            event: NetworkEvent::BoardCreated {
+                                id: id.clone(),
+                                workspace_id,
+                                name,
+                                created_at: now,
+                            },
+                        });
+                    }
                 }
 
                 CommandMsg::RenameBoard { id, name } => {
+                    // Get group_id for broadcast
+                    let group_id: Option<String> = {
+                        let db = self.db.lock().unwrap();
+                        let mut stmt = db.prepare(
+                            "SELECT w.group_id FROM objects o
+                                 JOIN workspaces w ON o.workspace_id = w.id
+                                 WHERE o.id=?1 AND o.type='whiteboard' LIMIT 1"
+                        ).unwrap();
+                        stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                    };
+
                     let ok = {
                         let db = self.db.lock().unwrap();
                         db.execute(
                             "UPDATE objects SET name=?1 WHERE id=?2 AND type='whiteboard'",
                             params![name.clone(), id.clone()],
-                        )
-                            .unwrap_or(0)
-                            > 0
+                        ).unwrap_or(0) > 0
                     };
 
                     if ok {
-                        let _ =
-                            self.event_tx
-                                .send(SwiftEvent::Network(NetworkEvent::BoardRenamed {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                }));
+                        let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::BoardRenamed {
+                            id: id.clone(),
+                            name: name.clone(),
+                        }));
+
+                        if let Some(gid) = group_id {
+                            let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                                group_id: gid,
+                                event: NetworkEvent::BoardRenamed { id, name },
+                            });
+                        }
                     }
                 }
 
                 CommandMsg::DeleteBoard { id } => {
+                    // Get group_id for broadcast
+                    let group_id: Option<String> = {
+                        let db = self.db.lock().unwrap();
+                        let mut stmt = db.prepare(
+                            "SELECT w.group_id FROM objects o
+                                 JOIN workspaces w ON o.workspace_id = w.id
+                                 WHERE o.id=?1 AND o.type='whiteboard' LIMIT 1"
+                        ).unwrap();
+                        stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                    };
+
                     let ok = {
                         let db = self.db.lock().unwrap();
                         db.execute(
                             "DELETE FROM objects WHERE id=?1 AND type='whiteboard'",
                             params![id],
-                        )
-                            .unwrap_or(0)
-                            > 0
+                        ).unwrap_or(0) > 0
                     };
 
                     if ok {
-                        let _ = self
-                            .event_tx
-                            .send(SwiftEvent::BoardDeleted { id: id.clone() });
+                        let _ = self.event_tx.send(SwiftEvent::BoardDeleted { id: id.clone() });
+
+                        if let Some(gid) = group_id {
+                            let _ = self.network_tx.send(NetworkCommand::DeleteBoard { id });
+                        }
                     }
                 }
 
@@ -605,6 +625,7 @@ struct NetworkActor {
     groups: Arc<Mutex<HashSet<String>>>,
     event_tx: mpsc::UnboundedSender<SwiftEvent>,
     discovery_topic: Arc<tokio::sync::Mutex<GossipTopic>>,
+    need_snapshot: Arc<Mutex<HashMap<String, AtomicBool>>>,
 }
 
 impl NetworkActor {
@@ -615,20 +636,12 @@ impl NetworkActor {
         rx: mpsc::UnboundedReceiver<NetworkCommand>,
         event_tx: mpsc::UnboundedSender<SwiftEvent>,
     ) -> Result<Self> {
-        let builder = Endpoint::builder()
-            .secret_key(secret_key.clone())
-            .alpns(vec![b"xsp-1.0".to_vec()])
-            .relay_mode(RelayMode::Default);
+        let builder = Endpoint::builder().secret_key(secret_key.clone()).alpns(vec![b"xsp-1.0".to_vec()]).relay_mode(RelayMode::Default);
         let endpoint = builder.bind().await?;
         tracing::info!("Node ID: {}", endpoint.id());
-
         let gossip = Arc::new(Gossip::builder().spawn(endpoint.clone()));
 
-        let root = DATA_DIR
-            .get()
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("blobs");
+        let root = DATA_DIR.get().cloned().unwrap_or_else(|| PathBuf::from(".")).join("blobs");
         let blob_store = BlobStore::load(root).await?;
 
         // Subscribe to discovery topic
@@ -637,16 +650,10 @@ impl NetworkActor {
                 format!(
                     "cyan/discovery/{}",
                     DISCOVERY_KEY.get().unwrap_or(&"cyan-dev".to_string())
-                )
-                    .as_bytes(),
-            )
-                .as_bytes()[..32]
-                .try_into()?,
+                ).as_bytes(),
+            ).as_bytes()[..32].try_into()?,
         );
-        let discovery_topic = gossip
-            .subscribe_and_join(discovery_topic_id, vec![])
-            .await?;
-
+        let discovery_topic = gossip.subscribe_and_join(discovery_topic_id, vec![]).await?;
         Ok(Self {
             node_id,
             db,
@@ -659,22 +666,57 @@ impl NetworkActor {
             groups: Arc::new(Mutex::new(HashSet::new())),
             event_tx,
             discovery_topic: Arc::new(tokio::sync::Mutex::new(discovery_topic)),
+            need_snapshot: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub async fn start(self) {
         let self_arc = Arc::new(self);
-
         // Setup discovery
         self_arc.clone().setup_discovery().await;
-
+        tracing::info!("Start a snapshot requestor for groups == handles sending snapshot requests");
+        tokio::spawn(self_arc.clone().snapshot_requestor());
         // Start polling network events
         tokio::spawn(self_arc.clone().poll_network_events());
-
         // Run command handler
         self_arc.clone().poll_network_commands().await;
     }
 
+    pub async fn snapshot_requestor(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+
+            let requests: Vec<String> = {
+                let snapshot_requests = self.need_snapshot.lock().unwrap();
+                snapshot_requests.iter().filter_map(|(group_id, flag)| {
+                    if flag.load(Ordering::Relaxed) {
+                        Some(group_id.clone())
+                    } else {
+                        None
+                    }
+                }).collect()
+            };
+
+            for group_id in requests {
+                let topic = {
+                    let topics = self.topics.lock().unwrap();
+                    topics.get(&group_id).cloned()
+                };
+
+                if let Some(topic) = topic {
+                    let request_msg = NetworkCommand::RequestSnapshot {
+                        from_peer: self.node_id.clone()
+                    };
+
+                    let mut guard = topic.lock().await;
+                    let _ = guard.broadcast(
+                        Bytes::from(serde_json::to_vec(&request_msg).unwrap())
+                    ).await;
+                }
+            }
+        }
+    }
     fn get_groups_from_db(db: Arc<Mutex<Connection>>) -> HashSet<String> {
         let groups = {
             let db = db.lock().unwrap();
@@ -691,19 +733,20 @@ impl NetworkActor {
 
     async fn poll_network_events(self: Arc<Self>) {
         loop {
-            let topics = self.topics.lock().unwrap().clone();
-            for (_group_id, topic) in topics.iter() {
+            let topics = self.clone().topics.lock().unwrap().clone();
+            for (group_id, topic) in topics.iter() {
                 let topic = topic.clone();
                 let db = self.db.clone();
                 let event_tx = self.event_tx.clone();
                 let self_clone = self.clone();
+                let group_id_for_cmd = group_id.clone();
 
                 tokio::spawn(async move {
                     if let Ok(mut topic_guard) = topic.try_lock() {
                         if let Some(Ok(ev)) = topic_guard.next().await {
                             if let GossipEvent::Received(msg) = ev {
-                                if let Ok(evt) =
-                                    serde_json::from_slice::<NetworkEvent>(&msg.content)
+                                // Try parsing as NetworkEvent first
+                                if let Ok(evt) = serde_json::from_slice::<NetworkEvent>(&msg.content)
                                 {
                                     // Store in DB
                                     match &evt {
@@ -743,6 +786,17 @@ impl NetworkActor {
                                                 params![name, id],
                                             );
                                         }
+                                        NetworkEvent::WorkspaceDeleted { id } => {
+                                            let db = db.lock().unwrap();
+                                            let _ = db.execute(
+                                                "DELETE FROM objects WHERE workspace_id=?1",
+                                                params![id],
+                                            );
+                                            let _ = db.execute(
+                                                "DELETE FROM workspaces WHERE id=?1",
+                                                params![id],
+                                            );
+                                        }
                                         NetworkEvent::BoardCreated {
                                             id,
                                             workspace_id,
@@ -763,6 +817,13 @@ impl NetworkActor {
                                                 "UPDATE objects SET name=?1 WHERE id=?2 AND \
                                              type='whiteboard'",
                                                 params![name, id],
+                                            );
+                                        }
+                                        NetworkEvent::BoardDeleted { id } => {
+                                            let db = db.lock().unwrap();
+                                            let _ = db.execute(
+                                                "DELETE FROM objects WHERE id=?1 AND type='whiteboard'",
+                                                params![id],
                                             );
                                         }
                                         NetworkEvent::FileAvailable {
@@ -804,9 +865,7 @@ impl NetworkActor {
                                                 db.execute(
                                                     "DELETE FROM groups WHERE id=?1",
                                                     params![id],
-                                                )
-                                                    .unwrap_or(0)
-                                                    > 0
+                                                ).unwrap_or(0) > 0
                                             };
                                             if ok {
                                                 self_clone.topics.lock().unwrap().remove(id);
@@ -816,10 +875,60 @@ impl NetworkActor {
                                                 );
                                             }
                                         }
+                                        NetworkEvent::GroupSnapshotAvailable { source, group_id } => {
+                                            // Don't download from ourselves
+                                            if *source != self_clone.node_id {
+                                                tracing::info!("Snapshot available for {group_id:?} from {source:?}");
+                                                // check if we need it?
+                                                let needs_snapshot = self_clone.need_snapshot.lock().unwrap()
+                                                    .get(group_id)
+                                                    .map(|flag| flag.load(Ordering::Relaxed))
+                                                    .unwrap_or(false);
+
+                                                if needs_snapshot {
+                                                    tracing::info!("Downloading snapshot for {group_id:?} from {source:?}");
+                                                    if let Ok(pk) = PublicKey::from_str(&source) {
+                                                        let self_for_spawn = self_clone.clone();
+                                                        let source_clone = source.clone();
+                                                        let group_id_clone = group_id.clone();
+                                                        tokio::spawn(async move {
+                                                            if let Err(e) = self_for_spawn.download_snapshot(source_clone, group_id_clone).await {
+                                                                tracing::error!("Snapshot download failed: {}", e);
+                                                            }
+                                                        });
+                                                    } else {
+                                                        tracing::warn!("Snapshot available from {source:?} cannot be downloaded because of invalid public key!")
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
 
                                     // Send to Swift
                                     let _ = event_tx.send(SwiftEvent::Network(evt));
+                                }
+                                // Try parsing as NetworkCommand (for snapshot requests)
+                                else if let Ok(cmd) = serde_json::from_slice::<NetworkCommand>(&msg.content) {
+                                    match cmd {
+                                        NetworkCommand::RequestSnapshot { from_peer } => {
+                                            // Don't respond to our own requests
+                                            if from_peer != self_clone.node_id {
+                                                tracing::info!("Received snapshot request from {from_peer} for group {group_id_for_cmd}");
+
+                                                if let Ok(pk) = PublicKey::from_str(&from_peer) {
+                                                    let self_for_spawn = self_clone.clone();
+                                                    let db_clone = db.clone();
+                                                    let gid = group_id_for_cmd.clone();
+                                                    tokio::spawn(async move {
+                                                        if let Err(e) = self_for_spawn.send_snapshot(pk, gid, db_clone).await {
+                                                            tracing::error!("Failed to send snapshot: {}", e);
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
@@ -829,10 +938,114 @@ impl NetworkActor {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+    async fn download_snapshot(self: Arc<Self>, peer_address: String, group_id: String) -> Result<()> {
+        let end_pt_address = EndpointAddr::new(PublicKey::from_str(&peer_address)?);
+        let connection = self.endpoint.connect(end_pt_address, b"xsp-1.0").await?;
+        let (_send, mut recv) = connection.open_bi().await?;
+
+        // FIXME: Note open a different stream for receiving files to afford some parallelization
+        // to get snapshot quick
+        // TODO: add zipping to get snapshot and save on bandwidth.
+
+        tracing::info!("Reading snapshot data from {peer_address}...");
+        let buf = recv.read_to_end(10 * 1024 * 1024).await?; // 10MB max
+
+        tracing::info!("Downloaded {} bytes, deserializing...", buf.len());
+        let tree_dto: TreeSnapshotDTO = serde_json::from_slice(&buf)?;
+
+        tracing::info!("Storing tree snapshot for group: {group_id}");
+        let db = self.db.lock().map_err(|e| anyhow!("Failed to lock db: {}", e))?;
+
+        let group = tree_dto.groups;
+        match group.get(0) {
+            None => {
+                tracing::warn!("No group found in snapshot, skipping");
+                Err(anyhow!("No group in snapshot"))
+            }
+            Some(g) => {
+                tracing::info!("Received snapshot for {g:?}, inserting data");
+                let _ = db.execute(
+                    "INSERT OR IGNORE INTO groups (id, name, icon, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![g.id, g.name, g.icon, g.color, g.created_at],
+                );
+                tracing::debug!("Group successfully inserted");
+
+                for w in tree_dto.workspaces {
+                    let _ = db.execute(
+                        "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![w.id, w.group_id, w.name, w.created_at],
+                    );
+                    tracing::debug!("Workspace {w:?} successfully inserted");
+                }
+
+                for whiteboard in tree_dto.whiteboards {
+                    let _ = db.execute(
+                        "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at) VALUES (?1, ?2, 'whiteboard', ?3, ?4)",
+                        params![whiteboard.id, whiteboard.workspace_id, whiteboard.name, whiteboard.created_at],
+                    );
+                    tracing::debug!("Whiteboard {whiteboard:?} successfully inserted");
+                }
+
+                // Mark snapshot as received
+                if let Some(flag) = self.need_snapshot.lock().unwrap().get(&group_id) {
+                    flag.store(false, Ordering::Relaxed);
+                    tracing::info!("Snapshot for {group_id} marked as received");
+                }
+
+                // Notify Swift of tree update
+                let json = dump_tree_json(&self.db);
+                let _ = self.event_tx.send(SwiftEvent::TreeLoaded(json));
+
+                Ok(())
+            }
+        }
+    }
+
+    async fn send_snapshot(
+        self: Arc<Self>,
+        requester: PublicKey,
+        group_id: String,
+        db: Arc<Mutex<Connection>>,
+    ) -> Result<()> {
+        tracing::info!("Building snapshot for group {group_id} to send to {requester}");
+
+        // Build snapshot from DB
+        let snapshot = build_group_snapshot(&db, &group_id)?;
+
+        // Serialize
+        let data = serde_json::to_vec(&snapshot)?;
+        tracing::info!("Snapshot serialized: {} bytes", data.len());
+
+        // Connect to requester
+        let addr = EndpointAddr::new(requester);
+        let connection = self.endpoint.connect(addr, b"xsp-1.0").await?;
+        let (mut send, _recv) = connection.open_bi().await?;
+
+        // Send data
+        send.write_all(&data).await?;
+        send.finish()?;
+
+        tracing::info!("Snapshot sent successfully to {requester}");
+
+        // Broadcast that snapshot is available
+        let evt = NetworkEvent::GroupSnapshotAvailable {
+            source: self.node_id.clone(),
+            group_id: group_id.clone(),
+        };
+
+        if let Some(topic) = self.topics.lock().unwrap().get(&group_id).cloned() {
+            tokio::spawn(async move {
+                let mut guard = topic.lock().await;
+                let _ = guard.broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap())).await;
+            });
+        }
+
+        Ok(())
+    }
+
 
     async fn poll_network_commands(self: Arc<Self>) {
         loop {
-            // Fix: Use tokio::sync::Mutex with .lock().await
             let cmd = {
                 let mut rx_guard = self.rx.lock().await;
                 rx_guard.recv().await
@@ -841,7 +1054,6 @@ impl NetworkActor {
             if let Some(cmd) = cmd {
                 match cmd {
                     NetworkCommand::JoinGroup { group_id } => {
-                        // Fix: Split subscribe from topics insertion
                         let should_subscribe = {
                             let topics = self.topics.lock().unwrap();
                             !topics.contains_key(&group_id)
@@ -849,21 +1061,16 @@ impl NetworkActor {
 
                         if should_subscribe {
                             let topic_id = TopicId::from_bytes(
-                                blake3::hash(format!("cyan/group/{}", group_id).as_bytes())
-                                    .as_bytes()[..32]
-                                    .try_into()
-                                    .unwrap(),
+                                blake3::hash(format!("cyan/group/{}", group_id).as_bytes()).as_bytes()[..32].try_into().unwrap(),
                             );
 
-                            if let Ok(topic) =
-                                self.gossip.subscribe_and_join(topic_id, vec![]).await
+                            if let Ok(topic) = self.gossip.subscribe_and_join(topic_id, vec![]).await
                             {
                                 self.topics.lock().unwrap().insert(
                                     group_id.clone(),
                                     Arc::new(tokio::sync::Mutex::new(topic)),
                                 );
 
-                                // Add to our groups
                                 self.groups.lock().unwrap().insert(group_id);
                             }
                         }
@@ -883,20 +1090,14 @@ impl NetworkActor {
                     NetworkCommand::UploadToGroup { group_id, path } => {
                         if let Ok(bytes) = tokio::fs::read(&path).await {
                             let _ = self.blob_store.add_bytes(bytes.clone()).await;
-                            let id =
-                                blake3::hash(format!("file:{}:{}", &group_id, &path).as_bytes())
-                                    .to_hex()
-                                    .to_string();
+                            let id = blake3::hash(format!("file:{}:{}", &group_id, &path).as_bytes()).to_hex().to_string();
                             let hash = blake3::hash(&bytes).to_hex().to_string();
                             let size = bytes.len() as u64;
                             let created_at = chrono::Utc::now().timestamp();
 
                             {
                                 let db = self.db.lock().unwrap();
-                                let name = Path::new(&path)
-                                    .file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("file");
+                                let name = Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file");
                                 let _ = db.execute(
                                     "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, \
                                      type, name, hash, size, created_at)
@@ -911,20 +1112,14 @@ impl NetworkActor {
                                     id: id.clone(),
                                     group_id: Some(group_id.clone()),
                                     workspace_id: None,
-                                    name: Path::new(&path)
-                                        .file_name()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("file")
-                                        .to_string(),
+                                    name: Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string(),
                                     hash,
                                     size,
                                     created_at,
                                 };
                                 tokio::spawn(async move {
                                     let mut guard = topic.lock().await;
-                                    let _ = guard
-                                        .broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap()))
-                                        .await;
+                                    let _ = guard.broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap())).await;
                                 });
                             }
                         }
@@ -936,31 +1131,22 @@ impl NetworkActor {
 
                             let gid: Option<String> = {
                                 let db = self.db.lock().unwrap();
-                                let mut stmt = db
-                                    .prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1")
-                                    .unwrap();
+                                let mut stmt = db.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").unwrap();
                                 stmt.query_row(params![workspace_id.clone()], |r| {
                                     r.get::<_, String>(0)
-                                })
-                                    .optional()
-                                    .unwrap()
+                                }).optional().unwrap()
                             };
 
                             let id = blake3::hash(
                                 format!("file:{}:{}", &workspace_id, &path).as_bytes(),
-                            )
-                                .to_hex()
-                                .to_string();
+                            ).to_hex().to_string();
                             let hash = blake3::hash(&bytes).to_hex().to_string();
                             let size = bytes.len() as u64;
                             let created_at = chrono::Utc::now().timestamp();
 
                             {
                                 let db = self.db.lock().unwrap();
-                                let name = Path::new(&path)
-                                    .file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("file");
+                                let name = Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file");
                                 let _ = db.execute(
                                     "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, \
                                      type, name, hash, size, created_at)
@@ -984,22 +1170,16 @@ impl NetworkActor {
                                         id: id.clone(),
                                         group_id: Some(group_id.clone()),
                                         workspace_id: Some(workspace_id.clone()),
-                                        name: Path::new(&path)
-                                            .file_name()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("file")
-                                            .to_string(),
+                                        name: Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string(),
                                         hash,
                                         size,
                                         created_at,
                                     };
                                     tokio::spawn(async move {
                                         let mut guard = topic.lock().await;
-                                        let _ = guard
-                                            .broadcast(Bytes::from(
-                                                serde_json::to_vec(&evt).unwrap(),
-                                            ))
-                                            .await;
+                                        let _ = guard.broadcast(Bytes::from(
+                                            serde_json::to_vec(&evt).unwrap(),
+                                        )).await;
                                     });
                                 }
                             }
@@ -1007,16 +1187,57 @@ impl NetworkActor {
                     }
 
                     NetworkCommand::DeleteGroup { id } => {
-                        // Broadcast deletion to discovery topic (all peers)
                         let msg = serde_json::json!({
                             "msg_type": "group_deleted",
                             "event": NetworkEvent::GroupDeleted { id: id.clone() }
                         });
 
                         let mut discovery_topic = self.discovery_topic.lock().await;
-                        let _ = discovery_topic
-                            .broadcast(Bytes::from(serde_json::to_string(&msg).unwrap()))
-                            .await;
+                        let _ = discovery_topic.broadcast(Bytes::from(serde_json::to_string(&msg).unwrap())).await;
+                    }
+
+                    NetworkCommand::DeleteWorkspace { id } => {
+                        // Get group_id to find the right topic
+                        let group_id: Option<String> = {
+                            let db = self.db.lock().unwrap();
+                            let mut stmt = db.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").unwrap();
+                            stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                        };
+
+                        if let Some(gid) = group_id {
+                            let topic = self.topics.lock().unwrap().get(&gid).cloned();
+                            if let Some(topic) = topic {
+                                let evt = NetworkEvent::WorkspaceDeleted { id: id.clone() };
+                                tokio::spawn(async move {
+                                    let mut guard = topic.lock().await;
+                                    let _ = guard.broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap())).await;
+                                });
+                            }
+                        }
+                    }
+
+                    NetworkCommand::DeleteBoard { id } => {
+                        // Get group_id through workspace join
+                        let group_id: Option<String> = {
+                            let db = self.db.lock().unwrap();
+                            let mut stmt = db.prepare(
+                                "SELECT w.group_id FROM objects o
+                                     JOIN workspaces w ON o.workspace_id = w.id
+                                     WHERE o.id=?1 AND o.type='whiteboard' LIMIT 1"
+                            ).unwrap();
+                            stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                        };
+
+                        if let Some(gid) = group_id {
+                            let topic = self.topics.lock().unwrap().get(&gid).cloned();
+                            if let Some(topic) = topic {
+                                let evt = NetworkEvent::BoardDeleted { id: id.clone() };
+                                tokio::spawn(async move {
+                                    let mut guard = topic.lock().await;
+                                    let _ = guard.broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap())).await;
+                                });
+                            }
+                        }
                     }
 
                     _ => {}
@@ -1036,7 +1257,7 @@ impl NetworkActor {
             loop {
                 let event = {
                     let mut topic_guard = discovery_topic.lock().await;
-                    topic_guard.next().await // Guard dropped here
+                    topic_guard.next().await
                 };
 
                 if let Some(Ok(event)) = event {
@@ -1049,7 +1270,6 @@ impl NetworkActor {
                                     if let Some(event_obj) = json.get("event") {
                                         if let Ok(evt) = serde_json::from_value::<NetworkEvent>(event_obj.clone()) {
                                             if let NetworkEvent::GroupDeleted { id } = evt {
-                                                // Delete from DB
                                                 {
                                                     let db = self_clone.db.lock().unwrap();
                                                     let _ = db.execute("DELETE FROM objects WHERE group_id=?1", params![&id]);
@@ -1057,11 +1277,9 @@ impl NetworkActor {
                                                     let _ = db.execute("DELETE FROM groups WHERE id=?1", params![&id]);
                                                 }
 
-                                                // Cleanup local state
                                                 self_clone.topics.lock().unwrap().remove(&id);
                                                 self_clone.groups.lock().unwrap().remove(&id);
 
-                                                // Notify UI
                                                 let _ = self_clone.event_tx.send(
                                                     SwiftEvent::GroupDeleted { id }
                                                 );
@@ -1071,40 +1289,27 @@ impl NetworkActor {
                                 }
                                 // Handle group discovery
                                 else if msg_type == "groups_exchange" {
-                                    if let Some(groups) =
-                                        json.get("local_groups").and_then(|v| v.as_array())
+                                    if let Some(groups) = json.get("local_groups").and_then(|v| v.as_array())
                                     {
-                                        // Fix: Collect new groups first, then subscribe
                                         let new_groups: Vec<String> = {
                                             let mut my_groups = self_clone.groups.lock().unwrap();
-                                            groups
-                                                .iter()
-                                                .filter_map(|g| g.as_str())
-                                                .filter(|gid| my_groups.insert(gid.to_string()))
-                                                .map(|s| s.to_string())
-                                                .collect()
-                                        }; // Guard dropped here
+                                            groups.iter().filter_map(|g| g.as_str()).filter(|gid| my_groups.insert(gid.to_string())).map(|s| s.to_string()).collect()
+                                        };
 
-                                        // Now subscribe without holding lock
                                         for gid in new_groups {
                                             let topic_id = TopicId::from_bytes(
                                                 blake3::hash(
                                                     format!("cyan/group/{}", gid).as_bytes(),
-                                                )
-                                                    .as_bytes()[..32]
-                                                    .try_into()
-                                                    .unwrap(),
+                                                ).as_bytes()[..32].try_into().unwrap(),
                                             );
 
-                                            if let Ok(topic) = self_clone
-                                                .gossip
-                                                .subscribe_and_join(topic_id, vec![])
-                                                .await
+                                            if let Ok(topic) = self_clone.gossip.subscribe_and_join(topic_id, vec![]).await
                                             {
                                                 self_clone.topics.lock().unwrap().insert(
-                                                    gid,
+                                                    gid.clone(),
                                                     Arc::new(tokio::sync::Mutex::new(topic)),
                                                 );
+                                                self_clone.need_snapshot.lock().unwrap().insert(gid, AtomicBool::new(true));
                                             }
                                         }
                                     }
@@ -1116,63 +1321,46 @@ impl NetworkActor {
             }
         });
 
-        // Broadcast our groups periodically
+        // Periodically broadcast our groups
         let self_clone = self.clone();
         tokio::spawn(async move {
-            // Broadcast immediately
-            Self::broadcast_groups(&self_clone).await;
-
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
-                interval.tick().await;
-                Self::broadcast_groups(&self_clone).await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let local_groups = self_clone.groups.lock().unwrap().clone();
+                let list: Vec<String> = local_groups.into_iter().collect();
+
+                let msg = serde_json::json!({
+                    "msg_type": "groups_exchange",
+                    "node_id": self_clone.node_id,
+                    "local_groups": list,
+                });
+
+                let mut discovery_topic = self_clone.discovery_topic.lock().await;
+                let _ = discovery_topic.broadcast(Bytes::from(serde_json::to_string(&msg).unwrap())).await;
             }
         });
     }
-
-    async fn broadcast_groups(self_arc: &Arc<Self>) {
-        let groups = self_arc.groups.lock().unwrap().clone();
-        let msg = serde_json::json!({
-            "msg_type": "groups_exchange",
-            "peer_id": self_arc.node_id.clone(),
-            "local_groups": groups.into_iter().collect::<Vec<_>>()
-        });
-
-        let mut discovery_topic = self_arc.discovery_topic.lock().await;
-        let _ = discovery_topic
-            .broadcast(Bytes::from(serde_json::to_string(&msg).unwrap()))
-            .await;
-    }
 }
 
-// ---------- Snapshot ----------
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GroupRowDTO {
-    id: String,
-    name: String,
-    icon: String,
-    color: String,
-    created_at: i64,
+// ---------- JSON dump & seeding ----------
+#[derive(Debug, Serialize, Deserialize)]
+struct TreeSnapshotDTO {
+    groups: Vec<Group>,
+    workspaces: Vec<Workspace>,
+    whiteboards: Vec<WhiteboardDTO>,
+    files: Vec<FileDTO>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkspaceRowDTO {
-    id: String,
-    group_id: String,
-    name: String,
-    created_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WhiteboardRowDTO {
+#[derive(Debug, Serialize, Deserialize)]
+struct WhiteboardDTO {
     id: String,
     workspace_id: String,
     name: String,
     created_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileRowDTO {
+#[derive(Debug, Serialize, Deserialize)]
+struct FileDTO {
     id: String,
     group_id: Option<String>,
     workspace_id: Option<String>,
@@ -1182,147 +1370,244 @@ struct FileRowDTO {
     created_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TreeSnapshotDTO {
-    groups: Vec<GroupRowDTO>,
-    workspaces: Vec<WorkspaceRowDTO>,
-    whiteboards: Vec<WhiteboardRowDTO>,
-    files: Vec<FileRowDTO>,
-}
+fn build_group_snapshot(db: &Arc<Mutex<Connection>>, group_id: &str) -> Result<TreeSnapshotDTO> {
+    let db = db.lock().map_err(|e| anyhow!("Failed to lock db: {}", e))?;
 
-fn dump_tree_json(db_arc: &Arc<Mutex<Connection>>) -> String {
-    let db = db_arc.lock().unwrap();
+    // Get the specific group
+    let group: Group = {
+        let mut stmt = db.prepare("SELECT id, name, icon, color, created_at FROM groups WHERE id=?1")?;
+        stmt.query_row(params![group_id], |r| {
+            Ok(Group {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                icon: r.get(2)?,
+                color: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })?
+    };
 
-    let mut groups = vec![];
-    {
-        let mut s = db
-            .prepare("SELECT id, name, icon, color, created_at FROM groups ORDER BY created_at ASC")
-            .unwrap();
-        let mut rows = s.query([]).unwrap();
-        while let Some(r) = rows.next().unwrap() {
-            groups.push(GroupRowDTO {
-                id: r.get(0).unwrap(),
-                name: r.get(1).unwrap(),
-                icon: r.get(2).unwrap(),
-                color: r.get(3).unwrap(),
-                created_at: r.get::<_, i64>(4).unwrap(),
-            });
+    // Get workspaces for this group
+    let workspaces: Vec<Workspace> = {
+        let mut stmt = db.prepare("SELECT id, group_id, name, created_at FROM workspaces WHERE group_id=?1 ORDER BY name")?;
+        let rows = stmt.query_map(params![group_id], |r| {
+            Ok(Workspace {
+                id: r.get(0)?,
+                group_id: r.get(1)?,
+                name: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        })?;
+        rows.filter_map(Result::ok).collect()
+    };
+
+    // Get workspace IDs for querying boards
+    let workspace_ids: Vec<String> = workspaces.iter().map(|w| w.id.clone()).collect();
+
+    // Get whiteboards for these workspaces
+    let whiteboards: Vec<WhiteboardDTO> = if !workspace_ids.is_empty() {
+        let placeholders = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT id, workspace_id, name, created_at FROM objects WHERE type='whiteboard' AND workspace_id IN ({}) ORDER BY name",
+            placeholders
+        );
+        let mut stmt = db.prepare(&query)?;
+        let params: Vec<&dyn rusqlite::ToSql> = workspace_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok(WhiteboardDTO {
+                id: r.get(0)?,
+                workspace_id: r.get(1)?,
+                name: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        })?;
+        rows.filter_map(Result::ok).collect()
+    } else {
+        vec![]
+    };
+
+    // Get files for this group and its workspaces
+    let files: Vec<FileDTO> = {
+        let mut all_files = vec![];
+
+        // Group-level files
+        let mut stmt = db.prepare("SELECT id, group_id, workspace_id, name, hash, size, created_at FROM objects WHERE type='file' AND group_id=?1")?;
+        let group_files = stmt.query_map(params![group_id], |r| {
+            Ok(FileDTO {
+                id: r.get(0)?,
+                group_id: r.get(1)?,
+                workspace_id: r.get(2)?,
+                name: r.get(3)?,
+                hash: r.get(4)?,
+                size: r.get::<_, i64>(5)? as u64,
+                created_at: r.get(6)?,
+            })
+        })?;
+        all_files.extend(group_files.filter_map(Result::ok));
+
+        // Workspace-level files
+        if !workspace_ids.is_empty() {
+            let placeholders = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let query = format!(
+                "SELECT id, group_id, workspace_id, name, hash, size, created_at FROM objects WHERE type='file' AND workspace_id IN ({})",
+                placeholders
+            );
+            let mut stmt = db.prepare(&query)?;
+            let params: Vec<&dyn rusqlite::ToSql> = workspace_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let ws_files = stmt.query_map(params.as_slice(), |r| {
+                Ok(FileDTO {
+                    id: r.get(0)?,
+                    group_id: r.get(1)?,
+                    workspace_id: r.get(2)?,
+                    name: r.get(3)?,
+                    hash: r.get(4)?,
+                    size: r.get::<_, i64>(5)? as u64,
+                    created_at: r.get(6)?,
+                })
+            })?;
+            all_files.extend(ws_files.filter_map(Result::ok));
         }
-    }
 
-    let mut workspaces = vec![];
-    {
-        let mut s = db
-            .prepare(
-                "SELECT id, group_id, name, created_at FROM workspaces ORDER BY created_at ASC",
-            )
-            .unwrap();
-        let mut rows = s.query([]).unwrap();
-        while let Some(r) = rows.next().unwrap() {
-            workspaces.push(WorkspaceRowDTO {
-                id: r.get(0).unwrap(),
-                group_id: r.get(1).unwrap(),
-                name: r.get(2).unwrap(),
-                created_at: r.get::<_, i64>(3).unwrap(),
-            });
-        }
-    }
+        all_files
+    };
 
-    let mut whiteboards = vec![];
-    {
-        let mut s = db
-            .prepare(
-                "SELECT id, workspace_id, name, created_at FROM objects WHERE type='whiteboard' \
-                 ORDER BY created_at ASC",
-            )
-            .unwrap();
-        let mut rows = s.query([]).unwrap();
-        while let Some(r) = rows.next().unwrap() {
-            whiteboards.push(WhiteboardRowDTO {
-                id: r.get(0).unwrap(),
-                workspace_id: r.get(1).unwrap(),
-                name: r.get(2).unwrap(),
-                created_at: r.get::<_, i64>(3).unwrap(),
-            });
-        }
-    }
-
-    let mut files = vec![];
-    {
-        let mut s = db
-            .prepare(
-                "SELECT id, group_id, workspace_id, name, hash, size, created_at
-                 FROM objects WHERE type='file' ORDER BY created_at ASC",
-            )
-            .unwrap();
-        let mut rows = s.query([]).unwrap();
-        while let Some(r) = rows.next().unwrap() {
-            files.push(FileRowDTO {
-                id: r.get(0).unwrap(),
-                group_id: r.get(1).unwrap(),
-                workspace_id: r.get(2).unwrap(),
-                name: r.get(3).unwrap(),
-                hash: r.get(4).unwrap(),
-                size: r.get::<_, i64>(5).unwrap() as u64,
-                created_at: r.get::<_, i64>(6).unwrap(),
-            });
-        }
-    }
-
-    serde_json::to_string(&TreeSnapshotDTO {
-        groups,
+    Ok(TreeSnapshotDTO {
+        groups: vec![group],
         workspaces,
         whiteboards,
         files,
     })
-        .unwrap()
 }
 
-fn seed_demo_if_empty(db_arc: &Arc<Mutex<Connection>>) {
-    let db = db_arc.lock().unwrap();
-    let count: i64 = db
-        .query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0))
-        .unwrap_or(0);
+fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
+    let db = db.lock().unwrap();
+
+    let groups: Vec<Group> = {
+        let mut stmt = db.prepare("SELECT id, name, icon, color, created_at FROM groups ORDER BY name").unwrap();
+        let rows = stmt.query_map([], |r| {
+            Ok(Group {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                icon: r.get(2)?,
+                color: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        }).unwrap();
+        rows.filter_map(Result::ok).collect()
+    };
+
+    let workspaces: Vec<Workspace> = {
+        let mut stmt = db.prepare("SELECT id, group_id, name, created_at FROM workspaces ORDER BY name").unwrap();
+        let rows = stmt.query_map([], |r| {
+            Ok(Workspace {
+                id: r.get(0)?,
+                group_id: r.get(1)?,
+                name: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        }).unwrap();
+        rows.filter_map(Result::ok).collect()
+    };
+
+    let whiteboards: Vec<WhiteboardDTO> = {
+        let mut stmt = db.prepare(
+            "SELECT id, workspace_id, name, created_at FROM objects WHERE type='whiteboard' \
+                 ORDER BY name",
+        ).unwrap();
+        let rows = stmt.query_map([], |r| {
+            Ok(WhiteboardDTO {
+                id: r.get(0)?,
+                workspace_id: r.get(1)?,
+                name: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        }).unwrap();
+        rows.filter_map(Result::ok).collect()
+    };
+
+    let files: Vec<FileDTO> = {
+        let mut stmt = db.prepare(
+            "SELECT id, group_id, workspace_id, name, hash, size, created_at FROM objects \
+                 WHERE type='file' ORDER BY name",
+        ).unwrap();
+        let rows = stmt.query_map([], |r| {
+            Ok(FileDTO {
+                id: r.get(0)?,
+                group_id: r.get(1)?,
+                workspace_id: r.get(2)?,
+                name: r.get(3)?,
+                hash: r.get(4)?,
+                size: r.get::<_, i64>(5)? as u64,
+                created_at: r.get(6)?,
+            })
+        }).unwrap();
+        rows.filter_map(Result::ok).collect()
+    };
+
+    let snapshot = TreeSnapshotDTO {
+        groups,
+        workspaces,
+        whiteboards,
+        files,
+    };
+    serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn seed_demo_if_empty(db: &Arc<Mutex<Connection>>) {
+    let db_clone = db.clone();
+    let count: i64 = db_clone.lock().unwrap().query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0)).unwrap_or(1);
     if count > 0 {
         return;
     }
+
+    // Create demo group
+    let group_id = blake3::hash(b"demo-group").to_hex().to_string();
     let now = chrono::Utc::now().timestamp();
+    {
+        let _ = db_clone.lock().unwrap().execute(
+            "INSERT INTO groups (id, name, icon, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![group_id, "Demo Group", "folder.fill", "#00AEEF", now],
+        );
+    }
 
-    let g1 = blake3::hash(b"DemoGroup").to_hex().to_string();
-    let _ = db.execute(
-        "INSERT OR IGNORE INTO groups (id, name, icon, color, created_at) VALUES (?1, ?2, ?3, ?4, \
-         ?5)",
-        params![g1, "Design", "folder.fill", "#00AEEF", now],
-    );
+    // Create demo workspace
+    let workspace_id = blake3::hash(b"demo-workspace").to_hex().to_string();
+    {
+        let _ = db_clone.lock().unwrap().execute(
+            "INSERT INTO workspaces (id, group_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![workspace_id, group_id, "Demo Workspace", now],
+        );
+    }
 
-    let ws1 = blake3::hash(b"WS:BrandKit").to_hex().to_string();
-    let ws2 = blake3::hash(b"WS:MarketingSite").to_hex().to_string();
-    let _ = db.execute(
-        "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![ws1, g1, "Brand Kit", now],
-    );
-    let _ = db.execute(
-        "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![ws2, g1, "Marketing Site", now + 1],
-    );
-
-    let wb1 = blake3::hash(b"WB:LogoExplorations").to_hex().to_string();
-    let wb2 = blake3::hash(b"WB:HomepageWireframe").to_hex().to_string();
-    let _ = db.execute(
-        "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at) VALUES (?1, ?2, \
-         'whiteboard', ?3, ?4)",
-        params![wb1, ws1, "Logo Explorations", now],
-    );
-    let _ = db.execute(
-        "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at) VALUES (?1, ?2, \
-         'whiteboard', ?3, ?4)",
-        params![wb2, ws2, "Homepage Wireframe", now + 1],
-    );
+    // Create demo board
+    let board_id = blake3::hash(b"demo-board").to_hex().to_string();
+    {
+        let _ = db_clone.lock().unwrap().execute(
+            "INSERT INTO objects (id, workspace_id, type, name, created_at) VALUES (?1, ?2, \
+             'whiteboard', ?3, ?4)",
+            params![board_id, workspace_id, "Demo Board", now],
+        );
+    }
 }
 
 // ---------- FFI helpers ----------
-fn cstr(s: String) -> *const c_char {
-    CString::new(s).unwrap().into_raw()
+fn compute_or_load_node_id() -> String {
+    if let Some(dir) = DATA_DIR.get() {
+        let node_id_file = dir.join("node_id.txt");
+        if let Ok(id) = std::fs::read_to_string(&node_id_file) {
+            return id.trim().to_string();
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    save_node_id_to_disk(&id);
+    id
+}
+
+fn save_node_id_to_disk(id: &str) {
+    if let Some(dir) = DATA_DIR.get() {
+        let node_id_file = dir.join("node_id.txt");
+        let _ = std::fs::write(node_id_file, id);
+    }
 }
 
 unsafe fn cstr_arg(ptr: *const c_char) -> Option<String> {
@@ -1337,68 +1622,16 @@ fn to_c_string(s: String) -> *const c_char {
     CString::new(s).unwrap().into_raw()
 }
 
-fn data_dir() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-fn node_id_file() -> PathBuf {
-    data_dir().join("cyan.node_id")
-}
-
-fn load_node_id_from_disk() -> Option<String> {
-    let path = node_id_file();
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    None
-}
-
-fn save_node_id_to_disk(id: &str) {
-    let path = node_id_file();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(&path, id.as_bytes());
-}
-
-fn generate_node_id() -> String {
-    blake3::hash(uuid::Uuid::new_v4().as_bytes())
-        .to_hex()
-        .to_string()
-}
-
-fn compute_or_load_node_id() -> String {
-    if let Ok(v) = std::env::var("CYAN_NODE_ID") {
-        if !v.trim().is_empty() {
-            return v.trim().to_string();
-        }
-    }
-    if let Some(s) = load_node_id_from_disk() {
-        return s;
-    }
-    let s = generate_node_id();
-    save_node_id_to_disk(&s);
-    s
-}
-
 // ---------- FFI: lifecycle ----------
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_set_data_dir(path: *const c_char) -> bool {
-    let Some(p) = (unsafe { cstr_arg(path) }) else {
+    let Some(s) = (unsafe { cstr_arg(path) }) else {
         return false;
     };
-    let pb = PathBuf::from(p);
-    if std::fs::create_dir_all(&pb).is_err() {
-        return false;
-    }
-    DATA_DIR.set(pb.clone()).ok();
-    std::env::set_current_dir(&pb).is_ok()
+    DATA_DIR.set(PathBuf::from(s)).is_ok()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_set_discovery_key(key: *const c_char) -> bool {
     let Some(s) = (unsafe { cstr_arg(key) }) else {
         return false;
@@ -1406,7 +1639,7 @@ pub extern "C" fn cyan_set_discovery_key(key: *const c_char) -> bool {
     DISCOVERY_KEY.set(s).is_ok()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
     if SYSTEM.get().is_some() {
         return true;
@@ -1419,11 +1652,7 @@ pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
         CStr::from_ptr(db_path).to_string_lossy().to_string()
     };
     let res = std::thread::spawn(|| {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().expect("runtime");
         RUNTIME.set(runtime).ok();
 
         let rt = RUNTIME.get().unwrap();
@@ -1439,35 +1668,30 @@ pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
                 false
             }
         }
-    })
-        .join();
+    }).join();
 
     res.unwrap_or(false)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_xaero_id() -> *const c_char {
     let id = NODE_ID.get_or_init(|| compute_or_load_node_id());
     to_c_string(id.clone())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_set_xaero_id(id: *const c_char) -> bool {
     if id.is_null() {
         return false;
     }
-    let s = unsafe { CStr::from_ptr(id) }
-        .to_str()
-        .ok()
-        .unwrap()
-        .to_string();
+    let s = unsafe { CStr::from_ptr(id) }.to_str().ok().unwrap().to_string();
 
     let _ = NODE_ID.set(s.clone());
     save_node_id_to_disk(&s);
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe {
@@ -1476,9 +1700,8 @@ pub extern "C" fn cyan_free_string(ptr: *mut c_char) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_poll_events(_component: *const c_char) -> *mut c_char {
-    // Fix: Return null pointer instead of using ? operator
     let Some(cyan) = SYSTEM.get() else {
         return std::ptr::null_mut();
     };
@@ -1497,7 +1720,7 @@ pub extern "C" fn cyan_poll_events(_component: *const c_char) -> *mut c_char {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_send_command(_component: *const c_char, json: *const c_char) -> bool {
     let json_str = unsafe { CStr::from_ptr(json).to_string_lossy().to_string() };
 
@@ -1521,7 +1744,7 @@ pub extern "C" fn cyan_send_command(_component: *const c_char, json: *const c_ch
 }
 
 // ---------- FFI: groups ----------
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_create_group(
     name: *const c_char,
     icon: *const c_char,
@@ -1537,12 +1760,10 @@ pub extern "C" fn cyan_create_group(
         Some(s) => s.clone(),
         None => return,
     };
-    let _ = sys
-        .command_tx
-        .send(CommandMsg::CreateGroup { name, icon, color });
+    let _ = sys.command_tx.send(CommandMsg::CreateGroup { name, icon, color });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_rename_group(id: *const c_char, new_name: *const c_char) {
     let Some(id) = (unsafe { cstr_arg(id) }) else {
         return;
@@ -1557,7 +1778,7 @@ pub extern "C" fn cyan_rename_group(id: *const c_char, new_name: *const c_char) 
     let _ = sys.command_tx.send(CommandMsg::RenameGroup { id, name });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_delete_group(id: *const c_char) {
     let Some(id) = (unsafe { cstr_arg(id) }) else {
         return;
@@ -1570,7 +1791,7 @@ pub extern "C" fn cyan_delete_group(id: *const c_char) {
 }
 
 // ---------- FFI: workspaces ----------
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_create_workspace(group_id: *const c_char, name: *const c_char) {
     let Some(gid) = (unsafe { cstr_arg(group_id) }) else {
         return;
@@ -1588,7 +1809,7 @@ pub extern "C" fn cyan_create_workspace(group_id: *const c_char, name: *const c_
     });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_rename_workspace(id: *const c_char, new_name: *const c_char) {
     let Some(id) = (unsafe { cstr_arg(id) }) else {
         return;
@@ -1600,12 +1821,10 @@ pub extern "C" fn cyan_rename_workspace(id: *const c_char, new_name: *const c_ch
         Some(s) => s.clone(),
         None => return,
     };
-    let _ = sys
-        .command_tx
-        .send(CommandMsg::RenameWorkspace { id, name });
+    let _ = sys.command_tx.send(CommandMsg::RenameWorkspace { id, name });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_delete_workspace(id: *const c_char) {
     let Some(id) = (unsafe { cstr_arg(id) }) else {
         return;
@@ -1618,7 +1837,7 @@ pub extern "C" fn cyan_delete_workspace(id: *const c_char) {
 }
 
 // ---------- FFI: boards ----------
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_create_board(workspace_id: *const c_char, name: *const c_char) {
     let Some(wid) = (unsafe { cstr_arg(workspace_id) }) else {
         return;
@@ -1636,7 +1855,7 @@ pub extern "C" fn cyan_create_board(workspace_id: *const c_char, name: *const c_
     });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_rename_board(id: *const c_char, new_name: *const c_char) {
     let Some(id) = (unsafe { cstr_arg(id) }) else {
         return;
@@ -1651,7 +1870,7 @@ pub extern "C" fn cyan_rename_board(id: *const c_char, new_name: *const c_char) 
     let _ = sys.command_tx.send(CommandMsg::RenameBoard { id, name });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_delete_board(id: *const c_char) {
     let Some(id) = (unsafe { cstr_arg(id) }) else {
         return;
@@ -1664,7 +1883,7 @@ pub extern "C" fn cyan_delete_board(id: *const c_char) {
 }
 
 // ---------- FFI: uploads ----------
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_upload_file_to_group(group_id: *const c_char, path: *const c_char) {
     let Some(gid) = (unsafe { cstr_arg(group_id) }) else {
         return;
@@ -1682,7 +1901,7 @@ pub extern "C" fn cyan_upload_file_to_group(group_id: *const c_char, path: *cons
     });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_upload_file_to_workspace(workspace_id: *const c_char, path: *const c_char) {
     let Some(wid) = (unsafe { cstr_arg(workspace_id) }) else {
         return;
@@ -1700,7 +1919,7 @@ pub extern "C" fn cyan_upload_file_to_workspace(workspace_id: *const c_char, pat
     });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn cyan_seed_demo_if_empty() {
     if let Some(sys) = SYSTEM.get() {
         let _ = sys.command_tx.send(CommandMsg::SeedDemoIfEmpty);
