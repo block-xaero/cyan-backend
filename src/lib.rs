@@ -82,6 +82,7 @@ pub enum Object {
         workspace_id: String,
         message: String,
         author: String,
+        parent_id: Option<String>,
         timestamp: i64,
     },
 }
@@ -136,6 +137,18 @@ pub enum NetworkEvent {
         size: u64,
         created_at: i64,
     },
+    // ---- Chat events ----
+    ChatSent {
+        id: String,
+        workspace_id: String,
+        message: String,
+        author: String,
+        parent_id: Option<String>,
+        timestamp: i64,
+    },
+    ChatDeleted {
+        id: String,
+    },
 }
 
 // ---------- Internal commands ----------
@@ -163,6 +176,27 @@ enum NetworkCommand {
     DeleteGroup { id: String },
     DeleteWorkspace { id: String },
     DeleteBoard { id: String },
+    DeleteChat { id: String },
+    /// Start a direct QUIC chat stream with a peer
+    StartChatStream {
+        peer_id: String,
+        workspace_id: String,
+    },
+    /// Send a message on an existing direct chat stream
+    SendDirectChat {
+        peer_id: String,
+        workspace_id: String,
+        message: String,
+        parent_id: Option<String>,
+    },
+}
+
+/// Message sent through channel to chat stream writer task
+#[derive(Debug, Clone)]
+struct DirectChatOutbound {
+    workspace_id: String,
+    message: String,
+    parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +239,16 @@ enum CommandMsg {
         id: String,
     },
 
+    // ---- Chat commands ----
+    SendChat {
+        workspace_id: String,
+        message: String,
+        parent_id: Option<String>,
+    },
+    DeleteChat {
+        id: String,
+    },
+
     Snapshot {},
     SeedDemoIfEmpty,
 }
@@ -217,6 +261,11 @@ pub enum SwiftEvent {
     GroupDeleted { id: String },
     WorkspaceDeleted { id: String },
     BoardDeleted { id: String },
+    ChatDeleted { id: String },
+    /// Direct chat stream established with peer
+    ChatStreamReady { peer_id: String, workspace_id: String },
+    /// Direct chat stream closed
+    ChatStreamClosed { peer_id: String },
 }
 
 // ---------- System ----------
@@ -298,18 +347,21 @@ impl CyanSystem {
 
         let db_clone = system.db.clone();
         let event_tx_clone = event_tx.clone();
+        let n_command_actor_clone = node_id_clone.clone();
         RUNTIME.get().unwrap().spawn(async move {
             CommandActor {
                 db: db_clone,
                 rx: cmd_rx,
                 network_tx: net_tx,
                 event_tx: event_tx_clone,
+                node_id: n_command_actor_clone.clone(),
             }.run().await;
         });
 
         let db_clone = system.db.clone();
+        let node_id_clone_for_n_actor = node_id_clone.clone();
         RUNTIME.get().unwrap().spawn(async move {
-            match NetworkActor::new(node_id_clone, secret_key_clone, db_clone, net_rx, event_tx).await {
+            match NetworkActor::new(node_id_clone_for_n_actor, secret_key_clone, db_clone, net_rx, event_tx).await {
                 Ok(n) => n.start().await,
                 Err(e) => eprintln!("Network actor failed: {e}"),
             }
@@ -337,6 +389,7 @@ struct CommandActor {
     rx: mpsc::UnboundedReceiver<CommandMsg>,
     network_tx: mpsc::UnboundedSender<NetworkCommand>,
     event_tx: mpsc::UnboundedSender<SwiftEvent>,
+    node_id: String,
 }
 
 impl CommandActor {
@@ -598,6 +651,86 @@ impl CommandActor {
                     }
                 }
 
+                // ---- Chat commands ----
+                CommandMsg::SendChat { workspace_id, message, parent_id } => {
+                    let id = blake3::hash(
+                        format!("chat:{}-{}-{}", &workspace_id, &message, chrono::Utc::now()).as_bytes()
+                    ).to_hex().to_string();
+                    let now = chrono::Utc::now().timestamp();
+                    let author = self.node_id.clone();
+
+                    {
+                        let db = self.db.lock().unwrap();
+                        // Store: type='chat', name=message, hash=author, data=parent_id
+                        let _ = db.execute(
+                            "INSERT INTO objects (id, workspace_id, type, name, hash, data, created_at) \
+                             VALUES (?1, ?2, 'chat', ?3, ?4, ?5, ?6)",
+                            params![
+                                id.clone(),
+                                workspace_id.clone(),
+                                message.clone(),
+                                author.clone(),
+                                parent_id.as_ref().map(|s| s.as_bytes()),
+                                now
+                            ],
+                        );
+                    }
+
+                    // Get group_id for broadcast
+                    let group_id: Option<String> = {
+                        let db = self.db.lock().unwrap();
+                        let mut stmt = db.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").unwrap();
+                        stmt.query_row(params![workspace_id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                    };
+
+                    let evt = NetworkEvent::ChatSent {
+                        id: id.clone(),
+                        workspace_id: workspace_id.clone(),
+                        message: message.clone(),
+                        author: author.clone(),
+                        parent_id: parent_id.clone(),
+                        timestamp: now,
+                    };
+
+                    let _ = self.event_tx.send(SwiftEvent::Network(evt.clone()));
+
+                    if let Some(gid) = group_id {
+                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                            group_id: gid,
+                            event: evt,
+                        });
+                    }
+                }
+
+                CommandMsg::DeleteChat { id } => {
+                    // Get group_id for broadcast
+                    let group_id: Option<String> = {
+                        let db = self.db.lock().unwrap();
+                        let mut stmt = db.prepare(
+                            "SELECT w.group_id FROM objects o
+                                 JOIN workspaces w ON o.workspace_id = w.id
+                                 WHERE o.id=?1 AND o.type='chat' LIMIT 1"
+                        ).unwrap();
+                        stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                    };
+
+                    let ok = {
+                        let db = self.db.lock().unwrap();
+                        db.execute(
+                            "DELETE FROM objects WHERE id=?1 AND type='chat'",
+                            params![id],
+                        ).unwrap_or(0) > 0
+                    };
+
+                    if ok {
+                        let _ = self.event_tx.send(SwiftEvent::ChatDeleted { id: id.clone() });
+
+                        if let Some(gid) = group_id {
+                            let _ = self.network_tx.send(NetworkCommand::DeleteChat { id });
+                        }
+                    }
+                }
+
                 CommandMsg::Snapshot {} => {
                     let json = dump_tree_json(&self.db);
                     let _ = self.event_tx.send(SwiftEvent::TreeLoaded(json.clone()));
@@ -613,6 +746,173 @@ impl CommandActor {
     }
 }
 
+// ---------- Direct QUIC Chat Helpers ----------
+
+/// Write a length-prefixed message to a QUIC send stream
+async fn write_chat_frame(tx: &mut iroh::endpoint::SendStream, msg: &[u8]) -> Result<()> {
+    let len = (msg.len() as u32).to_be_bytes();
+    tx.write_all(&len).await?;
+    tx.write_all(msg).await?;
+    Ok(())
+}
+
+/// Read a length-prefixed message from a QUIC receive stream
+async fn read_chat_frame(rx: &mut iroh::endpoint::RecvStream) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    rx.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    // Sanity check - don't allocate huge buffers
+    if len > 1024 * 1024 {
+        return Err(anyhow!("Chat message too large: {} bytes", len));
+    }
+
+    let mut buf = vec![0u8; len];
+    rx.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// First frame sent on chat stream to establish context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatStreamInit {
+    workspace_id: String,
+}
+
+/// Message format for direct chat
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DirectChatMessage {
+    message: String,
+    parent_id: Option<String>,
+}
+
+/// Handle a direct chat stream - runs as spawned task
+/// Reads from QUIC stream and writes to DB, reads from channel and writes to QUIC stream
+async fn handle_chat_stream(
+    db: Arc<Mutex<Connection>>,
+    event_tx: mpsc::UnboundedSender<SwiftEvent>,
+    node_id: String,
+    peer_id: String,
+    workspace_id: String,
+    mut tx: iroh::endpoint::SendStream,
+    mut rx: iroh::endpoint::RecvStream,
+    mut outbound_rx: mpsc::UnboundedReceiver<DirectChatOutbound>,
+) {
+    loop {
+        tokio::select! {
+            // Incoming message from peer
+            read_result = read_chat_frame(&mut rx) => {
+                match read_result {
+                    Ok(buf) => {
+                        match serde_json::from_slice::<DirectChatMessage>(&buf) {
+                            Ok(chat_msg) => {
+                                let id = blake3::hash(
+                                    format!("chat:{}-{}-{}", &peer_id, &chat_msg.message, chrono::Utc::now()).as_bytes()
+                                ).to_hex().to_string();
+                                let now = chrono::Utc::now().timestamp();
+
+                                // Write to DB
+                                {
+                                    let db = db.lock().unwrap();
+                                    let _ = db.execute(
+                                        "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, hash, data, created_at) \
+                                         VALUES (?1, ?2, 'chat', ?3, ?4, ?5, ?6)",
+                                        params![
+                                            id.clone(),
+                                            workspace_id.clone(),
+                                            chat_msg.message.clone(),
+                                            peer_id.clone(),
+                                            chat_msg.parent_id.as_ref().map(|s| s.as_bytes()),
+                                            now
+                                        ],
+                                    );
+                                }
+
+                                // Notify Swift
+                                let _ = event_tx.send(SwiftEvent::Network(NetworkEvent::ChatSent {
+                                    id,
+                                    workspace_id: workspace_id.clone(),
+                                    message: chat_msg.message,
+                                    author: peer_id.clone(),
+                                    parent_id: chat_msg.parent_id,
+                                    timestamp: now,
+                                }));
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse chat message: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::info!("Chat stream closed with peer {peer_id}: {e}");
+                        break;
+                    }
+                }
+            }
+
+            // Outgoing message to peer
+            outbound = outbound_rx.recv() => {
+                match outbound {
+                    Some(msg) => {
+                        let chat_msg = DirectChatMessage {
+                            message: msg.message.clone(),
+                            parent_id: msg.parent_id.clone(),
+                        };
+
+                        match serde_json::to_vec(&chat_msg) {
+                            Ok(bytes) => {
+                                if let Err(e) = write_chat_frame(&mut tx, &bytes).await {
+                                    tracing::error!("Failed to send chat to {peer_id}: {e}");
+                                    break;
+                                }
+
+                                // Also store locally and notify Swift
+                                let id = blake3::hash(
+                                    format!("chat:{}-{}-{}", &node_id, &msg.message, chrono::Utc::now()).as_bytes()
+                                ).to_hex().to_string();
+                                let now = chrono::Utc::now().timestamp();
+
+                                {
+                                    let db = db.lock().unwrap();
+                                    let _ = db.execute(
+                                        "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, hash, data, created_at) \
+                                         VALUES (?1, ?2, 'chat', ?3, ?4, ?5, ?6)",
+                                        params![
+                                            id.clone(),
+                                            msg.workspace_id.clone(),
+                                            msg.message.clone(),
+                                            node_id.clone(),
+                                            msg.parent_id.as_ref().map(|s| s.as_bytes()),
+                                            now
+                                        ],
+                                    );
+                                }
+
+                                let _ = event_tx.send(SwiftEvent::Network(NetworkEvent::ChatSent {
+                                    id,
+                                    workspace_id: msg.workspace_id,
+                                    message: msg.message,
+                                    author: node_id.clone(),
+                                    parent_id: msg.parent_id,
+                                    timestamp: now,
+                                }));
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to serialize chat message: {e}");
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::info!("Outbound channel closed for peer {peer_id}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!("Chat stream handler exiting for peer {peer_id}");
+}
+
 struct NetworkActor {
     node_id: String,
     db: Arc<Mutex<Connection>>,
@@ -626,6 +926,8 @@ struct NetworkActor {
     event_tx: mpsc::UnboundedSender<SwiftEvent>,
     discovery_topic: Arc<tokio::sync::Mutex<GossipTopic>>,
     need_snapshot: Arc<Mutex<HashMap<String, AtomicBool>>>,
+    /// Channel senders for each active direct chat stream, keyed by peer_id
+    chat_senders: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<DirectChatOutbound>>>>,
 }
 
 impl NetworkActor {
@@ -667,6 +969,7 @@ impl NetworkActor {
             event_tx,
             discovery_topic: Arc::new(tokio::sync::Mutex::new(discovery_topic)),
             need_snapshot: Arc::new(Mutex::new(HashMap::new())),
+            chat_senders: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -746,9 +1049,7 @@ impl NetworkActor {
                         if let Some(Ok(ev)) = topic_guard.next().await {
                             if let GossipEvent::Received(msg) = ev {
                                 // Try parsing as NetworkEvent first
-                                if let Ok(evt) = serde_json::from_slice::<NetworkEvent>(&msg.content)
-                                {
-                                    // Store in DB
+                                if let Ok(evt) = serde_json::from_slice::<NetworkEvent>(&msg.content) {
                                     match &evt {
                                         NetworkEvent::GroupCreated(g) => {
                                             let db = db.lock().unwrap();
@@ -902,6 +1203,37 @@ impl NetworkActor {
                                                 }
                                             }
                                         }
+                                        // ---- Chat events ----
+                                        NetworkEvent::ChatSent {
+                                            id,
+                                            workspace_id,
+                                            message,
+                                            author,
+                                            parent_id,
+                                            timestamp,
+                                        } => {
+                                            let db = db.lock().unwrap();
+                                            let _ = db.execute(
+                                                "INSERT OR IGNORE INTO objects (id, workspace_id, \
+                                                 type, name, hash, data, created_at) \
+                                                 VALUES (?1, ?2, 'chat', ?3, ?4, ?5, ?6)",
+                                                params![
+                                                    id,
+                                                    workspace_id,
+                                                    message,
+                                                    author,
+                                                    parent_id.as_ref().map(|s| s.as_bytes()),
+                                                    timestamp
+                                                ],
+                                            );
+                                        }
+                                        NetworkEvent::ChatDeleted { id } => {
+                                            let db = db.lock().unwrap();
+                                            let _ = db.execute(
+                                                "DELETE FROM objects WHERE id=?1 AND type='chat'",
+                                                params![id],
+                                            );
+                                        }
                                     }
 
                                     // Send to Swift
@@ -986,6 +1318,23 @@ impl NetworkActor {
                     tracing::debug!("Whiteboard {whiteboard:?} successfully inserted");
                 }
 
+                // Restore chats from snapshot
+                for chat in tree_dto.chats {
+                    let _ = db.execute(
+                        "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, hash, data, created_at) \
+                         VALUES (?1, ?2, 'chat', ?3, ?4, ?5, ?6)",
+                        params![
+                            chat.id,
+                            chat.workspace_id,
+                            chat.message,
+                            chat.author,
+                            chat.parent_id.as_ref().map(|s| s.as_bytes()),
+                            chat.timestamp
+                        ],
+                    );
+                    tracing::debug!("Chat {chat:?} successfully inserted");
+                }
+
                 // Mark snapshot as received
                 if let Some(flag) = self.need_snapshot.lock().unwrap().get(&group_id) {
                     flag.store(false, Ordering::Relaxed);
@@ -1046,201 +1395,430 @@ impl NetworkActor {
 
     async fn poll_network_commands(self: Arc<Self>) {
         loop {
-            let cmd = {
-                let mut rx_guard = self.rx.lock().await;
-                rx_guard.recv().await
-            };
+            let mut rx_guard = self.rx.lock().await;
 
-            if let Some(cmd) = cmd {
-                match cmd {
-                    NetworkCommand::JoinGroup { group_id } => {
-                        let should_subscribe = {
-                            let topics = self.topics.lock().unwrap();
-                            !topics.contains_key(&group_id)
-                        };
+            tokio::select! {
+                // Accept incoming QUIC connections for direct chat
+                incoming = self.endpoint.accept() => {
+                    if let Some(incoming) = incoming {
+                        match incoming.await {
+                            Ok(connection) => {
+                                let peer_id = connection.remote_id().to_string();
+                                tracing::info!("Accepted direct connection from peer: {peer_id}");
 
-                        if should_subscribe {
-                            let topic_id = TopicId::from_bytes(
-                                blake3::hash(format!("cyan/group/{}", group_id).as_bytes()).as_bytes()[..32].try_into().unwrap(),
-                            );
+                                let db = self.db.clone();
+                                let event_tx = self.event_tx.clone();
+                                let node_id = self.node_id.clone();
+                                let chat_senders = self.chat_senders.clone();
+                                let peer_id_clone = peer_id.clone();
 
-                            if let Ok(topic) = self.gossip.subscribe_and_join(topic_id, vec![]).await
-                            {
-                                self.topics.lock().unwrap().insert(
-                                    group_id.clone(),
-                                    Arc::new(tokio::sync::Mutex::new(topic)),
-                                );
-
-                                self.groups.lock().unwrap().insert(group_id);
-                            }
-                        }
-                    }
-
-                    NetworkCommand::Broadcast { group_id, event } => {
-                        let topic = self.topics.lock().unwrap().get(&group_id).cloned();
-                        if let Some(topic) = topic {
-                            let data = serde_json::to_vec(&event).unwrap();
-                            tokio::spawn(async move {
-                                let mut guard = topic.lock().await;
-                                let _ = guard.broadcast(Bytes::from(data)).await;
-                            });
-                        }
-                    }
-
-                    NetworkCommand::UploadToGroup { group_id, path } => {
-                        if let Ok(bytes) = tokio::fs::read(&path).await {
-                            let _ = self.blob_store.add_bytes(bytes.clone()).await;
-                            let id = blake3::hash(format!("file:{}:{}", &group_id, &path).as_bytes()).to_hex().to_string();
-                            let hash = blake3::hash(&bytes).to_hex().to_string();
-                            let size = bytes.len() as u64;
-                            let created_at = chrono::Utc::now().timestamp();
-
-                            {
-                                let db = self.db.lock().unwrap();
-                                let name = Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file");
-                                let _ = db.execute(
-                                    "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, \
-                                     type, name, hash, size, created_at)
-                                     VALUES (?1, ?2, NULL, 'file', ?3, ?4, ?5, ?6)",
-                                    params![id, group_id, name, hash, size as i64, created_at],
-                                );
-                            }
-
-                            let topic = self.topics.lock().unwrap().get(&group_id).cloned();
-                            if let Some(topic) = topic {
-                                let evt = NetworkEvent::FileAvailable {
-                                    id: id.clone(),
-                                    group_id: Some(group_id.clone()),
-                                    workspace_id: None,
-                                    name: Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string(),
-                                    hash,
-                                    size,
-                                    created_at,
-                                };
+                                // Spawn task to accept streams on this connection
                                 tokio::spawn(async move {
-                                    let mut guard = topic.lock().await;
-                                    let _ = guard.broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap())).await;
+                                    // Accept the bi-directional stream
+                                    match connection.accept_bi().await {
+                                        Ok((tx, mut rx)) => {
+                                            // Read workspace_id from first frame
+                                            match read_chat_frame(&mut rx).await {
+                                                Ok(init_bytes) => {
+                                                    match serde_json::from_slice::<ChatStreamInit>(&init_bytes) {
+                                                        Ok(init) => {
+                                                            tracing::info!("Chat stream initialized for workspace: {}", init.workspace_id);
+
+                                                            // Create channel for outbound messages
+                                                            let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+
+                                                            // Store sender for this peer
+                                                            {
+                                                                let mut senders = chat_senders.lock().unwrap();
+                                                                senders.insert(peer_id_clone.clone(), outbound_tx);
+                                                            }
+
+                                                            // Notify Swift that stream is ready
+                                                            let _ = event_tx.send(SwiftEvent::ChatStreamReady {
+                                                                peer_id: peer_id_clone.clone(),
+                                                                workspace_id: init.workspace_id.clone(),
+                                                            });
+
+                                                            // Run chat stream handler
+                                                            handle_chat_stream(
+                                                                db,
+                                                                event_tx.clone(),
+                                                                node_id,
+                                                                peer_id_clone.clone(),
+                                                                init.workspace_id,
+                                                                tx,
+                                                                rx,
+                                                                outbound_rx,
+                                                            ).await;
+
+                                                            // Clean up sender when done
+                                                            {
+                                                                let mut senders = chat_senders.lock().unwrap();
+                                                                senders.remove(&peer_id_clone);
+                                                            }
+
+                                                            // Notify Swift that stream is closed
+                                                            let _ = event_tx.send(SwiftEvent::ChatStreamClosed {
+                                                                peer_id: peer_id_clone,
+                                                            });
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!("Failed to parse chat init: {e}");
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!("Failed to read chat init frame: {e}");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to accept bi stream: {e}");
+                                        }
+                                    }
                                 });
                             }
+                            Err(e) => {
+                                tracing::error!("Failed to accept connection: {e}");
+                            }
                         }
                     }
+                }
 
-                    NetworkCommand::UploadToWorkspace { workspace_id, path } => {
-                        if let Ok(bytes) = tokio::fs::read(&path).await {
-                            let _ = self.blob_store.add_bytes(bytes.clone()).await;
+                // Handle network commands
+                cmd = rx_guard.recv() => {
+                    if let Some(cmd) = cmd {
+                        // Drop the guard before processing to avoid holding lock
+                        drop(rx_guard);
 
-                            let gid: Option<String> = {
-                                let db = self.db.lock().unwrap();
-                                let mut stmt = db.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").unwrap();
-                                stmt.query_row(params![workspace_id.clone()], |r| {
-                                    r.get::<_, String>(0)
-                                }).optional().unwrap()
-                            };
+                        match cmd {
+                            NetworkCommand::JoinGroup { group_id } => {
+                                let should_subscribe = {
+                                    let topics = self.topics.lock().unwrap();
+                                    !topics.contains_key(&group_id)
+                                };
 
-                            let id = blake3::hash(
-                                format!("file:{}:{}", &workspace_id, &path).as_bytes(),
-                            ).to_hex().to_string();
-                            let hash = blake3::hash(&bytes).to_hex().to_string();
-                            let size = bytes.len() as u64;
-                            let created_at = chrono::Utc::now().timestamp();
+                                if should_subscribe {
+                                    let topic_id = TopicId::from_bytes(
+                                        blake3::hash(format!("cyan/group/{}", group_id).as_bytes()).as_bytes()[..32].try_into().unwrap(),
+                                    );
 
-                            {
-                                let db = self.db.lock().unwrap();
-                                let name = Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file");
-                                let _ = db.execute(
-                                    "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, \
-                                     type, name, hash, size, created_at)
-                                     VALUES (?1, ?2, ?3, 'file', ?4, ?5, ?6, ?7)",
-                                    params![
-                                        id,
-                                        gid,
-                                        workspace_id,
-                                        name,
-                                        hash,
-                                        size as i64,
-                                        created_at
-                                    ],
-                                );
+                                    if let Ok(topic) = self.gossip.subscribe_and_join(topic_id, vec![]).await
+                                    {
+                                        self.topics.lock().unwrap().insert(
+                                            group_id.clone(),
+                                            Arc::new(tokio::sync::Mutex::new(topic)),
+                                        );
+
+                                        self.groups.lock().unwrap().insert(group_id);
+                                    }
+                                }
                             }
 
-                            if let Some(group_id) = gid {
+                            NetworkCommand::Broadcast { group_id, event } => {
                                 let topic = self.topics.lock().unwrap().get(&group_id).cloned();
                                 if let Some(topic) = topic {
-                                    let evt = NetworkEvent::FileAvailable {
-                                        id: id.clone(),
-                                        group_id: Some(group_id.clone()),
-                                        workspace_id: Some(workspace_id.clone()),
-                                        name: Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string(),
-                                        hash,
-                                        size,
-                                        created_at,
-                                    };
+                                    let data = serde_json::to_vec(&event).unwrap();
                                     tokio::spawn(async move {
                                         let mut guard = topic.lock().await;
-                                        let _ = guard.broadcast(Bytes::from(
-                                            serde_json::to_vec(&evt).unwrap(),
-                                        )).await;
+                                        let _ = guard.broadcast(Bytes::from(data)).await;
                                     });
                                 }
                             }
-                        }
-                    }
 
-                    NetworkCommand::DeleteGroup { id } => {
-                        let msg = serde_json::json!({
-                            "msg_type": "group_deleted",
-                            "event": NetworkEvent::GroupDeleted { id: id.clone() }
-                        });
+                            NetworkCommand::UploadToGroup { group_id, path } => {
+                                if let Ok(bytes) = tokio::fs::read(&path).await {
+                                    let _ = self.blob_store.add_bytes(bytes.clone()).await;
+                                    let id = blake3::hash(format!("file:{}:{}", &group_id, &path).as_bytes()).to_hex().to_string();
+                                    let hash = blake3::hash(&bytes).to_hex().to_string();
+                                    let size = bytes.len() as u64;
+                                    let created_at = chrono::Utc::now().timestamp();
 
-                        let mut discovery_topic = self.discovery_topic.lock().await;
-                        let _ = discovery_topic.broadcast(Bytes::from(serde_json::to_string(&msg).unwrap())).await;
-                    }
+                                    {
+                                        let db = self.db.lock().unwrap();
+                                        let name = Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file");
+                                        let _ = db.execute(
+                                            "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, \
+                                             type, name, hash, size, created_at)
+                                             VALUES (?1, ?2, NULL, 'file', ?3, ?4, ?5, ?6)",
+                                            params![id, group_id, name, hash, size as i64, created_at],
+                                        );
+                                    }
 
-                    NetworkCommand::DeleteWorkspace { id } => {
-                        // Get group_id to find the right topic
-                        let group_id: Option<String> = {
-                            let db = self.db.lock().unwrap();
-                            let mut stmt = db.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").unwrap();
-                            stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
-                        };
-
-                        if let Some(gid) = group_id {
-                            let topic = self.topics.lock().unwrap().get(&gid).cloned();
-                            if let Some(topic) = topic {
-                                let evt = NetworkEvent::WorkspaceDeleted { id: id.clone() };
-                                tokio::spawn(async move {
-                                    let mut guard = topic.lock().await;
-                                    let _ = guard.broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap())).await;
-                                });
+                                    let topic = self.topics.lock().unwrap().get(&group_id).cloned();
+                                    if let Some(topic) = topic {
+                                        let evt = NetworkEvent::FileAvailable {
+                                            id: id.clone(),
+                                            group_id: Some(group_id.clone()),
+                                            workspace_id: None,
+                                            name: Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string(),
+                                            hash,
+                                            size,
+                                            created_at,
+                                        };
+                                        tokio::spawn(async move {
+                                            let mut guard = topic.lock().await;
+                                            let _ = guard.broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap())).await;
+                                        });
+                                    }
+                                }
                             }
-                        }
-                    }
 
-                    NetworkCommand::DeleteBoard { id } => {
-                        // Get group_id through workspace join
-                        let group_id: Option<String> = {
-                            let db = self.db.lock().unwrap();
-                            let mut stmt = db.prepare(
-                                "SELECT w.group_id FROM objects o
-                                     JOIN workspaces w ON o.workspace_id = w.id
-                                     WHERE o.id=?1 AND o.type='whiteboard' LIMIT 1"
-                            ).unwrap();
-                            stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
-                        };
+                            NetworkCommand::UploadToWorkspace { workspace_id, path } => {
+                                if let Ok(bytes) = tokio::fs::read(&path).await {
+                                    let _ = self.blob_store.add_bytes(bytes.clone()).await;
 
-                        if let Some(gid) = group_id {
-                            let topic = self.topics.lock().unwrap().get(&gid).cloned();
-                            if let Some(topic) = topic {
-                                let evt = NetworkEvent::BoardDeleted { id: id.clone() };
-                                tokio::spawn(async move {
-                                    let mut guard = topic.lock().await;
-                                    let _ = guard.broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap())).await;
-                                });
+                                    let gid: Option<String> = {
+                                        let db = self.db.lock().unwrap();
+                                        let mut stmt = db.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").unwrap();
+                                        stmt.query_row(params![workspace_id.clone()], |r| {
+                                            r.get::<_, String>(0)
+                                        }).optional().unwrap()
+                                    };
+
+                                    let id = blake3::hash(
+                                        format!("file:{}:{}", &workspace_id, &path).as_bytes(),
+                                    ).to_hex().to_string();
+                                    let hash = blake3::hash(&bytes).to_hex().to_string();
+                                    let size = bytes.len() as u64;
+                                    let created_at = chrono::Utc::now().timestamp();
+
+                                    {
+                                        let db = self.db.lock().unwrap();
+                                        let name = Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file");
+                                        let _ = db.execute(
+                                            "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, \
+                                             type, name, hash, size, created_at)
+                                             VALUES (?1, ?2, ?3, 'file', ?4, ?5, ?6, ?7)",
+                                            params![
+                                                id,
+                                                gid,
+                                                workspace_id,
+                                                name,
+                                                hash,
+                                                size as i64,
+                                                created_at
+                                            ],
+                                        );
+                                    }
+
+                                    if let Some(group_id) = gid {
+                                        let topic = self.topics.lock().unwrap().get(&group_id).cloned();
+                                        if let Some(topic) = topic {
+                                            let evt = NetworkEvent::FileAvailable {
+                                                id: id.clone(),
+                                                group_id: Some(group_id.clone()),
+                                                workspace_id: Some(workspace_id.clone()),
+                                                name: Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string(),
+                                                hash,
+                                                size,
+                                                created_at,
+                                            };
+                                            tokio::spawn(async move {
+                                                let mut guard = topic.lock().await;
+                                                let _ = guard.broadcast(Bytes::from(
+                                                    serde_json::to_vec(&evt).unwrap(),
+                                                )).await;
+                                            });
+                                        }
+                                    }
+                                }
                             }
-                        }
-                    }
 
-                    _ => {}
+                            NetworkCommand::DeleteGroup { id } => {
+                                let msg = serde_json::json!({
+                                    "msg_type": "group_deleted",
+                                    "event": NetworkEvent::GroupDeleted { id: id.clone() }
+                                });
+
+                                let mut discovery_topic = self.discovery_topic.lock().await;
+                                let _ = discovery_topic.broadcast(Bytes::from(serde_json::to_string(&msg).unwrap())).await;
+                            }
+
+                            NetworkCommand::DeleteWorkspace { id } => {
+                                // Get group_id to find the right topic
+                                let group_id: Option<String> = {
+                                    let db = self.db.lock().unwrap();
+                                    let mut stmt = db.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").unwrap();
+                                    stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                                };
+
+                                if let Some(gid) = group_id {
+                                    let topic = self.topics.lock().unwrap().get(&gid).cloned();
+                                    if let Some(topic) = topic {
+                                        let evt = NetworkEvent::WorkspaceDeleted { id: id.clone() };
+                                        tokio::spawn(async move {
+                                            let mut guard = topic.lock().await;
+                                            let _ = guard.broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap())).await;
+                                        });
+                                    }
+                                }
+                            }
+
+                            NetworkCommand::DeleteBoard { id } => {
+                                // Get group_id through workspace join
+                                let group_id: Option<String> = {
+                                    let db = self.db.lock().unwrap();
+                                    let mut stmt = db.prepare(
+                                        "SELECT w.group_id FROM objects o
+                                             JOIN workspaces w ON o.workspace_id = w.id
+                                             WHERE o.id=?1 AND o.type='whiteboard' LIMIT 1"
+                                    ).unwrap();
+                                    stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                                };
+
+                                if let Some(gid) = group_id {
+                                    let topic = self.topics.lock().unwrap().get(&gid).cloned();
+                                    if let Some(topic) = topic {
+                                        let evt = NetworkEvent::BoardDeleted { id: id.clone() };
+                                        tokio::spawn(async move {
+                                            let mut guard = topic.lock().await;
+                                            let _ = guard.broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap())).await;
+                                        });
+                                    }
+                                }
+                            }
+
+                            NetworkCommand::DeleteChat { id } => {
+                                // Get group_id through workspace join
+                                let group_id: Option<String> = {
+                                    let db = self.db.lock().unwrap();
+                                    let mut stmt = db.prepare(
+                                        "SELECT w.group_id FROM objects o
+                                             JOIN workspaces w ON o.workspace_id = w.id
+                                             WHERE o.id=?1 AND o.type='chat' LIMIT 1"
+                                    ).unwrap();
+                                    stmt.query_row(params![id.clone()], |r| r.get::<_, String>(0)).optional().unwrap()
+                                };
+
+                                if let Some(gid) = group_id {
+                                    let topic = self.topics.lock().unwrap().get(&gid).cloned();
+                                    if let Some(topic) = topic {
+                                        let evt = NetworkEvent::ChatDeleted { id: id.clone() };
+                                        tokio::spawn(async move {
+                                            let mut guard = topic.lock().await;
+                                            let _ = guard.broadcast(Bytes::from(serde_json::to_vec(&evt).unwrap())).await;
+                                        });
+                                    }
+                                }
+                            }
+
+                            NetworkCommand::StartChatStream { peer_id, workspace_id } => {
+                                tracing::info!("Starting direct chat stream to peer: {peer_id} for workspace: {workspace_id}");
+
+                                match PublicKey::from_str(&peer_id) {
+                                    Ok(pk) => {
+                                        let addr = EndpointAddr::new(pk);
+                                        match self.endpoint.connect(addr, b"xsp-1.0").await {
+                                            Ok(conn) => {
+                                                match conn.open_bi().await {
+                                                    Ok((mut tx, rx)) => {
+                                                        // Send workspace_id as first frame
+                                                        let init = ChatStreamInit { workspace_id: workspace_id.clone() };
+                                                        match serde_json::to_vec(&init) {
+                                                            Ok(init_bytes) => {
+                                                                if let Err(e) = write_chat_frame(&mut tx, &init_bytes).await {
+                                                                    tracing::error!("Failed to send chat init: {e}");
+                                                                    continue;
+                                                                }
+
+                                                                // Create channel for outbound messages
+                                                                let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+
+                                                                // Store sender for this peer
+                                                                {
+                                                                    let mut senders = self.chat_senders.lock().unwrap();
+                                                                    senders.insert(peer_id.clone(), outbound_tx);
+                                                                }
+
+                                                                // Notify Swift that stream is ready
+                                                                let _ = self.event_tx.send(SwiftEvent::ChatStreamReady {
+                                                                    peer_id: peer_id.clone(),
+                                                                    workspace_id: workspace_id.clone(),
+                                                                });
+
+                                                                let db = self.db.clone();
+                                                                let event_tx = self.event_tx.clone();
+                                                                let node_id = self.node_id.clone();
+                                                                let chat_senders = self.chat_senders.clone();
+                                                                let peer_id_clone = peer_id.clone();
+                                                                let workspace_id_clone = workspace_id.clone();
+
+                                                                // Spawn chat stream handler
+                                                                tokio::spawn(async move {
+                                                                    handle_chat_stream(
+                                                                        db,
+                                                                        event_tx.clone(),
+                                                                        node_id,
+                                                                        peer_id_clone.clone(),
+                                                                        workspace_id_clone,
+                                                                        tx,
+                                                                        rx,
+                                                                        outbound_rx,
+                                                                    ).await;
+
+                                                                    // Clean up sender when done
+                                                                    {
+                                                                        let mut senders = chat_senders.lock().unwrap();
+                                                                        senders.remove(&peer_id_clone);
+                                                                    }
+
+                                                                    // Notify Swift that stream is closed
+                                                                    let _ = event_tx.send(SwiftEvent::ChatStreamClosed {
+                                                                        peer_id: peer_id_clone,
+                                                                    });
+                                                                });
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::error!("Failed to serialize chat init: {e}");
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!("Failed to open bi stream: {e}");
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Failed to connect to peer {peer_id}: {e}");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Invalid peer_id: {e}");
+                                    }
+                                }
+                            }
+
+                            NetworkCommand::SendDirectChat { peer_id, workspace_id, message, parent_id } => {
+                                let sender = {
+                                    let senders = self.chat_senders.lock().unwrap();
+                                    senders.get(&peer_id).cloned()
+                                };
+
+                                match sender {
+                                    Some(tx) => {
+                                        let msg = DirectChatOutbound {
+                                            workspace_id,
+                                            message,
+                                            parent_id,
+                                        };
+                                        if let Err(e) = tx.send(msg) {
+                                            tracing::error!("Failed to send to chat channel for {peer_id}: {e}");
+                                        }
+                                    }
+                                    None => {
+                                        tracing::warn!("No active chat stream to peer {peer_id}");
+                                    }
+                                }
+                            }
+
+                            _ => {}
+                        }
+
+                        // Continue to next iteration without re-acquiring guard
+                        continue;
+                    }
                 }
             }
         }
@@ -1349,6 +1927,7 @@ struct TreeSnapshotDTO {
     workspaces: Vec<Workspace>,
     whiteboards: Vec<WhiteboardDTO>,
     files: Vec<FileDTO>,
+    chats: Vec<ChatDTO>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1368,6 +1947,16 @@ struct FileDTO {
     hash: String,
     size: u64,
     created_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatDTO {
+    id: String,
+    workspace_id: String,
+    message: String,
+    author: String,
+    parent_id: Option<String>,
+    timestamp: i64,
 }
 
 fn build_group_snapshot(db: &Arc<Mutex<Connection>>, group_id: &str) -> Result<TreeSnapshotDTO> {
@@ -1471,11 +2060,38 @@ fn build_group_snapshot(db: &Arc<Mutex<Connection>>, group_id: &str) -> Result<T
         all_files
     };
 
+    // Get chats for these workspaces
+    let chats: Vec<ChatDTO> = if !workspace_ids.is_empty() {
+        let placeholders = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT id, workspace_id, name, hash, data, created_at FROM objects WHERE type='chat' AND workspace_id IN ({}) ORDER BY created_at",
+            placeholders
+        );
+        let mut stmt = db.prepare(&query)?;
+        let params: Vec<&dyn rusqlite::ToSql> = workspace_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            let parent_bytes: Option<Vec<u8>> = r.get(4)?;
+            let parent_id = parent_bytes.and_then(|b| String::from_utf8(b).ok());
+            Ok(ChatDTO {
+                id: r.get(0)?,
+                workspace_id: r.get(1)?,
+                message: r.get(2)?,
+                author: r.get(3)?,
+                parent_id,
+                timestamp: r.get(5)?,
+            })
+        })?;
+        rows.filter_map(Result::ok).collect()
+    } else {
+        vec![]
+    };
+
     Ok(TreeSnapshotDTO {
         groups: vec![group],
         workspaces,
         whiteboards,
         files,
+        chats,
     })
 }
 
@@ -1544,11 +2160,32 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
         rows.filter_map(Result::ok).collect()
     };
 
+    let chats: Vec<ChatDTO> = {
+        let mut stmt = db.prepare(
+            "SELECT id, workspace_id, name, hash, data, created_at FROM objects \
+                 WHERE type='chat' ORDER BY created_at",
+        ).unwrap();
+        let rows = stmt.query_map([], |r| {
+            let parent_bytes: Option<Vec<u8>> = r.get(4)?;
+            let parent_id = parent_bytes.and_then(|b| String::from_utf8(b).ok());
+            Ok(ChatDTO {
+                id: r.get(0)?,
+                workspace_id: r.get(1)?,
+                message: r.get(2)?,
+                author: r.get(3)?,
+                parent_id,
+                timestamp: r.get(5)?,
+            })
+        }).unwrap();
+        rows.filter_map(Result::ok).collect()
+    };
+
     let snapshot = TreeSnapshotDTO {
         groups,
         workspaces,
         whiteboards,
         files,
+        chats,
     };
     serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
 }
@@ -1880,6 +2517,98 @@ pub extern "C" fn cyan_delete_board(id: *const c_char) {
         None => return,
     };
     let _ = sys.command_tx.send(CommandMsg::DeleteBoard { id });
+}
+
+// ---------- FFI: chats ----------
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_send_chat(
+    workspace_id: *const c_char,
+    message: *const c_char,
+    parent_id: *const c_char,
+) {
+    let Some(wid) = (unsafe { cstr_arg(workspace_id) }) else {
+        return;
+    };
+    let Some(msg) = (unsafe { cstr_arg(message) }) else {
+        return;
+    };
+    let parent = unsafe { cstr_arg(parent_id) }; // Can be null for root messages
+
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::SendChat {
+        workspace_id: wid,
+        message: msg,
+        parent_id: parent,
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_delete_chat(id: *const c_char) {
+    let Some(id) = (unsafe { cstr_arg(id) }) else {
+        return;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::DeleteChat { id });
+}
+
+// ---------- FFI: direct chats ----------
+/// Start a direct QUIC chat stream with a peer
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_start_direct_chat(
+    peer_id: *const c_char,
+    workspace_id: *const c_char,
+) {
+    let Some(pid) = (unsafe { cstr_arg(peer_id) }) else {
+        return;
+    };
+    let Some(wid) = (unsafe { cstr_arg(workspace_id) }) else {
+        return;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.network_tx.send(NetworkCommand::StartChatStream {
+        peer_id: pid,
+        workspace_id: wid,
+    });
+}
+
+/// Send a message on an existing direct chat stream
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_send_direct_chat(
+    peer_id: *const c_char,
+    workspace_id: *const c_char,
+    message: *const c_char,
+    parent_id: *const c_char,
+) {
+    let Some(pid) = (unsafe { cstr_arg(peer_id) }) else {
+        return;
+    };
+    let Some(wid) = (unsafe { cstr_arg(workspace_id) }) else {
+        return;
+    };
+    let Some(msg) = (unsafe { cstr_arg(message) }) else {
+        return;
+    };
+    let parent = unsafe { cstr_arg(parent_id) };
+
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.network_tx.send(NetworkCommand::SendDirectChat {
+        peer_id: pid,
+        workspace_id: wid,
+        message: msg,
+        parent_id: parent,
+    });
 }
 
 // ---------- FFI: uploads ----------
