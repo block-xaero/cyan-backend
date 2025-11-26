@@ -2841,3 +2841,20 @@ pub extern "C" fn cyan_get_total_peer_count() -> i32 {
         .map(|set| set.len())
         .sum::<usize>() as i32
 }
+
+/// Get total object count (whiteboards + files)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_object_count() -> i32 {
+    let Some(sys) = SYSTEM.get() else {
+        return 0;
+    };
+
+    let db = sys.db.lock().unwrap();
+    let count: i32 = db.query_row(
+        "SELECT COUNT(*) FROM objects WHERE type IN ('whiteboard', 'file')",
+        [],
+        |row| row.get(0)
+    ).unwrap_or(0);
+
+    count
+}
