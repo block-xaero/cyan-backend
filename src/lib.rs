@@ -2858,3 +2858,147 @@ pub extern "C" fn cyan_get_object_count() -> i32 {
 
     count
 }
+
+// ---------- Board Query FFI ----------
+
+/// Get all boards for a group (across all workspaces in that group)
+/// Returns JSON array: [{"id": "...", "workspace_id": "...", "group_id": "...", "name": "...", "created_at": 123}]
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_boards_for_group(group_id: *const c_char) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    let gid = unsafe { CStr::from_ptr(group_id) }.to_string_lossy().to_string();
+
+    let boards: Vec<serde_json::Value> = {
+        let db = sys.db.lock().unwrap();
+
+        // First get all workspace IDs for this group
+        let mut ws_stmt = db.prepare(
+            "SELECT id FROM workspaces WHERE group_id = ?1"
+        ).unwrap();
+
+        let workspace_ids: Vec<String> = ws_stmt
+            .query_map(params![gid.clone()], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if workspace_ids.is_empty() {
+            return CString::new("[]").unwrap().into_raw();
+        }
+
+        // Query boards for all workspaces in this group
+        let mut all_boards = Vec::new();
+        for wid in &workspace_ids {
+            let mut stmt = db.prepare(
+                "SELECT id, workspace_id, name, created_at FROM objects
+                 WHERE type = 'whiteboard' AND workspace_id = ?1
+                 ORDER BY created_at DESC"
+            ).unwrap();
+
+            let boards_iter = stmt.query_map(params![wid], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "workspace_id": row.get::<_, String>(1)?,
+                    "group_id": gid.clone(),
+                    "name": row.get::<_, String>(2)?,
+                    "created_at": row.get::<_, i64>(3)?,
+                    "element_count": 0
+                }))
+            }).unwrap();
+
+            for board in boards_iter.filter_map(|r| r.ok()) {
+                all_boards.push(board);
+            }
+        }
+        all_boards
+    };
+
+    match serde_json::to_string(&boards) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => CString::new("[]").unwrap().into_raw(),
+    }
+}
+
+/// Get all boards for a specific workspace
+/// Returns JSON array
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_boards_for_workspace(workspace_id: *const c_char) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    let wid = unsafe { CStr::from_ptr(workspace_id) }.to_string_lossy().to_string();
+
+    let boards: Vec<serde_json::Value> = {
+        let db = sys.db.lock().unwrap();
+
+        // Get group_id for this workspace
+        let group_id: String = db.query_row(
+            "SELECT group_id FROM workspaces WHERE id = ?1",
+            params![wid.clone()],
+            |row| row.get(0)
+        ).unwrap_or_default();
+
+        let mut stmt = db.prepare(
+            "SELECT id, workspace_id, name, created_at FROM objects
+             WHERE type = 'whiteboard' AND workspace_id = ?1
+             ORDER BY created_at DESC"
+        ).unwrap();
+
+        stmt.query_map(params![wid], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "workspace_id": row.get::<_, String>(1)?,
+                "group_id": group_id.clone(),
+                "name": row.get::<_, String>(2)?,
+                "created_at": row.get::<_, i64>(3)?,
+                "element_count": 0
+            }))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    };
+
+    match serde_json::to_string(&boards) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => CString::new("[]").unwrap().into_raw(),
+    }
+}
+
+/// Get all boards across all groups and workspaces
+/// Returns JSON array
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    let boards: Vec<serde_json::Value> = {
+        let db = sys.db.lock().unwrap();
+
+        let mut stmt = db.prepare(
+            "SELECT o.id, o.workspace_id, w.group_id, o.name, o.created_at
+             FROM objects o
+             LEFT JOIN workspaces w ON o.workspace_id = w.id
+             WHERE o.type = 'whiteboard'
+             ORDER BY o.created_at DESC"
+        ).unwrap();
+
+        stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "workspace_id": row.get::<_, String>(1)?,
+                "group_id": row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                "name": row.get::<_, String>(3)?,
+                "created_at": row.get::<_, i64>(4)?,
+                "element_count": 0
+            }))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    };
+
+    match serde_json::to_string(&boards) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => CString::new("[]").unwrap().into_raw(),
+    }
+}
