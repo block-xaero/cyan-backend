@@ -149,6 +149,41 @@ pub enum NetworkEvent {
     ChatDeleted {
         id: String,
     },
+    // ---- Whiteboard element events ----
+    WhiteboardElementAdded {
+        id: String,
+        board_id: String,
+        element_type: String,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        z_index: i32,
+        style_json: Option<String>,
+        content_json: Option<String>,
+        created_at: i64,
+        updated_at: i64,
+    },
+    WhiteboardElementUpdated {
+        id: String,
+        board_id: String,
+        element_type: String,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        z_index: i32,
+        style_json: Option<String>,
+        content_json: Option<String>,
+        updated_at: i64,
+    },
+    WhiteboardElementDeleted {
+        id: String,
+        board_id: String,
+    },
+    WhiteboardCleared {
+        board_id: String,
+    },
 }
 
 // ---------- Internal commands ----------
@@ -321,6 +356,22 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             FOREIGN KEY(group_id) REFERENCES groups(id),
             FOREIGN KEY(workspace_id) REFERENCES workspaces(id)
         );
+        CREATE TABLE IF NOT EXISTS whiteboard_elements (
+            id TEXT PRIMARY KEY,
+            board_id TEXT NOT NULL,
+            element_type TEXT NOT NULL,
+            x REAL NOT NULL,
+            y REAL NOT NULL,
+            width REAL NOT NULL,
+            height REAL NOT NULL,
+            z_index INTEGER DEFAULT 0,
+            style_json TEXT,
+            content_json TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY(board_id) REFERENCES objects(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_whiteboard_elements_board ON whiteboard_elements(board_id);
         "#,
     )?;
     Ok(())
@@ -1329,6 +1380,68 @@ impl NetworkActor {
                                                 let _ = db.execute(
                                                     "DELETE FROM objects WHERE id=?1 AND type='chat'",
                                                     params![id],
+                                                );
+                                            }
+                                            // ---- Whiteboard element events ----
+                                            NetworkEvent::WhiteboardElementAdded {
+                                                id,
+                                                board_id,
+                                                element_type,
+                                                x, y, width, height, z_index,
+                                                style_json,
+                                                content_json,
+                                                created_at,
+                                                updated_at,
+                                            } => {
+                                                let db = db.lock().unwrap();
+                                                let _ = db.execute(
+                                                    "INSERT OR IGNORE INTO whiteboard_elements
+                                                     (id, board_id, element_type, x, y, width, height, z_index,
+                                                      style_json, content_json, created_at, updated_at)
+                                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                                    params![
+                                                        id, board_id, element_type,
+                                                        x, y, width, height, z_index,
+                                                        style_json, content_json,
+                                                        created_at, updated_at
+                                                    ],
+                                                );
+                                            }
+                                            NetworkEvent::WhiteboardElementUpdated {
+                                                id,
+                                                board_id,
+                                                element_type,
+                                                x, y, width, height, z_index,
+                                                style_json,
+                                                content_json,
+                                                updated_at,
+                                            } => {
+                                                let db = db.lock().unwrap();
+                                                let _ = db.execute(
+                                                    "UPDATE whiteboard_elements SET
+                                                     board_id=?2, element_type=?3, x=?4, y=?5,
+                                                     width=?6, height=?7, z_index=?8,
+                                                     style_json=?9, content_json=?10, updated_at=?11
+                                                     WHERE id=?1",
+                                                    params![
+                                                        id, board_id, element_type,
+                                                        x, y, width, height, z_index,
+                                                        style_json, content_json, updated_at
+                                                    ],
+                                                );
+                                            }
+                                            NetworkEvent::WhiteboardElementDeleted { id, board_id: _ } => {
+                                                let db = db.lock().unwrap();
+                                                let _ = db.execute(
+                                                    "DELETE FROM whiteboard_elements WHERE id=?1",
+                                                    params![id],
+                                                );
+                                            }
+                                            NetworkEvent::WhiteboardCleared { board_id } => {
+                                                let db = db.lock().unwrap();
+                                                let _ = db.execute(
+                                                    "DELETE FROM whiteboard_elements WHERE board_id=?1",
+                                                    params![board_id],
                                                 );
                                             }
                                         }
@@ -2451,6 +2564,12 @@ pub extern "C" fn cyan_free_string(ptr: *mut c_char) {
     }
 }
 
+/// Check if the Cyan system is initialized and ready
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_is_ready() -> bool {
+    SYSTEM.get().is_some()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_poll_events(_component: *const c_char) -> *mut c_char {
     let Some(cyan) = SYSTEM.get() else {
@@ -3001,4 +3120,287 @@ pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
         Ok(json) => CString::new(json).unwrap().into_raw(),
         Err(_) => CString::new("[]").unwrap().into_raw(),
     }
+}
+
+// ---------- Whiteboard Elements FFI ----------
+
+/// Load all elements for a whiteboard/board
+/// Returns JSON array of element objects
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_load_whiteboard_elements(board_id: *const c_char) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+
+    let elements: Vec<serde_json::Value> = {
+        let db = sys.db.lock().unwrap();
+
+        let mut stmt = db.prepare(
+            "SELECT id, board_id, element_type, x, y, width, height, z_index,
+                    style_json, content_json, created_at, updated_at
+             FROM whiteboard_elements
+             WHERE board_id = ?1
+             ORDER BY z_index ASC, created_at ASC"
+        ).unwrap();
+
+        stmt.query_map(params![bid], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "board_id": row.get::<_, String>(1)?,
+                "element_type": row.get::<_, String>(2)?,
+                "x": row.get::<_, f64>(3)?,
+                "y": row.get::<_, f64>(4)?,
+                "width": row.get::<_, f64>(5)?,
+                "height": row.get::<_, f64>(6)?,
+                "z_index": row.get::<_, i32>(7)?,
+                "style_json": row.get::<_, Option<String>>(8)?,
+                "content_json": row.get::<_, Option<String>>(9)?,
+                "created_at": row.get::<_, i64>(10)?,
+                "updated_at": row.get::<_, i64>(11)?
+            }))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    };
+
+    match serde_json::to_string(&elements) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => CString::new("[]").unwrap().into_raw(),
+    }
+}
+
+/// Save (insert or update) a whiteboard element
+/// Input: JSON object with element fields
+/// Returns: true on success
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_save_whiteboard_element(element_json: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let json_str = unsafe { CStr::from_ptr(element_json) }.to_string_lossy().to_string();
+
+    let Ok(elem) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+        return false;
+    };
+
+    let id = elem["id"].as_str().unwrap_or("").to_string();
+    let board_id = elem["board_id"].as_str().unwrap_or("").to_string();
+    let element_type = elem["element_type"].as_str().unwrap_or("rectangle").to_string();
+    let x = elem["x"].as_f64().unwrap_or(0.0);
+    let y = elem["y"].as_f64().unwrap_or(0.0);
+    let width = elem["width"].as_f64().unwrap_or(100.0);
+    let height = elem["height"].as_f64().unwrap_or(100.0);
+    let z_index = elem["z_index"].as_i64().unwrap_or(0) as i32;
+    let style_json = elem["style_json"].as_str().map(|s| s.to_string());
+    let content_json = elem["content_json"].as_str().map(|s| s.to_string());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let created_at = elem["created_at"].as_i64().unwrap_or(now);
+    let updated_at = now;
+
+    if id.is_empty() || board_id.is_empty() {
+        return false;
+    }
+
+    // Check if element exists (for add vs update event)
+    let is_new: bool;
+    let group_id: String;
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        // Check if exists
+        is_new = db.query_row(
+            "SELECT 1 FROM whiteboard_elements WHERE id = ?1",
+            params![&id],
+            |_| Ok(())
+        ).is_err();
+
+        // Get group_id via board -> workspace -> group
+        group_id = db.query_row(
+            "SELECT w.group_id FROM objects o
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE o.id = ?1",
+            params![&board_id],
+            |row| row.get(0)
+        ).unwrap_or_default();
+
+        // Insert or replace
+        let result = db.execute(
+            "INSERT OR REPLACE INTO whiteboard_elements
+             (id, board_id, element_type, x, y, width, height, z_index, style_json, content_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![&id, &board_id, &element_type, x, y, width, height, z_index, &style_json, &content_json, created_at, updated_at]
+        );
+
+        if result.is_err() {
+            return false;
+        }
+    }
+
+    // Broadcast via gossip
+    if !group_id.is_empty() {
+        let event = if is_new {
+            NetworkEvent::WhiteboardElementAdded {
+                id: id.clone(),
+                board_id: board_id.clone(),
+                element_type,
+                x, y, width, height, z_index,
+                style_json,
+                content_json,
+                created_at,
+                updated_at,
+            }
+        } else {
+            NetworkEvent::WhiteboardElementUpdated {
+                id: id.clone(),
+                board_id: board_id.clone(),
+                element_type,
+                x, y, width, height, z_index,
+                style_json,
+                content_json,
+                updated_at,
+            }
+        };
+
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id,
+            event,
+        });
+    }
+
+    true
+}
+
+/// Delete a whiteboard element by ID
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_delete_whiteboard_element(element_id: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let id = unsafe { CStr::from_ptr(element_id) }.to_string_lossy().to_string();
+
+    if id.is_empty() {
+        return false;
+    }
+
+    let board_id: String;
+    let group_id: String;
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        // Get board_id before deleting
+        board_id = db.query_row(
+            "SELECT board_id FROM whiteboard_elements WHERE id = ?1",
+            params![&id],
+            |row| row.get(0)
+        ).unwrap_or_default();
+
+        // Get group_id via board -> workspace -> group
+        group_id = if !board_id.is_empty() {
+            db.query_row(
+                "SELECT w.group_id FROM objects o
+                 JOIN workspaces w ON o.workspace_id = w.id
+                 WHERE o.id = ?1",
+                params![&board_id],
+                |row| row.get(0)
+            ).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let result = db.execute(
+            "DELETE FROM whiteboard_elements WHERE id = ?1",
+            params![&id]
+        );
+
+        if result.is_err() {
+            return false;
+        }
+    }
+
+    // Broadcast via gossip
+    if !group_id.is_empty() && !board_id.is_empty() {
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id,
+            event: NetworkEvent::WhiteboardElementDeleted {
+                id,
+                board_id,
+            },
+        });
+    }
+
+    true
+}
+
+/// Clear all elements for a whiteboard/board
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_clear_whiteboard(board_id: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+
+    if bid.is_empty() {
+        return false;
+    }
+
+    let group_id: String;
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        // Get group_id via board -> workspace -> group
+        group_id = db.query_row(
+            "SELECT w.group_id FROM objects o
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE o.id = ?1",
+            params![&bid],
+            |row| row.get(0)
+        ).unwrap_or_default();
+
+        let result = db.execute(
+            "DELETE FROM whiteboard_elements WHERE board_id = ?1",
+            params![&bid]
+        );
+
+        if result.is_err() {
+            return false;
+        }
+    }
+
+    // Broadcast via gossip
+    if !group_id.is_empty() {
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id,
+            event: NetworkEvent::WhiteboardCleared {
+                board_id: bid,
+            },
+        });
+    }
+
+    true
+}
+
+/// Get element count for a board (useful for BoardGridView badges)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_whiteboard_element_count(board_id: *const c_char) -> i32 {
+    let Some(sys) = SYSTEM.get() else {
+        return 0;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+
+    let db = sys.db.lock().unwrap();
+    db.query_row(
+        "SELECT COUNT(*) FROM whiteboard_elements WHERE board_id = ?1",
+        params![bid],
+        |row| row.get(0)
+    ).unwrap_or(0)
 }
