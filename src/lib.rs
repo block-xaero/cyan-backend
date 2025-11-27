@@ -3404,3 +3404,32 @@ pub extern "C" fn cyan_get_whiteboard_element_count(board_id: *const c_char) -> 
         |row| row.get(0)
     ).unwrap_or(0)
 }
+
+/// Get all workspace IDs for a group
+/// Returns JSON array of workspace ID strings: ["ws1", "ws2", ...]
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_workspaces_for_group(group_id: *const c_char) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    let gid = unsafe { CStr::from_ptr(group_id) }.to_string_lossy().to_string();
+
+    let workspace_ids: Vec<String> = {
+        let db = sys.db.lock().unwrap();
+
+        let mut stmt = db.prepare(
+            "SELECT id FROM workspaces WHERE group_id = ?1"
+        ).unwrap();
+
+        stmt.query_map(params![gid], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    match serde_json::to_string(&workspace_ids) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => CString::new("[]").unwrap().into_raw(),
+    }
+}
