@@ -132,9 +132,11 @@ pub enum NetworkEvent {
         id: String,
         group_id: Option<String>,
         workspace_id: Option<String>,
+        board_id: Option<String>,
         name: String,
         hash: String,
         size: u64,
+        source_peer: String,
         created_at: i64,
     },
     // ---- Chat events ----
@@ -224,6 +226,12 @@ enum NetworkCommand {
         message: String,
         parent_id: Option<String>,
     },
+    /// Request file download from peer
+    RequestFileDownload {
+        file_id: String,
+        hash: String,
+        source_peer: String,
+    },
 }
 
 /// Message sent through channel to chat stream writer task
@@ -232,6 +240,15 @@ struct DirectChatOutbound {
     workspace_id: String,
     message: String,
     parent_id: Option<String>,
+}
+
+/// File transfer protocol messages (length-prefixed JSON over QUIC)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "msg_type")]
+pub enum FileTransferMsg {
+    Request { file_id: String, hash: String },
+    Metadata { file_id: String, size: u64, name: String },
+    NotFound { file_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +327,12 @@ pub enum SwiftEvent {
     PeerLeft { group_id: String, peer_id: String },
     /// Status update for UI (syncing, downloading, etc.)
     StatusUpdate { message: String },
+    /// File download progress (0.0 to 1.0)
+    FileDownloadProgress { file_id: String, progress: f64 },
+    /// File download completed
+    FileDownloaded { file_id: String, local_path: String },
+    /// File download failed
+    FileDownloadFailed { file_id: String, error: String },
 }
 
 // ---------- System ----------
@@ -347,14 +370,18 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             id TEXT PRIMARY KEY,
             group_id TEXT,
             workspace_id TEXT,
+            board_id TEXT,
             type TEXT NOT NULL,
             name TEXT,
             hash TEXT,
             size INTEGER,
+            source_peer TEXT,
+            local_path TEXT,
             data BLOB,
             created_at INTEGER NOT NULL,
             FOREIGN KEY(group_id) REFERENCES groups(id),
-            FOREIGN KEY(workspace_id) REFERENCES workspaces(id)
+            FOREIGN KEY(workspace_id) REFERENCES workspaces(id),
+            FOREIGN KEY(board_id) REFERENCES objects(id)
         );
         CREATE TABLE IF NOT EXISTS whiteboard_elements (
             id TEXT PRIMARY KEY,
@@ -377,6 +404,26 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Run schema migrations for existing databases
+fn run_migrations(conn: &Connection) -> Result<()> {
+    // Check and add board_id column
+    if conn.prepare("SELECT board_id FROM objects LIMIT 1").is_err() {
+        tracing::info!("Migration: adding board_id column");
+        let _ = conn.execute("ALTER TABLE objects ADD COLUMN board_id TEXT", []);
+    }
+    // Check and add source_peer column
+    if conn.prepare("SELECT source_peer FROM objects LIMIT 1").is_err() {
+        tracing::info!("Migration: adding source_peer column");
+        let _ = conn.execute("ALTER TABLE objects ADD COLUMN source_peer TEXT", []);
+    }
+    // Check and add local_path column
+    if conn.prepare("SELECT local_path FROM objects LIMIT 1").is_err() {
+        tracing::info!("Migration: adding local_path column");
+        let _ = conn.execute("ALTER TABLE objects ADD COLUMN local_path TEXT", []);
+    }
+    Ok(())
+}
+
 impl CyanSystem {
     async fn new(db_path: String) -> Result<Self> {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
@@ -387,6 +434,7 @@ impl CyanSystem {
 
         let db = Connection::open(db_path)?;
         ensure_schema(&db)?;
+        run_migrations(&db)?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<CommandMsg>();
         let (net_tx, net_rx) = mpsc::unbounded_channel::<NetworkCommand>();
@@ -1279,25 +1327,28 @@ impl NetworkActor {
                                                 id,
                                                 group_id,
                                                 workspace_id,
+                                                board_id,
                                                 name,
                                                 hash,
                                                 size,
+                                                source_peer,
                                                 created_at,
                                             } => {
                                                 let db = db.lock().unwrap();
                                                 let _ = db.execute(
-                                                    "INSERT OR IGNORE INTO objects (id, group_id, \
-                                             workspace_id, type, name, hash, size, created_at)
-                                             VALUES (?1, ?2, ?3, 'file', ?4, ?5, ?6, ?7)",
+                                                    "INSERT OR IGNORE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, created_at)
+                                                     VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9)",
                                                     params![
-                                                id,
-                                                group_id,
-                                                workspace_id,
-                                                name,
-                                                hash,
-                                                *size as i64,
-                                                created_at
-                                            ],
+                                                        id,
+                                                        group_id,
+                                                        workspace_id,
+                                                        board_id,
+                                                        name,
+                                                        hash,
+                                                        *size as i64,
+                                                        source_peer,
+                                                        created_at
+                                                    ],
                                                 );
                                             }
                                             NetworkEvent::GroupDeleted { id } => {
@@ -1765,10 +1816,9 @@ impl NetworkActor {
                                         let db = self.db.lock().unwrap();
                                         let name = Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file");
                                         let _ = db.execute(
-                                            "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, \
-                                             type, name, hash, size, created_at)
-                                             VALUES (?1, ?2, NULL, 'file', ?3, ?4, ?5, ?6)",
-                                            params![id, group_id, name, hash, size as i64, created_at],
+                                            "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, created_at)
+                                             VALUES (?1, ?2, NULL, NULL, 'file', ?3, ?4, ?5, ?6, ?7)",
+                                            params![id, group_id, name, hash, size as i64, self.node_id, created_at],
                                         );
                                     }
 
@@ -1778,9 +1828,11 @@ impl NetworkActor {
                                             id: id.clone(),
                                             group_id: Some(group_id.clone()),
                                             workspace_id: None,
+                                            board_id: None,
                                             name: Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string(),
                                             hash,
                                             size,
+                                            source_peer: self.node_id.clone(),
                                             created_at,
                                         };
                                         tokio::spawn(async move {
@@ -1814,9 +1866,8 @@ impl NetworkActor {
                                         let db = self.db.lock().unwrap();
                                         let name = Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file");
                                         let _ = db.execute(
-                                            "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, \
-                                             type, name, hash, size, created_at)
-                                             VALUES (?1, ?2, ?3, 'file', ?4, ?5, ?6, ?7)",
+                                            "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, created_at)
+                                             VALUES (?1, ?2, ?3, NULL, 'file', ?4, ?5, ?6, ?7, ?8)",
                                             params![
                                                 id,
                                                 gid,
@@ -1824,6 +1875,7 @@ impl NetworkActor {
                                                 name,
                                                 hash,
                                                 size as i64,
+                                                self.node_id,
                                                 created_at
                                             ],
                                         );
@@ -1836,9 +1888,11 @@ impl NetworkActor {
                                                 id: id.clone(),
                                                 group_id: Some(group_id.clone()),
                                                 workspace_id: Some(workspace_id.clone()),
+                                                board_id: None,
                                                 name: Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string(),
                                                 hash,
                                                 size,
+                                                source_peer: self.node_id.clone(),
                                                 created_at,
                                             };
                                             tokio::spawn(async move {
@@ -2170,9 +2224,12 @@ struct FileDTO {
     id: String,
     group_id: Option<String>,
     workspace_id: Option<String>,
+    board_id: Option<String>,
     name: String,
     hash: String,
     size: u64,
+    source_peer: Option<String>,
+    local_path: Option<String>,
     created_at: i64,
 }
 
@@ -2247,16 +2304,19 @@ fn build_group_snapshot(db: &Arc<Mutex<Connection>>, group_id: &str) -> Result<T
         let mut all_files = vec![];
 
         // Group-level files
-        let mut stmt = db.prepare("SELECT id, group_id, workspace_id, name, hash, size, created_at FROM objects WHERE type='file' AND group_id=?1")?;
+        let mut stmt = db.prepare("SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at FROM objects WHERE type='file' AND group_id=?1")?;
         let group_files = stmt.query_map(params![group_id], |r| {
             Ok(FileDTO {
                 id: r.get(0)?,
                 group_id: r.get(1)?,
                 workspace_id: r.get(2)?,
-                name: r.get(3)?,
-                hash: r.get(4)?,
-                size: r.get::<_, i64>(5)? as u64,
-                created_at: r.get(6)?,
+                board_id: r.get(3)?,
+                name: r.get(4)?,
+                hash: r.get(5)?,
+                size: r.get::<_, i64>(6)? as u64,
+                source_peer: r.get(7)?,
+                local_path: r.get(8)?,
+                created_at: r.get(9)?,
             })
         })?;
         all_files.extend(group_files.filter_map(Result::ok));
@@ -2265,7 +2325,7 @@ fn build_group_snapshot(db: &Arc<Mutex<Connection>>, group_id: &str) -> Result<T
         if !workspace_ids.is_empty() {
             let placeholders = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let query = format!(
-                "SELECT id, group_id, workspace_id, name, hash, size, created_at FROM objects WHERE type='file' AND workspace_id IN ({})",
+                "SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at FROM objects WHERE type='file' AND workspace_id IN ({})",
                 placeholders
             );
             let mut stmt = db.prepare(&query)?;
@@ -2275,10 +2335,13 @@ fn build_group_snapshot(db: &Arc<Mutex<Connection>>, group_id: &str) -> Result<T
                     id: r.get(0)?,
                     group_id: r.get(1)?,
                     workspace_id: r.get(2)?,
-                    name: r.get(3)?,
-                    hash: r.get(4)?,
-                    size: r.get::<_, i64>(5)? as u64,
-                    created_at: r.get(6)?,
+                    board_id: r.get(3)?,
+                    name: r.get(4)?,
+                    hash: r.get(5)?,
+                    size: r.get::<_, i64>(6)? as u64,
+                    source_peer: r.get(7)?,
+                    local_path: r.get(8)?,
+                    created_at: r.get(9)?,
                 })
             })?;
             all_files.extend(ws_files.filter_map(Result::ok));
@@ -2370,7 +2433,7 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
 
     let files: Vec<FileDTO> = {
         let mut stmt = db.prepare(
-            "SELECT id, group_id, workspace_id, name, hash, size, created_at FROM objects \
+            "SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at FROM objects \
                  WHERE type='file' ORDER BY name",
         ).unwrap();
         let rows = stmt.query_map([], |r| {
@@ -2378,10 +2441,13 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                 id: r.get(0)?,
                 group_id: r.get(1)?,
                 workspace_id: r.get(2)?,
-                name: r.get(3)?,
-                hash: r.get(4)?,
-                size: r.get::<_, i64>(5)? as u64,
-                created_at: r.get(6)?,
+                board_id: r.get(3)?,
+                name: r.get(4)?,
+                hash: r.get(5)?,
+                size: r.get::<_, i64>(6)? as u64,
+                source_peer: r.get(7)?,
+                local_path: r.get(8)?,
+                created_at: r.get(9)?,
             })
         }).unwrap();
         rows.filter_map(Result::ok).collect()
@@ -3431,5 +3497,379 @@ pub extern "C" fn cyan_get_workspaces_for_group(group_id: *const c_char) -> *mut
     match serde_json::to_string(&workspace_ids) {
         Ok(json) => CString::new(json).unwrap().into_raw(),
         Err(_) => CString::new("[]").unwrap().into_raw(),
+    }
+}
+
+// ---------- FFI: File Transfer ----------
+
+/// Upload a file with scope (group/workspace/board)
+/// scope_json: {"type": "Group", "group_id": "..."} or {"type": "Workspace", "workspace_id": "..."} etc.
+/// Returns JSON: {"success": true, "file_id": "...", "hash": "...", "size": 123} or {"success": false, "error": "..."}
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_char) -> *mut c_char {
+    eprintln!("🦀 cyan_upload_file called!");
+    let Some(file_path) = (unsafe { cstr_arg(path) }) else {
+        eprintln!("🦀 cyan_upload_file: invalid path");
+        return CString::new(r#"{"success":false,"error":"Invalid path"}"#).unwrap().into_raw();
+    };
+    eprintln!("🦀 cyan_upload_file: path = {}", file_path);
+    let Some(scope_str) = (unsafe { cstr_arg(scope_json) }) else {
+        return CString::new(r#"{"success":false,"error":"Invalid scope"}"#).unwrap().into_raw();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        eprintln!("🦀 cyan_upload_file: invalid scope");
+        return CString::new(r#"{"success":false,"error":"System not initialized"}"#).unwrap().into_raw();
+    };
+
+    eprintln!("🦀 cyan_upload_file: scope = {}", scope_str);
+    // Parse scope
+    let scope: serde_json::Value = match serde_json::from_str(&scope_str) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("🦀failed to parse scope due to : {e:?}");
+            return CString::new(format!(r#"{{"success":false,"error":"Invalid scope JSON: {}"}}"#, e))
+                .unwrap().into_raw();
+        }
+    };
+
+    // Read file
+    let bytes = match std::fs::read(&file_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("🦀failed to read file path due to : {e:?}");
+            return CString::new(format!(r#"{{"success":false,"error":"Failed to read file: {}"}}"#, e))
+                .unwrap().into_raw();
+        }
+    };
+
+    let file_name = Path::new(&file_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let size = bytes.len() as u64;
+    let now = chrono::Utc::now().timestamp();
+    eprintln!("🦀 attempting to store file locally!");
+    // Store file locally
+    let files_dir = DATA_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("files");
+    if let Err(e) = std::fs::create_dir_all(&files_dir) {
+        eprintln!("🦀 failed to create dir due to : {e:?}");
+        return CString::new(format!(r#"{{"success":false,"error":"Failed to create files dir at {:?}: {}"}}"#, files_dir, e))
+            .unwrap().into_raw();
+    }
+    let local_path = files_dir.join(&hash);
+    if let Err(e) = std::fs::write(&local_path, &bytes) {
+        eprintln!("🦀 failed to write file due  to : {e:?}");
+        return CString::new(format!(r#"{{"success":false,"error":"Failed to store file: {}"}}"#, e))
+            .unwrap().into_raw();
+    }
+
+    // Determine scope and IDs
+    let scope_type = scope["type"].as_str().unwrap_or("");
+    let (group_id, workspace_id, board_id): (Option<String>, Option<String>, Option<String>);
+
+    match scope_type {
+        "Group" => {
+            group_id = scope["group_id"].as_str().map(|s| s.to_string());
+            workspace_id = None;
+            board_id = None;
+        }
+        "Workspace" => {
+            workspace_id = scope["workspace_id"].as_str().map(|s| s.to_string());
+            let db = sys.db.lock().unwrap();
+            group_id = workspace_id.as_ref().and_then(|wid| {
+                db.query_row(
+                    "SELECT group_id FROM workspaces WHERE id = ?1",
+                    params![wid],
+                    |row| row.get(0),
+                ).ok()
+            });
+            board_id = None;
+        }
+        "Board" => {
+            board_id = scope["board_id"].as_str().map(|s| s.to_string());
+            let db = sys.db.lock().unwrap();
+            let ids: Option<(String, String)> = board_id.as_ref().and_then(|bid| {
+                db.query_row(
+                    "SELECT o.workspace_id, w.group_id FROM objects o
+                     JOIN workspaces w ON o.workspace_id = w.id
+                     WHERE o.id = ?1",
+                    params![bid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ).ok()
+            });
+            workspace_id = ids.as_ref().map(|(wid, _)| wid.clone());
+            group_id = ids.map(|(_, gid)| gid);
+        }
+        scope_type => {
+            eprintln!("🦀 invalid scope type error  {scope_type:?}");
+            return CString::new(r#"{"success":false,"error":"Unknown scope type"}"#)
+                .unwrap().into_raw();
+        }
+    }
+
+    let gid = match &group_id {
+        Some(g) => g.clone(),
+        None => {
+            return CString::new(r#"{"success":false,"error":"Could not determine group"}"#)
+                .unwrap().into_raw();
+        }
+    };
+
+    // Generate file ID
+    let file_id = blake3::hash(format!("file:{}:{}:{}", &gid, &file_name, now).as_bytes())
+        .to_hex()
+        .to_string();
+
+    // Insert into database
+    {
+        let db = sys.db.lock().unwrap();
+        let result = db.execute(
+            "INSERT OR REPLACE INTO objects (id, group_id, workspace_id, board_id, type, name, hash, size, source_peer, local_path, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                file_id,
+                group_id,
+                workspace_id,
+                board_id,
+                file_name,
+                hash,
+                size as i64,
+                sys.node_id,
+                local_path.to_string_lossy().to_string(),
+                now
+            ],
+        );
+
+        if let Err(e) = result {
+            return CString::new(format!(r#"{{"success":false,"error":"DB error: {}"}}"#, e))
+                .unwrap().into_raw();
+        }
+    }
+
+    // Broadcast FileAvailable
+    let evt = NetworkEvent::FileAvailable {
+        id: file_id.clone(),
+        group_id: group_id.clone(),
+        workspace_id: workspace_id.clone(),
+        board_id: board_id.clone(),
+        name: file_name.clone(),
+        hash: hash.clone(),
+        size,
+        source_peer: sys.node_id.clone(),
+        created_at: now,
+    };
+
+    let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+        group_id: gid,
+        event: evt,
+    });
+
+    // Return success
+    let result = serde_json::json!({
+        "success": true,
+        "file_id": file_id,
+        "hash": hash,
+        "size": size
+    });
+
+    CString::new(result.to_string()).unwrap().into_raw()
+}
+
+/// Request download of a file from its source peer
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_request_file_download(file_id: *const c_char) -> bool {
+    let Some(fid) = (unsafe { cstr_arg(file_id) }) else {
+        return false;
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    // Look up file info
+    let file_info: Option<(String, String)> = {
+        let db = sys.db.lock().unwrap();
+        db.query_row(
+            "SELECT hash, source_peer FROM objects WHERE id = ?1 AND type = 'file'",
+            params![fid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).ok()
+    };
+
+    let (hash, source_peer) = match file_info {
+        Some((h, sp)) => (h, sp),
+        None => return false,
+    };
+
+    // Check if already downloaded
+    {
+        let db = sys.db.lock().unwrap();
+        let local_path: Option<String> = db
+            .query_row(
+                "SELECT local_path FROM objects WHERE id = ?1",
+                params![fid],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+
+        if let Some(path) = local_path {
+            if Path::new(&path).exists() {
+                return true; // Already have it locally
+            }
+        }
+    }
+
+    // Send download request
+    let _ = sys.network_tx.send(NetworkCommand::RequestFileDownload {
+        file_id: fid,
+        hash,
+        source_peer,
+    });
+
+    true
+}
+
+/// Get file status (local/remote)
+/// Returns JSON: {"status": "local", "local_path": "..."} or {"status": "remote"}
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_file_status(file_id: *const c_char) -> *mut c_char {
+    let Some(fid) = (unsafe { cstr_arg(file_id) }) else {
+        return CString::new(r#"{"status":"unknown"}"#).unwrap().into_raw();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new(r#"{"status":"unknown"}"#).unwrap().into_raw();
+    };
+
+    let db = sys.db.lock().unwrap();
+    let local_path: Option<String> = db
+        .query_row(
+            "SELECT local_path FROM objects WHERE id = ?1 AND type = 'file'",
+            params![fid],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+
+    let status = match local_path {
+        Some(path) if Path::new(&path).exists() => {
+            serde_json::json!({
+                "status": "local",
+                "local_path": path
+            })
+        }
+        _ => {
+            serde_json::json!({
+                "status": "remote"
+            })
+        }
+    };
+
+    CString::new(status.to_string()).unwrap().into_raw()
+}
+
+/// Get files for a scope
+/// scope_json: {"type": "Group", "id": "..."} or {"type": "Workspace", "id": "..."} or {"type": "Board", "id": "..."}
+/// Returns JSON array of file objects
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_files(scope_json: *const c_char) -> *mut c_char {
+    let Some(scope_str) = (unsafe { cstr_arg(scope_json) }) else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    let scope: serde_json::Value = match serde_json::from_str(&scope_str) {
+        Ok(v) => v,
+        Err(_) => return CString::new("[]").unwrap().into_raw(),
+    };
+
+    let scope_type = scope["type"].as_str().unwrap_or("");
+    let id = scope["id"].as_str().unwrap_or("");
+
+    let files: Vec<serde_json::Value> = {
+        let db = sys.db.lock().unwrap();
+
+        let query = match scope_type {
+            "Group" => {
+                "SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at
+                 FROM objects WHERE type = 'file' AND group_id = ?1"
+            }
+            "Workspace" => {
+                "SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at
+                 FROM objects WHERE type = 'file' AND workspace_id = ?1"
+            }
+            "Board" => {
+                "SELECT id, group_id, workspace_id, board_id, name, hash, size, source_peer, local_path, created_at
+                 FROM objects WHERE type = 'file' AND board_id = ?1"
+            }
+            _ => return CString::new("[]").unwrap().into_raw(),
+        };
+
+        let mut stmt = db.prepare(query).unwrap();
+        stmt.query_map(params![id], |row| {
+            let local_path: Option<String> = row.get(8)?;
+            let is_local = local_path
+                .as_ref()
+                .map(|p| Path::new(p).exists())
+                .unwrap_or(false);
+
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "group_id": row.get::<_, Option<String>>(1)?,
+                "workspace_id": row.get::<_, Option<String>>(2)?,
+                "board_id": row.get::<_, Option<String>>(3)?,
+                "name": row.get::<_, String>(4)?,
+                "hash": row.get::<_, String>(5)?,
+                "size": row.get::<_, i64>(6)?,
+                "source_peer": row.get::<_, Option<String>>(7)?,
+                "local_path": local_path,
+                "created_at": row.get::<_, i64>(9)?,
+                "is_local": is_local
+            }))
+        })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    match serde_json::to_string(&files) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => CString::new("[]").unwrap().into_raw(),
+    }
+}
+
+/// Get local file path if file is downloaded
+/// Returns null if file is not local
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_file_local_path(file_id: *const c_char) -> *mut c_char {
+    let Some(fid) = (unsafe { cstr_arg(file_id) }) else {
+        return std::ptr::null_mut();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+
+    let db = sys.db.lock().unwrap();
+    let local_path: Option<String> = db
+        .query_row(
+            "SELECT local_path FROM objects WHERE id = ?1 AND type = 'file'",
+            params![fid],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+
+    match local_path {
+        Some(path) if Path::new(&path).exists() => {
+            CString::new(path).unwrap().into_raw()
+        }
+        _ => std::ptr::null_mut(),
     }
 }
