@@ -1,6 +1,9 @@
 // src/lib.rs
 #![allow(clippy::too_many_arguments)]
+
 extern crate core;
+mod integration_bridge;
+pub use integration_bridge::IntegrationBridge;
 
 use crate::NetworkCommand::RequestSnapshot;
 use anyhow::{anyhow, Result};
@@ -333,6 +336,23 @@ pub enum SwiftEvent {
     FileDownloaded { file_id: String, local_path: String },
     /// File download failed
     FileDownloadFailed { file_id: String, error: String },
+    /// Integration event for console display
+    IntegrationEvent {
+        id: String,
+        scope_id: String,
+        source: String,
+        summary: String,
+        context: String,
+        url: Option<String>,
+        ts: u64,
+    },
+    /// Integration status change
+    IntegrationStatus {
+        scope_id: String,
+        integration_type: String,
+        status: String,
+        message: Option<String>,
+    },
 }
 
 // ---------- System ----------
@@ -346,6 +366,8 @@ pub struct CyanSystem {
     pub db: Arc<Mutex<Connection>>,
     /// Peers per group, shared with NetworkActor for FFI queries
     pub peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>>,
+    /// Integration bridge for managing external integrations
+    pub integration_bridge: Arc<IntegrationBridge>,
 }
 
 fn ensure_schema(conn: &Connection) -> Result<()> {
@@ -447,6 +469,12 @@ impl CyanSystem {
         let secret_key_clone = secret_key.clone();
         let peers_per_group_clone = peers_per_group.clone();
 
+        let db_arc = Arc::new(Mutex::new(db));
+        let integration_bridge = Arc::new(IntegrationBridge::new(
+            db_arc.clone(),
+            event_tx.clone(),
+        ));
+
         let system = Self {
             node_id: node_id.clone(),
             secret_key: secret_key.clone(),
@@ -454,8 +482,9 @@ impl CyanSystem {
             command_tx: cmd_tx,
             network_tx: net_tx.clone(),
             event_ffi_buffer,
-            db: Arc::new(Mutex::new(db)),
+            db: db_arc,
             peers_per_group,
+            integration_bridge,
         };
 
         let db_clone = system.db.clone();
@@ -3876,4 +3905,30 @@ pub extern "C" fn cyan_get_file_local_path(file_id: *const c_char) -> *mut c_cha
         }
         _ => std::ptr::null_mut(),
     }
+}
+
+// ---------- FFI: Integration Bridge ----------
+
+/// Handle integration commands via JSON dispatch
+/// Swift sends: {"cmd": "start", "scope_type": "workspace", ...}
+/// Returns JSON response: {"success": true, ...}
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_integration_command(json: *const c_char) -> *mut c_char {
+    let Some(cmd_json) = (unsafe { cstr_arg(json) }) else {
+        return CString::new(r#"{"success":false,"error":"Invalid JSON"}"#).unwrap().into_raw();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new(r#"{"success":false,"error":"System not initialized"}"#).unwrap().into_raw();
+    };
+    let Some(runtime) = RUNTIME.get() else {
+        return CString::new(r#"{"success":false,"error":"Runtime not initialized"}"#).unwrap().into_raw();
+    };
+
+    let result = runtime.block_on(async {
+        sys.integration_bridge.handle_command(&cmd_json).await
+    });
+
+    CString::new(result).unwrap_or_else(|_| {
+        CString::new(r#"{"success":false,"error":"CString conversion failed"}"#).unwrap()
+    }).into_raw()
 }
