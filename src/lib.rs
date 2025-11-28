@@ -3791,7 +3791,11 @@ pub extern "C" fn cyan_get_files(scope_json: *const c_char) -> *mut c_char {
     };
 
     let scope_type = scope["type"].as_str().unwrap_or("");
-    let id = scope["id"].as_str().unwrap_or("");
+    let id = scope["id"].as_str()
+        .or_else(|| scope["group_id"].as_str())
+        .or_else(|| scope["workspace_id"].as_str())
+        .or_else(|| scope["board_id"].as_str())
+        .unwrap_or("");
 
     let files: Vec<serde_json::Value> = {
         let db = sys.db.lock().unwrap();
