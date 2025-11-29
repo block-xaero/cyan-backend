@@ -353,6 +353,11 @@ pub enum SwiftEvent {
         status: String,
         message: Option<String>,
     },
+    /// Integration graph for console tree display
+    IntegrationGraph {
+        scope_id: String,
+        graph_json: String,  // Serialized IntegrationGraph from integration_bridge
+    },
 }
 
 // ---------- System ----------

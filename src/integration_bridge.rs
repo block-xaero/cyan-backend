@@ -5,7 +5,7 @@
 // This module:
 // 1. Wraps IntegrationManager from cyan-backend-integrations
 // 2. Persists integration bindings to SQLite (no tokens)
-// 3. Transforms IntegrationEvent → SwiftEvent::IntegrationEvent
+// 3. Transforms IntegrationEvent → SwiftEvent::IntegrationGraph
 // 4. Provides single FFI entry point: cyan_integration_command(json)
 //
 // Usage in lib.rs:
@@ -21,7 +21,7 @@
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -75,6 +75,45 @@ impl IntegrationType {
             _ => None,
         }
     }
+}
+
+// ============================================================================
+// Graph Types (for Console display)
+// ============================================================================
+
+/// A mention edge - connects a source node to an anchor
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MentionEdge {
+    pub source_node_id: String,      // The Slack message that mentions
+    pub source_kind: String,         // "slackmessage", "githubpr", etc.
+    pub author: String,              // Who wrote it
+    pub summary: String,             // Truncated content
+    pub url: Option<String>,
+    pub ts: u64,
+    pub relation: String,            // "mentions", "fixes", "implements"
+}
+
+/// A graph entry - an anchor node with all its mentions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphEntry {
+    pub anchor_id: String,           // External ID: "PROJ-123", "PR #456"
+    pub anchor_kind: String,         // "jira", "github_pr", "github_issue"
+    pub anchor_status: String,       // "ephemeral", "resolved", "real"
+    pub anchor_title: Option<String>,// Title if resolved
+    pub anchor_url: Option<String>,
+    pub mention_count: u32,
+    pub mentions: Vec<MentionEdge>,  // All edges pointing to this anchor
+    pub first_seen: u64,
+    pub last_activity: u64,
+}
+
+/// The full graph payload sent to Swift
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrationGraph {
+    pub scope_id: String,
+    pub entries: Vec<GraphEntry>,    // Anchors with their mentions
+    pub unlinked_count: u32,         // Messages with no correlations
+    pub updated_at: u64,
 }
 
 // ============================================================================
@@ -152,6 +191,9 @@ pub struct IntegrationBridge {
     manager: Arc<IntegrationManager>,
     /// Track which integrations are running: key = "scope_id:integration_type"
     running: RwLock<HashMap<String, RunningIntegration>>,
+    sent_ids: RwLock<HashSet<String>>,
+    /// Track last graph hash to avoid sending duplicates
+    last_graph_hash: RwLock<HashMap<String, u64>>,
 }
 
 struct RunningIntegration {
@@ -166,7 +208,6 @@ impl IntegrationBridge {
         db: Arc<Mutex<Connection>>,
         event_tx: mpsc::UnboundedSender<SwiftEvent>,
     ) -> Self {
-        // Ensure schema exists
         Self::ensure_schema(&db);
 
         Self {
@@ -174,6 +215,8 @@ impl IntegrationBridge {
             event_tx,
             manager: Arc::new(IntegrationManager::new()),
             running: RwLock::new(HashMap::new()),
+            sent_ids: RwLock::new(HashSet::new()),
+            last_graph_hash: RwLock::new(HashMap::new()),
         }
     }
 
@@ -192,182 +235,215 @@ impl IntegrationBridge {
         });
     }
 
-    /// Poll IntegrationManager for events and forward to Swift
+    /// Poll IntegrationManager for events and forward graph to Swift
     async fn forward_events(&self) {
         let running = self.running.read().await;
 
-        for (key, info) in running.iter() {
-            // Get events from the manager
+        if running.is_empty() {
+            return;
+        }
+
+        for (_key, info) in running.iter() {
+            // Get events and nodes from the manager
             let events = self.manager.get_all_events(&info.scope_id).await;
-
-            for event in events {
-                // Transform to SwiftEvent
-                let swift_event = self.transform_event(&event, &info.scope_type, &info.scope_id);
-
-                if let Err(e) = self.event_tx.send(swift_event) {
-                    tracing::error!("Failed to send integration event: {}", e);
-                }
-            }
-
-            // Also get nodes and send as events (for console display)
             let nodes = self.manager.get_all_nodes(&info.scope_id).await;
 
-            for node in nodes {
-                if !matches!(node.kind, NodeKind::JiraTicket | NodeKind::GitHubPR | NodeKind::GitHubIssue) {
-                    continue;
-                }
-                let swift_event = self.transform_node(&node, &info.scope_type, &info.scope_id);
+            // Build the graph
+            let graph = self.build_graph(&events, &nodes, &info.scope_type, &info.scope_id);
 
-                if let Err(e) = self.event_tx.send(swift_event) {
-                    tracing::error!("Failed to send node event: {}", e);
+            // Skip if graph is empty
+            if graph.entries.is_empty() {
+                continue;
+            }
+
+            // Compute simple hash to detect changes
+            let graph_hash = self.compute_graph_hash(&graph);
+
+            // Check if graph changed
+            {
+                let last_hashes = self.last_graph_hash.read().await;
+                if let Some(&last) = last_hashes.get(&graph.scope_id) {
+                    if last == graph_hash {
+                        continue; // No change, skip
+                    }
                 }
+            }
+
+            // Update hash
+            {
+                let mut last_hashes = self.last_graph_hash.write().await;
+                last_hashes.insert(graph.scope_id.clone(), graph_hash);
+            }
+
+            // Serialize and send
+            let graph_json = serde_json::to_string(&graph).unwrap_or_default();
+
+            tracing::info!(
+                "📊 Sending graph: {} anchors, {} unlinked for {}",
+                graph.entries.len(),
+                graph.unlinked_count,
+                graph.scope_id
+            );
+
+            if let Err(e) = self.event_tx.send(SwiftEvent::IntegrationGraph {
+                scope_id: graph.scope_id.clone(),
+                graph_json,
+            }) {
+                tracing::error!("❌ Failed to send graph: {}", e);
             }
         }
     }
 
-    /// Transform IntegrationEvent from crate to SwiftEvent
-    fn transform_event(&self, event: &CrateIntegrationEvent, scope_type: &str, scope_id: &str) -> SwiftEvent {
-        // Parse payload to extract summary/context
-        let payload: serde_json::Value = serde_json::from_str(&event.base.payload)
-            .unwrap_or(serde_json::json!({}));
+    /// Compute a simple hash for change detection
+    fn compute_graph_hash(&self, graph: &IntegrationGraph) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
-        let event_type = payload.get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-
-        let (summary, context, source) = match event_type {
-            "jira_mention" => {
-                let jira_id = payload.get("jira_id").and_then(|v| v.as_str()).unwrap_or("");
-                let channel = payload.get("channel").and_then(|v| v.as_str()).unwrap_or("");
-                (
-                    format!("{} mentioned", jira_id),
-                    format!("#{}", channel),
-                    "slack".to_string(),
-                )
-            }
-            "github_pr_reference" => {
-                let pr_num = payload.get("pr_number").and_then(|v| v.as_str()).unwrap_or("");
-                let jira_key = payload.get("jira_key").and_then(|v| v.as_str()).unwrap_or("");
-                (
-                    format!("PR #{} linked", pr_num),
-                    jira_key.to_string(),
-                    "jira".to_string(),
-                )
-            }
-            _ => {
-                (
-                    format!("{:?}", event.relation),
-                    "".to_string(),
-                    "unknown".to_string(),
-                )
-            }
-        };
-
-        SwiftEvent::IntegrationEvent {
-            id: event.base.id.clone(),
-            scope_id: format!("{}:{}", scope_type, scope_id),
-            source,
-            summary,
-            context,
-            url: None,
-            ts: event.base.ts,
+        let mut hasher = DefaultHasher::new();
+        graph.entries.len().hash(&mut hasher);
+        graph.unlinked_count.hash(&mut hasher);
+        for entry in &graph.entries {
+            entry.anchor_id.hash(&mut hasher);
+            entry.mention_count.hash(&mut hasher);
+            entry.last_activity.hash(&mut hasher);
         }
+        hasher.finish()
     }
 
-    /// Transform Node from crate to SwiftEvent (for new messages, issues, etc.)
-    fn transform_node(&self, node: &Node, scope_type: &str, scope_id: &str) -> SwiftEvent {
-        let (source, summary, context, url) = match &node.kind {
-            NodeKind::SlackMessage | NodeKind::SlackThread => {
-                let author = if node.metadata.author.is_empty() {
-                    "unknown".to_string()
-                } else {
-                    format!("@{}", node.metadata.author)
-                };
+    /// Build the event graph from nodes and correlation events
+    fn build_graph(
+        &self,
+        events: &[CrateIntegrationEvent],
+        nodes: &[Node],
+        scope_type: &str,
+        scope_id: &str,
+    ) -> IntegrationGraph {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
-                // Truncate message for summary
-                let text = if node.content.len() > 50 {
-                    format!("{}...", truncate_str(&node.content, 50))
-                } else {
-                    node.content.clone()
-                };
+        // Index nodes by ID for quick lookup
+        let node_map: HashMap<String, &Node> = nodes.iter()
+            .map(|n| (n.id.clone(), n))
+            .collect();
 
-                (
-                    "slack".to_string(),
-                    format!("{}: \"{}\"", author, text),
-                    node.name.replace("Message in ", "#"),
-                    Some(node.metadata.url.clone()),
-                )
-            }
-            NodeKind::JiraTicket => {
-                let status = node.metadata.status.as_deref().unwrap_or("Unknown");
-                (
-                    "jira".to_string(),
-                    format!("{} → {}", node.external_id, status),
-                    node.metadata.author.clone(),
-                    Some(node.metadata.url.clone()),
-                )
-            }
-            NodeKind::JiraComment => {
-                (
-                    "jira".to_string(),
-                    format!("Comment on {}", node.external_id),
-                    format!("@{}", node.metadata.author),
-                    Some(node.metadata.url.clone()),
-                )
-            }
-            NodeKind::GitHubPR | NodeKind::GitHubIssue => {
-                let title = node.metadata.title.as_deref().unwrap_or(&node.name);
-                (
-                    "github".to_string(),
-                    title.to_string(),
-                    format!("@{}", node.metadata.author),
-                    Some(node.metadata.url.clone()),
-                )
-            }
-            NodeKind::GitHubCommit => {
-                (
-                    "github".to_string(),
-                    node.content.lines().next().unwrap_or("Commit").to_string(),
-                    format!("@{}", node.metadata.author),
-                    Some(node.metadata.url.clone()),
-                )
-            }
-            NodeKind::ConfluencePage => {
-                let title = node.metadata.title.as_deref().unwrap_or("Page");
-                (
-                    "confluence".to_string(),
-                    format!("{} updated", title),
-                    format!("@{}", node.metadata.author),
-                    Some(node.metadata.url.clone()),
-                )
-            }
-            NodeKind::GoogleDoc | NodeKind::GoogleSheet | NodeKind::GoogleSlide => {
-                let title = node.metadata.title.as_deref().unwrap_or("Document");
-                (
-                    "googledocs".to_string(),
-                    format!("{} updated", title),
-                    format!("@{}", node.metadata.author),
-                    Some(node.metadata.url.clone()),
-                )
-            }
-            _ => {
-                (
-                    "unknown".to_string(),
-                    node.name.clone(),
-                    "".to_string(),
-                    None,
-                )
-            }
-        };
+        // Group events by their anchor (the thing being mentioned)
+        // Key = external_id (e.g., "PROJ-123"), Value = (anchor_kind, mentions)
+        let mut anchors: HashMap<String, (String, Vec<MentionEdge>)> = HashMap::new();
+        let mut linked_node_ids: HashSet<String> = HashSet::new();
 
-        SwiftEvent::IntegrationEvent {
-            id: node.id.clone(),
+        for event in events {
+            // Parse payload to get anchor info
+            let payload: serde_json::Value = serde_json::from_str(&event.base.payload)
+                .unwrap_or(serde_json::json!({}));
+
+            let event_type = payload.get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            // Extract anchor ID and kind based on event type
+            let (anchor_id, anchor_kind) = match event_type {
+                "jira_mention" => {
+                    let jira_id = payload.get("jira_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (jira_id, "jira".to_string())
+                }
+                "github_pr_reference" => {
+                    let pr_num = payload.get("pr_number")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (format!("PR #{}", pr_num), "github_pr".to_string())
+                }
+                "github_issue_reference" => {
+                    let issue_num = payload.get("issue_number")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (format!("Issue #{}", issue_num), "github_issue".to_string())
+                }
+                _ => continue, // Skip unknown event types
+            };
+
+            if anchor_id.is_empty() {
+                continue;
+            }
+
+            // Find the source node (the message that mentions the anchor)
+            let source_node = node_map.get(&event.base.source);
+
+            let mention = MentionEdge {
+                source_node_id: event.base.source.clone(),
+                source_kind: source_node
+                    .map(|n| format!("{:?}", n.kind).to_lowercase())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                author: source_node
+                    .map(|n| n.metadata.author.clone())
+                    .unwrap_or_default(),
+                summary: source_node
+                    .map(|n| truncate_str(&n.content, 60).to_string())
+                    .unwrap_or_else(|| "Unknown message".to_string()),
+                url: source_node.and_then(|n| {
+                    if n.metadata.url.is_empty() { None } else { Some(n.metadata.url.clone()) }
+                }),
+                ts: event.base.ts,
+                relation: format!("{:?}", event.relation).to_lowercase(),
+            };
+
+            // Track this node as linked
+            linked_node_ids.insert(event.base.source.clone());
+
+            // Add to anchor's mentions
+            anchors
+                .entry(anchor_id.clone())
+                .or_insert_with(|| (anchor_kind.clone(), Vec::new()))
+                .1
+                .push(mention);
+        }
+
+        // Build graph entries
+        let mut entries: Vec<GraphEntry> = anchors
+            .into_iter()
+            .map(|(anchor_id, (anchor_kind, mut mentions))| {
+                // Sort mentions by timestamp
+                mentions.sort_by_key(|m| m.ts);
+
+                let first_seen = mentions.first().map(|m| m.ts).unwrap_or(now);
+                let last_activity = mentions.last().map(|m| m.ts).unwrap_or(now);
+
+                GraphEntry {
+                    anchor_id,
+                    anchor_kind,
+                    anchor_status: "ephemeral".to_string(), // TODO: check NodeCache
+                    anchor_title: None,  // TODO: resolve from NodeCache
+                    anchor_url: None,    // TODO: resolve from NodeCache
+                    mention_count: mentions.len() as u32,
+                    mentions,
+                    first_seen,
+                    last_activity,
+                }
+            })
+            .collect();
+
+        // Sort entries by last activity (most recent first)
+        entries.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+
+        // Count unlinked nodes (messages with no correlations)
+        let unlinked_count = nodes.iter()
+            .filter(|n| {
+                matches!(n.kind, NodeKind::SlackMessage | NodeKind::SlackThread)
+                    && !linked_node_ids.contains(&n.id)
+            })
+            .count() as u32;
+
+        IntegrationGraph {
             scope_id: format!("{}:{}", scope_type, scope_id),
-            source,
-            summary,
-            context,
-            url,
-            ts: node.ts,
+            entries,
+            unlinked_count,
+            updated_at: now,
         }
     }
 
