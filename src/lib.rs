@@ -360,6 +360,18 @@ pub enum SwiftEvent {
     },
 }
 
+impl SwiftEvent {
+    /// Returns true if this is an integration-related event that should go to the integration buffer
+    fn is_integration_event(&self) -> bool {
+        matches!(
+            self,
+            SwiftEvent::IntegrationEvent { .. }
+                | SwiftEvent::IntegrationStatus { .. }
+                | SwiftEvent::IntegrationGraph { .. }
+        )
+    }
+}
+
 // ---------- System ----------
 pub struct CyanSystem {
     pub node_id: String,
@@ -367,7 +379,10 @@ pub struct CyanSystem {
     pub command_tx: mpsc::UnboundedSender<CommandMsg>,
     pub event_tx: mpsc::UnboundedSender<SwiftEvent>,
     pub network_tx: mpsc::UnboundedSender<NetworkCommand>,
+    /// Buffer for general events (FileTree, Network, etc.) - polled by cyan_poll_events
     pub event_ffi_buffer: Arc<Mutex<VecDeque<String>>>,
+    /// Buffer for integration events only - polled by cyan_poll_integration_events
+    pub integration_event_buffer: Arc<Mutex<VecDeque<String>>>,
     pub db: Arc<Mutex<Connection>>,
     /// Peers per group, shared with NetworkActor for FFI queries
     pub peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>>,
@@ -466,10 +481,13 @@ impl CyanSystem {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<CommandMsg>();
         let (net_tx, net_rx) = mpsc::unbounded_channel::<NetworkCommand>();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SwiftEvent>();
+        // Two separate buffers for different event types
         let event_ffi_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(Default::default()));
+        let integration_event_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(Default::default()));
         let peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let event_ffi_buffer_clone = event_ffi_buffer.clone();
+        let integration_event_buffer_clone = integration_event_buffer.clone();
         let node_id_clone = node_id.clone();
         let secret_key_clone = secret_key.clone();
         let peers_per_group_clone = peers_per_group.clone();
@@ -490,6 +508,7 @@ impl CyanSystem {
             command_tx: cmd_tx,
             network_tx: net_tx.clone(),
             event_ffi_buffer,
+            integration_event_buffer,
             db: db_arc,
             peers_per_group,
             integration_bridge,
@@ -517,11 +536,17 @@ impl CyanSystem {
             }
         });
 
+        // Event router: routes events to appropriate buffer based on type
         RUNTIME.get().unwrap().spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 match serde_json::to_string(&event) {
                     Ok(event_json) => {
-                        event_ffi_buffer_clone.lock().unwrap().push_back(event_json);
+                        // Route integration events to their dedicated buffer
+                        if event.is_integration_event() {
+                            integration_event_buffer_clone.lock().unwrap().push_back(event_json);
+                        } else {
+                            event_ffi_buffer_clone.lock().unwrap().push_back(event_json);
+                        }
                     }
                     Err(e) => {
                         eprintln!("Failed to serialize event: {e:?}");
@@ -4009,9 +4034,23 @@ pub extern "C" fn cyan_integration_command(json: *const c_char) -> *mut c_char {
 
 /// Poll for integration events (uses same buffer as cyan_poll_events)
 /// Returns integration events only, filtering out other event types
+/// NOW: Uses dedicated integration_event_buffer to avoid race condition with FileTree polling
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_poll_integration_events() -> *mut c_char {
-    // Integration events flow through the same event_tx channel
-    // Just use the main poll for now - Swift will filter by event type
-    cyan_poll_events(std::ptr::null())
+    let Some(cyan) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+
+    let integration_buffer = cyan.integration_event_buffer.clone();
+    let buffer = integration_buffer.lock();
+    match buffer {
+        Ok(mut buff) => match buff.pop_front() {
+            None => std::ptr::null_mut(),
+            Some(event_json) => CString::new(event_json).unwrap().into_raw(),
+        },
+        Err(e) => {
+            tracing::error!("failed to lock integration buffer due to {e:?}");
+            std::ptr::null_mut()
+        }
+    }
 }
