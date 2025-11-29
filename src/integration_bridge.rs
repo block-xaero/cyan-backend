@@ -1,7 +1,12 @@
 // src/integration_bridge.rs
 //
-// Siloed integration management for Cyan.
-// All integration logic lives here - minimal changes needed to lib.rs.
+// Bridges cyan-backend-integrations crate into Cyan's FFI layer.
+//
+// This module:
+// 1. Wraps IntegrationManager from cyan-backend-integrations
+// 2. Persists integration bindings to SQLite (no tokens)
+// 3. Transforms IntegrationEvent → SwiftEvent::IntegrationEvent
+// 4. Provides single FFI entry point: cyan_integration_command(json)
 //
 // Usage in lib.rs:
 //   mod integration_bridge;
@@ -12,10 +17,7 @@
 //
 //   // In CyanSystem::new():
 //   let integration_bridge = Arc::new(IntegrationBridge::new(db.clone(), event_tx.clone()));
-//
-//   // Single FFI function:
-//   #[unsafe(no_mangle)]
-//   pub extern "C" fn cyan_integration_command(json: *const c_char) -> *mut c_char { ... }
+//   integration_bridge.start_event_forwarder();
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -24,13 +26,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 
+// Import from cyan-backend-integrations crate
+use cyan_backend_integrations::{
+    IntegrationEvent as CrateIntegrationEvent,
+    IntegrationManager,
+    IntegrationType as CrateIntegrationType,
+    Node,
+    NodeKind,
+};
+
 use crate::SwiftEvent;
 
 // ============================================================================
-// Public Types
+// Public Types (for FFI JSON interface)
 // ============================================================================
 
-/// Integration types supported
+/// Integration types supported (mirrors crate's IntegrationType)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum IntegrationType {
@@ -67,7 +78,7 @@ impl IntegrationType {
 }
 
 // ============================================================================
-// Command/Response Types (JSON dispatch)
+// Command/Response Types (JSON dispatch from Swift)
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -96,18 +107,18 @@ enum IntegrationCommand {
         scope_type: Option<String>,
         scope_id: String,
     },
-    /// Get events by IDs (for citation filtering)
-    GetEventsByIds {
-        event_ids: Vec<String>,
-    },
     /// Check if integration is running
     IsRunning {
         scope_id: String,
         integration_type: String,
     },
+    /// List available channels (for Slack setup UI)
+    ListSlackChannels {
+        scope_id: String,
+    },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CommandResponse {
     success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,22 +142,22 @@ impl CommandResponse {
 }
 
 // ============================================================================
-// Actor Handle
-// ============================================================================
-
-struct ActorHandle {
-    shutdown_tx: mpsc::Sender<()>,
-    integration_type: IntegrationType,
-}
-
-// ============================================================================
 // Integration Bridge (Main Entry Point)
 // ============================================================================
 
 pub struct IntegrationBridge {
     db: Arc<Mutex<Connection>>,
     event_tx: mpsc::UnboundedSender<SwiftEvent>,
-    actors: RwLock<HashMap<String, ActorHandle>>,  // key: "{scope_id}:{integration_type}"
+    /// The actual integration manager from cyan-backend-integrations
+    manager: Arc<IntegrationManager>,
+    /// Track which integrations are running: key = "scope_id:integration_type"
+    running: RwLock<HashMap<String, RunningIntegration>>,
+}
+
+struct RunningIntegration {
+    scope_type: String,
+    scope_id: String,
+    integration_type: IntegrationType,
 }
 
 impl IntegrationBridge {
@@ -161,7 +172,202 @@ impl IntegrationBridge {
         Self {
             db,
             event_tx,
-            actors: RwLock::new(HashMap::new()),
+            manager: Arc::new(IntegrationManager::new()),
+            running: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Start the background event forwarder task.
+    /// Call this after creating IntegrationBridge.
+    pub fn start_event_forwarder(self: &Arc<Self>) {
+        let bridge = Arc::clone(self);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+            loop {
+                interval.tick().await;
+                bridge.forward_events().await;
+            }
+        });
+    }
+
+    /// Poll IntegrationManager for events and forward to Swift
+    async fn forward_events(&self) {
+        let running = self.running.read().await;
+
+        for (key, info) in running.iter() {
+            // Get events from the manager
+            let events = self.manager.get_all_events(&info.scope_id).await;
+
+            for event in events {
+                // Transform to SwiftEvent
+                let swift_event = self.transform_event(&event, &info.scope_type, &info.scope_id);
+
+                if let Err(e) = self.event_tx.send(swift_event) {
+                    tracing::error!("Failed to send integration event: {}", e);
+                }
+            }
+
+            // Also get nodes and send as events (for console display)
+            let nodes = self.manager.get_all_nodes(&info.scope_id).await;
+
+            for node in nodes {
+                if !matches!(node.kind, NodeKind::JiraTicket | NodeKind::GitHubPR | NodeKind::GitHubIssue) {
+                    continue;
+                }
+                let swift_event = self.transform_node(&node, &info.scope_type, &info.scope_id);
+
+                if let Err(e) = self.event_tx.send(swift_event) {
+                    tracing::error!("Failed to send node event: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Transform IntegrationEvent from crate to SwiftEvent
+    fn transform_event(&self, event: &CrateIntegrationEvent, scope_type: &str, scope_id: &str) -> SwiftEvent {
+        // Parse payload to extract summary/context
+        let payload: serde_json::Value = serde_json::from_str(&event.base.payload)
+            .unwrap_or(serde_json::json!({}));
+
+        let event_type = payload.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let (summary, context, source) = match event_type {
+            "jira_mention" => {
+                let jira_id = payload.get("jira_id").and_then(|v| v.as_str()).unwrap_or("");
+                let channel = payload.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+                (
+                    format!("{} mentioned", jira_id),
+                    format!("#{}", channel),
+                    "slack".to_string(),
+                )
+            }
+            "github_pr_reference" => {
+                let pr_num = payload.get("pr_number").and_then(|v| v.as_str()).unwrap_or("");
+                let jira_key = payload.get("jira_key").and_then(|v| v.as_str()).unwrap_or("");
+                (
+                    format!("PR #{} linked", pr_num),
+                    jira_key.to_string(),
+                    "jira".to_string(),
+                )
+            }
+            _ => {
+                (
+                    format!("{:?}", event.relation),
+                    "".to_string(),
+                    "unknown".to_string(),
+                )
+            }
+        };
+
+        SwiftEvent::IntegrationEvent {
+            id: event.base.id.clone(),
+            scope_id: format!("{}:{}", scope_type, scope_id),
+            source,
+            summary,
+            context,
+            url: None,
+            ts: event.base.ts,
+        }
+    }
+
+    /// Transform Node from crate to SwiftEvent (for new messages, issues, etc.)
+    fn transform_node(&self, node: &Node, scope_type: &str, scope_id: &str) -> SwiftEvent {
+        let (source, summary, context, url) = match &node.kind {
+            NodeKind::SlackMessage | NodeKind::SlackThread => {
+                let author = if node.metadata.author.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    format!("@{}", node.metadata.author)
+                };
+
+                // Truncate message for summary
+                let text = if node.content.len() > 50 {
+                    format!("{}...", truncate_str(&node.content, 50))
+                } else {
+                    node.content.clone()
+                };
+
+                (
+                    "slack".to_string(),
+                    format!("{}: \"{}\"", author, text),
+                    node.name.replace("Message in ", "#"),
+                    Some(node.metadata.url.clone()),
+                )
+            }
+            NodeKind::JiraTicket => {
+                let status = node.metadata.status.as_deref().unwrap_or("Unknown");
+                (
+                    "jira".to_string(),
+                    format!("{} → {}", node.external_id, status),
+                    node.metadata.author.clone(),
+                    Some(node.metadata.url.clone()),
+                )
+            }
+            NodeKind::JiraComment => {
+                (
+                    "jira".to_string(),
+                    format!("Comment on {}", node.external_id),
+                    format!("@{}", node.metadata.author),
+                    Some(node.metadata.url.clone()),
+                )
+            }
+            NodeKind::GitHubPR | NodeKind::GitHubIssue => {
+                let title = node.metadata.title.as_deref().unwrap_or(&node.name);
+                (
+                    "github".to_string(),
+                    title.to_string(),
+                    format!("@{}", node.metadata.author),
+                    Some(node.metadata.url.clone()),
+                )
+            }
+            NodeKind::GitHubCommit => {
+                (
+                    "github".to_string(),
+                    node.content.lines().next().unwrap_or("Commit").to_string(),
+                    format!("@{}", node.metadata.author),
+                    Some(node.metadata.url.clone()),
+                )
+            }
+            NodeKind::ConfluencePage => {
+                let title = node.metadata.title.as_deref().unwrap_or("Page");
+                (
+                    "confluence".to_string(),
+                    format!("{} updated", title),
+                    format!("@{}", node.metadata.author),
+                    Some(node.metadata.url.clone()),
+                )
+            }
+            NodeKind::GoogleDoc | NodeKind::GoogleSheet | NodeKind::GoogleSlide => {
+                let title = node.metadata.title.as_deref().unwrap_or("Document");
+                (
+                    "googledocs".to_string(),
+                    format!("{} updated", title),
+                    format!("@{}", node.metadata.author),
+                    Some(node.metadata.url.clone()),
+                )
+            }
+            _ => {
+                (
+                    "unknown".to_string(),
+                    node.name.clone(),
+                    "".to_string(),
+                    None,
+                )
+            }
+        };
+
+        SwiftEvent::IntegrationEvent {
+            id: node.id.clone(),
+            scope_id: format!("{}:{}", scope_type, scope_id),
+            source,
+            summary,
+            context,
+            url,
+            ts: node.ts,
         }
     }
 
@@ -195,11 +401,11 @@ impl IntegrationBridge {
             IntegrationCommand::GetBindings { scope_type, scope_id } => {
                 self.cmd_get_bindings(scope_type.as_deref(), &scope_id).await
             }
-            IntegrationCommand::GetEventsByIds { event_ids } => {
-                self.cmd_get_events_by_ids(&event_ids).await
-            }
             IntegrationCommand::IsRunning { scope_id, integration_type } => {
                 self.cmd_is_running(&scope_id, &integration_type).await
+            }
+            IntegrationCommand::ListSlackChannels { scope_id } => {
+                self.cmd_list_slack_channels(&scope_id).await
             }
         }
     }
@@ -227,32 +433,100 @@ impl IntegrationBridge {
             return CommandResponse::err("scope_type must be 'group' or 'workspace'");
         }
 
-        let actor_key = format!("{}:{}:{}", scope_type, scope_id, integration_type);
+        let actor_key = format!("{}:{}", scope_id, integration_type);
 
         // Check if already running
-        if self.actors.read().await.contains_key(&actor_key) {
+        if self.running.read().await.contains_key(&actor_key) {
             return CommandResponse::err("Integration already running for this scope");
         }
 
-        // Start the actor
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-        let scope_key = format!("{}:{}", scope_type, scope_id);
+        // Start the integration via IntegrationManager
+        let result = match i_type {
+            IntegrationType::Slack => {
+                let channels: Vec<String> = config["channels"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
 
-        match self.spawn_actor(
-            i_type.clone(),
-            scope_key.clone(),
-            token.to_string(),
-            config.clone(),
-            shutdown_rx,
-        ).await {
-            Ok(_) => {}
-            Err(e) => return CommandResponse::err(e),
+                self.manager.start_slack(
+                    scope_id.to_string(),
+                    token.to_string(),
+                    channels,
+                ).await
+            }
+            IntegrationType::Jira => {
+                let domain = config["domain"].as_str().unwrap_or("").to_string();
+                let email = config["email"].as_str().unwrap_or("").to_string();
+                let projects: Vec<String> = config["projects"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+
+                self.manager.start_jira(
+                    domain,
+                    email,
+                    token.to_string(),
+                    scope_id.to_string(),
+                    projects,
+                ).await
+            }
+            IntegrationType::GitHub => {
+                let repos: Vec<(String, String)> = config["repos"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter().filter_map(|v| {
+                            let owner = v["owner"].as_str()?;
+                            let repo = v["repo"].as_str()?;
+                            Some((owner.to_string(), repo.to_string()))
+                        }).collect()
+                    })
+                    .unwrap_or_default();
+
+                self.manager.start_github(
+                    token.to_string(),
+                    scope_id.to_string(),
+                    repos,
+                ).await
+            }
+            IntegrationType::Confluence => {
+                let domain = config["domain"].as_str().unwrap_or("").to_string();
+                let email = config["email"].as_str().unwrap_or("").to_string();
+                let spaces: Vec<String> = config["spaces"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+
+                self.manager.start_confluence(
+                    domain,
+                    email,
+                    token.to_string(),
+                    scope_id.to_string(),
+                    spaces,
+                ).await
+            }
+            IntegrationType::GoogleDocs => {
+                let document_ids: Vec<String> = config["document_ids"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+
+                self.manager.start_googledocs(
+                    token.to_string(),
+                    scope_id.to_string(),
+                    document_ids,
+                ).await
+            }
+        };
+
+        if let Err(e) = result {
+            return CommandResponse::err(format!("Failed to start integration: {}", e));
         }
 
-        // Store handle
-        self.actors.write().await.insert(actor_key, ActorHandle {
-            shutdown_tx,
-            integration_type: i_type,
+        // Track as running
+        self.running.write().await.insert(actor_key, RunningIntegration {
+            scope_type: scope_type.to_string(),
+            scope_id: scope_id.to_string(),
+            integration_type: i_type.clone(),
         });
 
         // Save binding to DB (no token)
@@ -262,7 +536,7 @@ impl IntegrationBridge {
 
         // Send status event
         let _ = self.event_tx.send(SwiftEvent::IntegrationStatus {
-            scope_id: scope_key,
+            scope_id: format!("{}:{}", scope_type, scope_id),
             integration_type: integration_type.to_string(),
             status: "connected".to_string(),
             message: None,
@@ -272,35 +546,38 @@ impl IntegrationBridge {
     }
 
     async fn cmd_stop(&self, scope_id: &str, integration_type: &str) -> CommandResponse {
-        // Try both scope types
-        let keys = vec![
-            format!("group:{}:{}", scope_id, integration_type),
-            format!("workspace:{}:{}", scope_id, integration_type),
-        ];
+        let actor_key = format!("{}:{}", scope_id, integration_type);
 
-        let mut stopped = false;
-        for key in keys {
-            if let Some(handle) = self.actors.write().await.remove(&key) {
-                let _ = handle.shutdown_tx.send(()).await;
-                stopped = true;
+        // Check if running
+        let was_running = self.running.write().await.remove(&actor_key).is_some();
 
-                // Send status event
-                let _ = self.event_tx.send(SwiftEvent::IntegrationStatus {
-                    scope_id: scope_id.to_string(),
-                    integration_type: integration_type.to_string(),
-                    status: "stopped".to_string(),
-                    message: None,
-                });
-
-                break;
-            }
+        if !was_running {
+            return CommandResponse::err("Integration not running");
         }
 
-        if stopped {
-            CommandResponse::ok()
-        } else {
-            CommandResponse::err("Integration not running")
+        // Stop via IntegrationManager
+        let result = match integration_type {
+            "slack" => self.manager.stop_slack(scope_id).await,
+            "jira" => self.manager.stop_jira(scope_id).await,
+            "github" => self.manager.stop_github(scope_id).await,
+            "confluence" => self.manager.stop_confluence(scope_id).await,
+            "googledocs" => self.manager.stop_googledocs(scope_id).await,
+            _ => Err("Unknown integration type".to_string()),
+        };
+
+        if let Err(e) = result {
+            tracing::warn!("Error stopping integration: {}", e);
         }
+
+        // Send status event
+        let _ = self.event_tx.send(SwiftEvent::IntegrationStatus {
+            scope_id: scope_id.to_string(),
+            integration_type: integration_type.to_string(),
+            status: "stopped".to_string(),
+            message: None,
+        });
+
+        CommandResponse::ok()
     }
 
     async fn cmd_remove_binding(&self, scope_id: &str, integration_type: &str) -> CommandResponse {
@@ -359,104 +636,17 @@ impl IntegrationBridge {
         CommandResponse::ok_with_data(serde_json::json!(bindings))
     }
 
-    async fn cmd_get_events_by_ids(&self, event_ids: &[String]) -> CommandResponse {
-        // This would search through recent events
-        // For now, return empty - events are in Swift's local buffer
-        CommandResponse::ok_with_data(serde_json::json!([]))
-    }
-
     async fn cmd_is_running(&self, scope_id: &str, integration_type: &str) -> CommandResponse {
-        let keys = vec![
-            format!("group:{}:{}", scope_id, integration_type),
-            format!("workspace:{}:{}", scope_id, integration_type),
-        ];
-
-        let running = {
-            let actors = self.actors.read().await;
-            keys.iter().any(|k| actors.contains_key(k))
-        };
+        let actor_key = format!("{}:{}", scope_id, integration_type);
+        let running = self.running.read().await.contains_key(&actor_key);
 
         CommandResponse::ok_with_data(serde_json::json!({ "running": running }))
     }
 
-    // ========================================================================
-    // Actor Spawning
-    // ========================================================================
-
-    async fn spawn_actor(
-        &self,
-        integration_type: IntegrationType,
-        scope_id: String,
-        token: String,
-        config: serde_json::Value,
-        mut shutdown_rx: mpsc::Receiver<()>,
-    ) -> Result<(), String> {
-        let event_tx = self.event_tx.clone();
-
-        match integration_type {
-            IntegrationType::Slack => {
-                let channels: Vec<String> = config["channels"]
-                    .as_array()
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-
-                tokio::spawn(async move {
-                    slack_actor_loop(scope_id, token, channels, event_tx, shutdown_rx).await;
-                });
-            }
-            IntegrationType::Jira => {
-                let domain = config["domain"].as_str().unwrap_or("").to_string();
-                let email = config["email"].as_str().unwrap_or("").to_string();
-                let projects: Vec<String> = config["projects"]
-                    .as_array()
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-
-                tokio::spawn(async move {
-                    jira_actor_loop(scope_id, token, domain, email, projects, event_tx, shutdown_rx).await;
-                });
-            }
-            IntegrationType::GitHub => {
-                let repos: Vec<(String, String)> = config["repos"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter().filter_map(|v| {
-                            let owner = v["owner"].as_str()?;
-                            let repo = v["repo"].as_str()?;
-                            Some((owner.to_string(), repo.to_string()))
-                        }).collect()
-                    })
-                    .unwrap_or_default();
-
-                tokio::spawn(async move {
-                    github_actor_loop(scope_id, token, repos, event_tx, shutdown_rx).await;
-                });
-            }
-            IntegrationType::Confluence => {
-                let domain = config["domain"].as_str().unwrap_or("").to_string();
-                let email = config["email"].as_str().unwrap_or("").to_string();
-                let spaces: Vec<String> = config["spaces"]
-                    .as_array()
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-
-                tokio::spawn(async move {
-                    confluence_actor_loop(scope_id, token, domain, email, spaces, event_tx, shutdown_rx).await;
-                });
-            }
-            IntegrationType::GoogleDocs => {
-                let document_ids: Vec<String> = config["document_ids"]
-                    .as_array()
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-
-                tokio::spawn(async move {
-                    googledocs_actor_loop(scope_id, token, document_ids, event_tx, shutdown_rx).await;
-                });
-            }
-        }
-
-        Ok(())
+    async fn cmd_list_slack_channels(&self, scope_id: &str) -> CommandResponse {
+        // This would require storing the SlackClient reference
+        // For now, return error - channels should be selected during OAuth flow
+        CommandResponse::err("List channels via OAuth flow in Swift, not here")
     }
 
     // ========================================================================
@@ -517,203 +707,64 @@ impl IntegrationBridge {
             "created_at": row.get::<_, i64>(5)?
         }))
     }
-}
 
-// ============================================================================
-// Actor Loops (Replace with actual client implementations)
-// ============================================================================
+    // ========================================================================
+    // App Restart: Restore integrations from bindings
+    // ========================================================================
 
-async fn slack_actor_loop(
-    scope_id: String,
-    token: String,
-    channels: Vec<String>,
-    event_tx: mpsc::UnboundedSender<SwiftEvent>,
-    mut shutdown_rx: mpsc::Receiver<()>,
-) {
-    // TODO: Import and use actual SlackClient from cyan-integrations
-    // let client = SlackClient::new(token);
+    /// Called on app startup to restore integrations.
+    /// Swift must call this with tokens retrieved from Keychain.
+    pub async fn restore_integration(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        integration_type: &str,
+        token: &str,
+    ) -> Result<(), String> {
+        // Get binding from DB
+        let config = {
+            let db = self.db.lock().unwrap();
+            let config_str: Option<String> = db.query_row(
+                "SELECT config_json FROM integration_bindings WHERE scope_id = ?1 AND integration_type = ?2",
+                params![scope_id, integration_type],
+                |row| row.get(0),
+            ).ok();
 
-    let mut interval = tokio::time::interval(Duration::from_secs(30));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                // Poll Slack for each channel
-                for channel in &channels {
-                    // TODO: Actual polling logic
-                    // let messages = client.get_messages(channel, ...).await;
-                    // for msg in messages {
-                    //     let _ = event_tx.send(SwiftEvent::IntegrationEvent {
-                    //         id: generate_event_id(&msg),
-                    //         scope_id: scope_id.clone(),
-                    //         source: "slack".to_string(),
-                    //         summary: format_slack_summary(&msg),
-                    //         context: format!("#{}", channel_name),
-                    //         url: Some(msg.permalink),
-                    //         ts: msg.ts,
-                    //     });
-                    // }
-
-                    tracing::debug!("Polling Slack channel {} for scope {}", channel, scope_id);
-                }
+            match config_str {
+                Some(s) => serde_json::from_str(&s).unwrap_or(serde_json::json!({})),
+                None => return Err("Binding not found".to_string()),
             }
-            _ = shutdown_rx.recv() => {
-                tracing::info!("Slack actor shutting down for {}", scope_id);
-                break;
-            }
+        };
+
+        // Start the integration
+        let cmd_json = serde_json::json!({
+            "cmd": "start",
+            "scope_type": scope_type,
+            "scope_id": scope_id,
+            "integration_type": integration_type,
+            "token": token,
+            "config": config,
+        });
+
+        let response = self.handle_command(&cmd_json.to_string()).await;
+        let parsed: CommandResponse = serde_json::from_str(&response).map_err(|e| e.to_string())?;
+
+        if parsed.success {
+            Ok(())
+        } else {
+            Err(parsed.error.unwrap_or("Unknown error".to_string()))
         }
     }
 }
 
-async fn jira_actor_loop(
-    scope_id: String,
-    token: String,
-    domain: String,
-    email: String,
-    projects: Vec<String>,
-    event_tx: mpsc::UnboundedSender<SwiftEvent>,
-    mut shutdown_rx: mpsc::Receiver<()>,
-) {
-    // TODO: Import and use actual JiraClient from cyan-integrations
-    // let client = JiraClient::new(domain, email, token);
-
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                for project in &projects {
-                    // TODO: Actual polling logic
-                    // let issues = client.search_issues(&format!("project = {}", project)).await;
-                    // for issue in issues {
-                    //     let _ = event_tx.send(SwiftEvent::IntegrationEvent {
-                    //         id: generate_event_id(&issue),
-                    //         scope_id: scope_id.clone(),
-                    //         source: "jira".to_string(),
-                    //         summary: format!("{} {}", issue.key, issue.fields.summary),
-                    //         context: format!("@{}", issue.fields.assignee),
-                    //         url: Some(issue.url),
-                    //         ts: issue.updated_ts,
-                    //     });
-                    // }
-
-                    tracing::debug!("Polling Jira project {} for scope {}", project, scope_id);
-                }
-            }
-            _ = shutdown_rx.recv() => {
-                tracing::info!("Jira actor shutting down for {}", scope_id);
-                break;
-            }
-        }
+// Put this somewhere common, maybe in lib.rs or a utils module
+pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
     }
-}
-
-async fn github_actor_loop(
-    scope_id: String,
-    token: String,
-    repos: Vec<(String, String)>,
-    event_tx: mpsc::UnboundedSender<SwiftEvent>,
-    mut shutdown_rx: mpsc::Receiver<()>,
-) {
-    // TODO: Import and use actual GitHubClient from cyan-integrations
-    // let client = GitHubClient::new(token);
-
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                for (owner, repo) in &repos {
-                    // TODO: Actual polling logic
-                    // let commits = client.list_commits(owner, repo, None).await;
-                    // for commit in commits {
-                    //     let _ = event_tx.send(SwiftEvent::IntegrationEvent {
-                    //         id: commit.sha.clone(),
-                    //         scope_id: scope_id.clone(),
-                    //         source: "github".to_string(),
-                    //         summary: commit.commit.message.lines().next().unwrap_or(""),
-                    //         context: format!("PR #{}", pr_number),
-                    //         url: Some(commit.html_url),
-                    //         ts: commit.ts,
-                    //     });
-                    // }
-
-                    tracing::debug!("Polling GitHub repo {}/{} for scope {}", owner, repo, scope_id);
-                }
-            }
-            _ = shutdown_rx.recv() => {
-                tracing::info!("GitHub actor shutting down for {}", scope_id);
-                break;
-            }
-        }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
     }
-}
-
-async fn confluence_actor_loop(
-    scope_id: String,
-    token: String,
-    domain: String,
-    email: String,
-    spaces: Vec<String>,
-    event_tx: mpsc::UnboundedSender<SwiftEvent>,
-    mut shutdown_rx: mpsc::Receiver<()>,
-) {
-    // TODO: Import and use actual ConfluenceClient from cyan-integrations
-    // let client = ConfluenceClient::new(domain, email, token);
-
-    let mut interval = tokio::time::interval(Duration::from_secs(120));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                for space in &spaces {
-                    // TODO: Actual polling logic
-                    tracing::debug!("Polling Confluence space {} for scope {}", space, scope_id);
-                }
-            }
-            _ = shutdown_rx.recv() => {
-                tracing::info!("Confluence actor shutting down for {}", scope_id);
-                break;
-            }
-        }
-    }
-}
-
-async fn googledocs_actor_loop(
-    scope_id: String,
-    token: String,
-    document_ids: Vec<String>,
-    event_tx: mpsc::UnboundedSender<SwiftEvent>,
-    mut shutdown_rx: mpsc::Receiver<()>,
-) {
-    // TODO: Import and use actual GoogleDocsClient from cyan-integrations
-    // let client = GoogleDocsClient::new(token);
-
-    let mut interval = tokio::time::interval(Duration::from_secs(120));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                for doc_id in &document_ids {
-                    // TODO: Actual polling logic
-                    tracing::debug!("Polling Google Doc {} for scope {}", doc_id, scope_id);
-                }
-            }
-            _ = shutdown_rx.recv() => {
-                tracing::info!("Google Docs actor shutting down for {}", scope_id);
-                break;
-            }
-        }
-    }
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    &s[..end]
 }
