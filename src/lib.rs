@@ -475,6 +475,9 @@ impl CyanSystem {
             event_tx.clone(),
         ));
 
+        // Start background task to forward integration events to Swift
+        integration_bridge.start_event_forwarder();
+
         let system = Self {
             node_id: node_id.clone(),
             secret_key: secret_key.clone(),
@@ -2238,6 +2241,18 @@ struct TreeSnapshotDTO {
     whiteboards: Vec<WhiteboardDTO>,
     files: Vec<FileDTO>,
     chats: Vec<ChatDTO>,
+    #[serde(default)]
+    integrations: Vec<IntegrationBindingDTO>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IntegrationBindingDTO {
+    id: String,
+    scope_type: String,
+    scope_id: String,
+    integration_type: String,
+    config: serde_json::Value,
+    created_at: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2405,13 +2420,41 @@ fn build_group_snapshot(db: &Arc<Mutex<Connection>>, group_id: &str) -> Result<T
         vec![]
     };
 
-    Ok(TreeSnapshotDTO {
+    let integrations: Vec<IntegrationBindingDTO> = {
+        match db.prepare(
+            "SELECT id, scope_type, scope_id, integration_type, config_json, created_at
+             FROM integration_bindings ORDER BY created_at"
+        ) {
+            Ok(mut stmt) => {
+                stmt.query_map([], |r| {
+                    let config_str: String = r.get(4)?;
+                    let config = serde_json::from_str(&config_str).unwrap_or(serde_json::Value::Null);
+                    Ok(IntegrationBindingDTO {
+                        id: r.get(0)?,
+                        scope_type: r.get(1)?,
+                        scope_id: r.get(2)?,
+                        integration_type: r.get(3)?,
+                        config,
+                        created_at: r.get(5)?,
+                    })
+                }).unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            }
+            Err(_) => vec![], // Table doesn't exist yet
+        }
+    };
+    let group_clone = group.name.clone();
+    let snapshot = TreeSnapshotDTO {
         groups: vec![group],
         workspaces,
         whiteboards,
         files,
         chats,
-    })
+        integrations,
+    };
+    tracing::info!("snapshot {snapshot:?} built for group : {group_clone:?}");
+    Ok(snapshot)
 }
 
 fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
@@ -2502,12 +2545,38 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
         rows.filter_map(Result::ok).collect()
     };
 
+    let integrations: Vec<IntegrationBindingDTO> = {
+        match db.prepare(
+            "SELECT id, scope_type, scope_id, integration_type, config_json, created_at
+             FROM integration_bindings ORDER BY created_at"
+        ) {
+            Ok(mut stmt) => {
+                stmt.query_map([], |r| {
+                    let config_str: String = r.get(4)?;
+                    let config = serde_json::from_str(&config_str).unwrap_or(serde_json::Value::Null);
+                    Ok(IntegrationBindingDTO {
+                        id: r.get(0)?,
+                        scope_type: r.get(1)?,
+                        scope_id: r.get(2)?,
+                        integration_type: r.get(3)?,
+                        config,
+                        created_at: r.get(5)?,
+                    })
+                }).unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            }
+            Err(_) => vec![], // Table doesn't exist yet
+        }
+    };
+
     let snapshot = TreeSnapshotDTO {
         groups,
         workspaces,
         whiteboards,
         files,
         chats,
+        integrations,
     };
     serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
 }
@@ -3931,4 +4000,13 @@ pub extern "C" fn cyan_integration_command(json: *const c_char) -> *mut c_char {
     CString::new(result).unwrap_or_else(|_| {
         CString::new(r#"{"success":false,"error":"CString conversion failed"}"#).unwrap()
     }).into_raw()
+}
+
+/// Poll for integration events (uses same buffer as cyan_poll_events)
+/// Returns integration events only, filtering out other event types
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_poll_integration_events() -> *mut c_char {
+    // Integration events flow through the same event_tx channel
+    // Just use the main poll for now - Swift will filter by event type
+    cyan_poll_events(std::ptr::null())
 }

@@ -675,8 +675,6 @@ dependencies = [
 [[package]]
 name = "cyan-backend-integrations"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e16e94ccce3478569a22f8f54f0d44d60e577aa638edf023f2a588287fa38dc9"
 dependencies = [
  "blake3",
  "chrono",
