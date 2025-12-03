@@ -1,7 +1,17 @@
 // src/lib.rs
 #![allow(clippy::too_many_arguments)]
 
-extern crate core;
+extern crate core; // Re-export xaeroid FFI functions for Swift
+mod xaero_ffi {
+    pub use xaeroid::xaero_create_pass_json;
+    pub use xaeroid::xaero_create_pass_with_profile;
+    pub use xaeroid::xaero_derive_identity;
+    pub use xaeroid::xaero_free_string;
+    pub use xaeroid::xaero_generate_json;
+    pub use xaeroid::xaero_sign_with_key;
+}
+pub use xaero_ffi::*;
+
 mod integration_bridge;
 pub use integration_bridge::IntegrationBridge;
 
@@ -19,6 +29,7 @@ use iroh_gossip::{
 };
 use once_cell::sync::OnceCell;
 use rand_chacha::rand_core::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -467,12 +478,24 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 }
 
 impl CyanSystem {
-    async fn new(db_path: String) -> Result<Self> {
-        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
-        );
-        let secret_key = SecretKey::generate(&mut rng);
+    /// Create system with optional provided secret_key.
+    /// If None, generates ephemeral key (for testing - different each launch).
+    /// If Some, uses provided key from Swift Keychain (persistent identity).
+    async fn new(db_path: String, provided_secret_key: Option<[u8; 32]>) -> Result<Self> {
+        let secret_key = match provided_secret_key {
+            Some(bytes) => {
+                // Use provided key from Swift Keychain - persistent identity
+                SecretKey::from_bytes(&bytes)
+            }
+            None => {
+                // Ephemeral key for testing - DIFFERENT EVERY LAUNCH
+                let mut rng = ChaCha8Rng::from_os_rng();
+                SecretKey::generate(&mut rng)
+            }
+        };
         let node_id = secret_key.public().to_string();
+
+        println!("🔑 Node ID: {} (persistent={})", &node_id[..16], provided_secret_key.is_some());
 
         let db = Connection::open(db_path)?;
         ensure_schema(&db)?;
@@ -2697,6 +2720,8 @@ pub extern "C" fn cyan_set_discovery_key(key: *const c_char) -> bool {
     DISCOVERY_KEY.set(s).is_ok()
 }
 
+/// Initialize Cyan with ephemeral identity (for testing).
+/// Different NodeID each launch - use for P2P mesh testing.
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
     if SYSTEM.get().is_some() {
@@ -2714,15 +2739,94 @@ pub extern "C" fn cyan_init(db_path: *const c_char) -> bool {
         RUNTIME.set(runtime).ok();
 
         let rt = RUNTIME.get().unwrap();
-        let sys = rt.block_on(async { CyanSystem::new(path).await });
+        // Pass None for ephemeral identity (test mode)
+        let sys = rt.block_on(async { CyanSystem::new(path, None).await });
 
         match sys {
             Ok(s) => {
-                println!("Cyan initialized with ID: {}", s.node_id);
+                println!("⚠️ Cyan initialized (EPHEMERAL) with ID: {}", &s.node_id[..16]);
                 SYSTEM.set(Arc::new(s)).is_ok()
             }
             Err(e) => {
                 eprintln!("Failed init: {e}");
+                false
+            }
+        }
+    }).join();
+
+    res.unwrap_or(false)
+}
+
+/// Initialize Cyan with persistent identity from Swift Keychain.
+/// Same NodeID across app launches - use for production.
+/// secret_key_hex: 64-character hex string (32 bytes)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_init_with_identity(
+    db_path: *const c_char,
+    secret_key_hex: *const c_char,
+) -> bool {
+    if SYSTEM.get().is_some() {
+        return true;
+    }
+
+    // Parse db_path
+    let path = unsafe {
+        if db_path.is_null() {
+            eprintln!("Database path is null");
+            return false;
+        }
+        CStr::from_ptr(db_path).to_string_lossy().to_string()
+    };
+
+    // Parse secret_key_hex
+    let secret_key_bytes: [u8; 32] = unsafe {
+        if secret_key_hex.is_null() {
+            eprintln!("Secret key is null");
+            return false;
+        }
+        let hex_str = match CStr::from_ptr(secret_key_hex).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Invalid secret key UTF-8");
+                return false;
+            }
+        };
+
+        let bytes = match hex::decode(hex_str) {
+            Ok(b) if b.len() == 32 => b,
+            Ok(b) => {
+                eprintln!("Secret key must be 32 bytes, got {}", b.len());
+                return false;
+            }
+            Err(e) => {
+                eprintln!("Invalid secret key hex: {e}");
+                return false;
+            }
+        };
+
+        bytes.try_into().unwrap()
+    };
+
+    let res = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        RUNTIME.set(runtime).ok();
+
+        let rt = RUNTIME.get().unwrap();
+        let sys = rt.block_on(async {
+            CyanSystem::new(path, Some(secret_key_bytes)).await
+        });
+
+        match sys {
+            Ok(s) => {
+                println!("✅ Cyan initialized (PERSISTENT) with ID: {}", &s.node_id[..16]);
+                SYSTEM.set(Arc::new(s)).is_ok()
+            }
+            Err(e) => {
+                eprintln!("Failed init with identity: {e}");
                 false
             }
         }
