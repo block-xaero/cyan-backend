@@ -200,6 +200,37 @@ pub enum NetworkEvent {
     WhiteboardCleared {
         board_id: String,
     },
+    // ---- Notebook cell events ----
+    NotebookCellAdded {
+        id: String,
+        board_id: String,
+        cell_type: String,
+        cell_order: i32,
+        content: Option<String>,
+    },
+    NotebookCellUpdated {
+        id: String,
+        board_id: String,
+        cell_type: String,
+        cell_order: i32,
+        content: Option<String>,
+        output: Option<String>,
+        collapsed: bool,
+        height: Option<f64>,
+        metadata_json: Option<String>,
+    },
+    NotebookCellDeleted {
+        id: String,
+        board_id: String,
+    },
+    NotebookCellsReordered {
+        board_id: String,
+        cell_ids: Vec<String>,
+    },
+    BoardModeChanged {
+        board_id: String,
+        mode: String,
+    },
 }
 
 // ---------- Internal commands ----------
@@ -452,6 +483,21 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             FOREIGN KEY(board_id) REFERENCES objects(id)
         );
         CREATE INDEX IF NOT EXISTS idx_whiteboard_elements_board ON whiteboard_elements(board_id);
+        CREATE TABLE IF NOT EXISTS notebook_cells (
+            id TEXT PRIMARY KEY,
+            board_id TEXT NOT NULL,
+            cell_type TEXT NOT NULL,
+            cell_order INTEGER NOT NULL,
+            content TEXT,
+            output TEXT,
+            collapsed INTEGER DEFAULT 0,
+            height REAL,
+            metadata_json TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY(board_id) REFERENCES objects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_notebook_cells_order ON notebook_cells(board_id, cell_order);
         "#,
     )?;
     Ok(())
@@ -473,6 +519,16 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     if conn.prepare("SELECT local_path FROM objects LIMIT 1").is_err() {
         tracing::info!("Migration: adding local_path column");
         let _ = conn.execute("ALTER TABLE objects ADD COLUMN local_path TEXT", []);
+    }
+    // Check and add cell_id column to whiteboard_elements
+    if conn.prepare("SELECT cell_id FROM whiteboard_elements LIMIT 1").is_err() {
+        tracing::info!("Migration: adding cell_id column to whiteboard_elements");
+        let _ = conn.execute("ALTER TABLE whiteboard_elements ADD COLUMN cell_id TEXT", []);
+    }
+    // Check and add board_mode column to objects
+    if conn.prepare("SELECT board_mode FROM objects LIMIT 1").is_err() {
+        tracing::info!("Migration: adding board_mode column to objects");
+        let _ = conn.execute("ALTER TABLE objects ADD COLUMN board_mode TEXT DEFAULT 'freeform'", []);
     }
     Ok(())
 }
@@ -1578,6 +1634,81 @@ impl NetworkActor {
                                                 let _ = db.execute(
                                                     "DELETE FROM whiteboard_elements WHERE board_id=?1",
                                                     params![board_id],
+                                                );
+                                            }
+                                            // ---- Notebook cell events ----
+                                            NetworkEvent::NotebookCellAdded {
+                                                id,
+                                                board_id,
+                                                cell_type,
+                                                cell_order,
+                                                content,
+                                            } => {
+                                                let db = db.lock().unwrap();
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs() as i64)
+                                                    .unwrap_or(0);
+                                                let _ = db.execute(
+                                                    "INSERT OR IGNORE INTO notebook_cells
+                                                     (id, board_id, cell_type, cell_order, content, created_at, updated_at)
+                                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                                    params![id, board_id, cell_type, cell_order, content, now, now],
+                                                );
+                                            }
+                                            NetworkEvent::NotebookCellUpdated {
+                                                id,
+                                                board_id: _,
+                                                cell_type,
+                                                cell_order,
+                                                content,
+                                                output,
+                                                collapsed,
+                                                height,
+                                                metadata_json,
+                                            } => {
+                                                let db = db.lock().unwrap();
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs() as i64)
+                                                    .unwrap_or(0);
+                                                let _ = db.execute(
+                                                    "UPDATE notebook_cells SET
+                                                     cell_type=?2, cell_order=?3, content=?4, output=?5,
+                                                     collapsed=?6, height=?7, metadata_json=?8, updated_at=?9
+                                                     WHERE id=?1",
+                                                    params![
+                                                        id, cell_type, cell_order, content, output,
+                                                        *collapsed as i32, height, metadata_json, now
+                                                    ],
+                                                );
+                                            }
+                                            NetworkEvent::NotebookCellDeleted { id, board_id: _ } => {
+                                                let db = db.lock().unwrap();
+                                                let _ = db.execute(
+                                                    "DELETE FROM notebook_cells WHERE id=?1",
+                                                    params![id],
+                                                );
+                                            }
+                                            NetworkEvent::NotebookCellsReordered { board_id, cell_ids } => {
+                                                let db = db.lock().unwrap();
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs() as i64)
+                                                    .unwrap_or(0);
+                                                for (idx, cell_id) in cell_ids.iter().enumerate() {
+                                                    let _ = db.execute(
+                                                        "UPDATE notebook_cells SET cell_order=?1, updated_at=?2
+                                                         WHERE id=?3 AND board_id=?4",
+                                                        params![idx as i32, now, cell_id, board_id],
+                                                    );
+                                                }
+                                            }
+                                            NetworkEvent::BoardModeChanged { board_id, mode } => {
+                                                let db = db.lock().unwrap();
+                                                let _ = db.execute(
+                                                    "UPDATE objects SET board_mode=?1 WHERE id=?2",
+                                                    params![mode, board_id],
                                                 );
                                             }
                                         }
@@ -4156,5 +4287,389 @@ pub extern "C" fn cyan_poll_integration_events() -> *mut c_char {
             tracing::error!("failed to lock integration buffer due to {e:?}");
             std::ptr::null_mut()
         }
+    }
+}
+
+// ==================== NOTEBOOK CELLS FFI ====================
+
+/// Load all notebook cells for a board, ordered by cell_order
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_load_notebook_cells(board_id: *const c_char) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+
+    let cells: Vec<serde_json::Value> = {
+        let db = sys.db.lock().unwrap();
+
+        let mut stmt = match db.prepare(
+            "SELECT id, board_id, cell_type, cell_order, content, output,
+                    collapsed, height, metadata_json, created_at, updated_at
+             FROM notebook_cells
+             WHERE board_id = ?1
+             ORDER BY cell_order ASC"
+        ) {
+            Ok(s) => s,
+            Err(_) => return CString::new("[]").unwrap().into_raw(),
+        };
+
+        stmt.query_map(params![bid], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "board_id": row.get::<_, String>(1)?,
+                "cell_type": row.get::<_, String>(2)?,
+                "cell_order": row.get::<_, i32>(3)?,
+                "content": row.get::<_, Option<String>>(4)?,
+                "output": row.get::<_, Option<String>>(5)?,
+                "collapsed": row.get::<_, i32>(6)? != 0,
+                "height": row.get::<_, Option<f64>>(7)?,
+                "metadata_json": row.get::<_, Option<String>>(8)?,
+                "created_at": row.get::<_, i64>(9)?,
+                "updated_at": row.get::<_, i64>(10)?
+            }))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    };
+
+    match serde_json::to_string(&cells) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => CString::new("[]").unwrap().into_raw(),
+    }
+}
+
+/// Save (insert or update) a notebook cell
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_save_notebook_cell(cell_json: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let json_str = unsafe { CStr::from_ptr(cell_json) }.to_string_lossy().to_string();
+
+    let Ok(cell) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+        return false;
+    };
+
+    let id = cell["id"].as_str().unwrap_or("").to_string();
+    let board_id = cell["board_id"].as_str().unwrap_or("").to_string();
+    let cell_type = cell["cell_type"].as_str().unwrap_or("markdown").to_string();
+    let cell_order = cell["cell_order"].as_i64().unwrap_or(0) as i32;
+    let content = cell["content"].as_str().map(|s| s.to_string());
+    let output = cell["output"].as_str().map(|s| s.to_string());
+    let collapsed = cell["collapsed"].as_bool().unwrap_or(false);
+    let height = cell["height"].as_f64();
+    let metadata_json = cell["metadata_json"].as_str().map(|s| s.to_string());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let created_at = cell["created_at"].as_i64().unwrap_or(now);
+    let updated_at = now;
+
+    if id.is_empty() || board_id.is_empty() {
+        return false;
+    }
+
+    let is_new: bool;
+    let group_id: String;
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        // Check if exists
+        is_new = db.query_row(
+            "SELECT 1 FROM notebook_cells WHERE id = ?1",
+            params![&id],
+            |_| Ok(())
+        ).is_err();
+
+        // Get group_id via board -> workspace -> group
+        group_id = db.query_row(
+            "SELECT w.group_id FROM objects o
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE o.id = ?1",
+            params![&board_id],
+            |row| row.get(0)
+        ).unwrap_or_default();
+
+        // Insert or replace
+        let result = db.execute(
+            "INSERT OR REPLACE INTO notebook_cells
+             (id, board_id, cell_type, cell_order, content, output, collapsed, height, metadata_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![&id, &board_id, &cell_type, cell_order, &content, &output, collapsed as i32, height, &metadata_json, created_at, updated_at]
+        );
+
+        if result.is_err() {
+            return false;
+        }
+    }
+
+    // Broadcast via gossip
+    if !group_id.is_empty() {
+        let event = if is_new {
+            NetworkEvent::NotebookCellAdded {
+                id: id.clone(),
+                board_id: board_id.clone(),
+                cell_type,
+                cell_order,
+                content,
+            }
+        } else {
+            NetworkEvent::NotebookCellUpdated {
+                id: id.clone(),
+                board_id: board_id.clone(),
+                cell_type,
+                cell_order,
+                content,
+                output,
+                collapsed,
+                height,
+                metadata_json,
+            }
+        };
+
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id,
+            event,
+        });
+    }
+
+    true
+}
+
+/// Delete a notebook cell
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_delete_notebook_cell(cell_id: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let cid = unsafe { CStr::from_ptr(cell_id) }.to_string_lossy().to_string();
+
+    let board_id: String;
+    let group_id: String;
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        // Get board_id and group_id before delete
+        let ids: Option<(String, String)> = db.query_row(
+            "SELECT c.board_id, w.group_id
+             FROM notebook_cells c
+             JOIN objects o ON c.board_id = o.id
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE c.id = ?1",
+            params![&cid],
+            |row| Ok((row.get(0)?, row.get(1)?))
+        ).ok();
+
+        let Some((bid, gid)) = ids else {
+            return false;
+        };
+        board_id = bid;
+        group_id = gid;
+
+        // Also clear cell_id from any whiteboard_elements belonging to this cell
+        let _ = db.execute(
+            "UPDATE whiteboard_elements SET cell_id = NULL WHERE cell_id = ?1",
+            params![&cid]
+        );
+
+        // Delete the cell
+        if db.execute("DELETE FROM notebook_cells WHERE id = ?1", params![&cid]).is_err() {
+            return false;
+        }
+    }
+
+    // Broadcast deletion
+    if !group_id.is_empty() {
+        let event = NetworkEvent::NotebookCellDeleted {
+            id: cid.clone(),
+            board_id: board_id.clone(),
+        };
+
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id,
+            event,
+        });
+    }
+
+    true
+}
+
+/// Reorder cells within a board
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_reorder_notebook_cells(board_id: *const c_char, cell_ids_json: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+    let json_str = unsafe { CStr::from_ptr(cell_ids_json) }.to_string_lossy().to_string();
+
+    let Ok(cell_ids) = serde_json::from_str::<Vec<String>>(&json_str) else {
+        return false;
+    };
+
+    let group_id: String;
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        group_id = db.query_row(
+            "SELECT w.group_id FROM objects o
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE o.id = ?1",
+            params![&bid],
+            |row| row.get(0)
+        ).unwrap_or_default();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        for (idx, cell_id) in cell_ids.iter().enumerate() {
+            let _ = db.execute(
+                "UPDATE notebook_cells SET cell_order = ?1, updated_at = ?2 WHERE id = ?3 AND board_id = ?4",
+                params![idx as i32, now, cell_id, &bid]
+            );
+        }
+    }
+
+    if !group_id.is_empty() {
+        let event = NetworkEvent::NotebookCellsReordered {
+            board_id: bid.clone(),
+            cell_ids: cell_ids.clone(),
+        };
+
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id,
+            event,
+        });
+    }
+
+    true
+}
+
+/// Get board mode (freeform or notebook)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_board_mode(board_id: *const c_char) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("freeform").unwrap().into_raw();
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+
+    let mode: String = {
+        let db = sys.db.lock().unwrap();
+        db.query_row(
+            "SELECT COALESCE(board_mode, 'freeform') FROM objects WHERE id = ?1",
+            params![bid],
+            |row| row.get(0)
+        ).unwrap_or_else(|_| "freeform".to_string())
+    };
+
+    CString::new(mode).unwrap().into_raw()
+}
+
+/// Set board mode (freeform or notebook)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_set_board_mode(board_id: *const c_char, mode: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+    let mode_str = unsafe { CStr::from_ptr(mode) }.to_string_lossy().to_string();
+
+    if mode_str != "freeform" && mode_str != "notebook" {
+        return false;
+    }
+
+    let group_id: String;
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        group_id = db.query_row(
+            "SELECT w.group_id FROM objects o
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE o.id = ?1",
+            params![&bid],
+            |row| row.get(0)
+        ).unwrap_or_default();
+
+        if db.execute(
+            "UPDATE objects SET board_mode = ?1 WHERE id = ?2",
+            params![&mode_str, &bid]
+        ).is_err() {
+            return false;
+        }
+    }
+
+    if !group_id.is_empty() {
+        let event = NetworkEvent::BoardModeChanged {
+            board_id: bid.clone(),
+            mode: mode_str.clone(),
+        };
+
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id,
+            event,
+        });
+    }
+
+    true
+}
+
+/// Load whiteboard elements for a specific cell (canvas cells)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_load_cell_elements(cell_id: *const c_char) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    let cid = unsafe { CStr::from_ptr(cell_id) }.to_string_lossy().to_string();
+
+    let elements: Vec<serde_json::Value> = {
+        let db = sys.db.lock().unwrap();
+
+        let mut stmt = match db.prepare(
+            "SELECT id, board_id, element_type, x, y, width, height, z_index,
+                    style_json, content_json, created_at, updated_at, cell_id
+             FROM whiteboard_elements
+             WHERE cell_id = ?1
+             ORDER BY z_index ASC, created_at ASC"
+        ) {
+            Ok(s) => s,
+            Err(_) => return CString::new("[]").unwrap().into_raw(),
+        };
+
+        stmt.query_map(params![cid], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "board_id": row.get::<_, String>(1)?,
+                "element_type": row.get::<_, String>(2)?,
+                "x": row.get::<_, f64>(3)?,
+                "y": row.get::<_, f64>(4)?,
+                "width": row.get::<_, f64>(5)?,
+                "height": row.get::<_, f64>(6)?,
+                "z_index": row.get::<_, i32>(7)?,
+                "style_json": row.get::<_, Option<String>>(8)?,
+                "content_json": row.get::<_, Option<String>>(9)?,
+                "created_at": row.get::<_, i64>(10)?,
+                "updated_at": row.get::<_, i64>(11)?,
+                "cell_id": row.get::<_, Option<String>>(12)?
+            }))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    };
+
+    match serde_json::to_string(&elements) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => CString::new("[]").unwrap().into_raw(),
     }
 }
