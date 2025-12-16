@@ -13,7 +13,11 @@ mod xaero_ffi {
 pub use xaero_ffi::*;
 
 mod integration_bridge;
+
 pub use integration_bridge::IntegrationBridge;
+
+mod ai_bridge;
+pub use ai_bridge::AIBridge;
 
 use crate::NetworkCommand::RequestSnapshot;
 use anyhow::{anyhow, Result};
@@ -400,6 +404,10 @@ pub enum SwiftEvent {
         scope_id: String,
         graph_json: String,  // Serialized IntegrationGraph from integration_bridge
     },
+    /// AI proactive insight generated
+    AIInsight {
+        insight_json: String,
+    },
 }
 
 impl SwiftEvent {
@@ -408,6 +416,7 @@ impl SwiftEvent {
         matches!(
             self,
             SwiftEvent::IntegrationEvent { .. }
+                | SwiftEvent::AIInsight { .. }
                 | SwiftEvent::IntegrationStatus { .. }
                 | SwiftEvent::IntegrationGraph { .. }
         )
@@ -430,6 +439,8 @@ pub struct CyanSystem {
     pub peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>>,
     /// Integration bridge for managing external integrations
     pub integration_bridge: Arc<IntegrationBridge>,
+    /// AI bridge for XaeroAI integration
+    pub ai_bridge: Arc<AIBridge>,
 }
 
 fn ensure_schema(conn: &Connection) -> Result<()> {
@@ -577,6 +588,13 @@ impl CyanSystem {
             event_tx.clone(),
         ));
 
+        // Create AI bridge
+        let ai_bridge = Arc::new(AIBridge::new(
+            db_arc.clone(),
+            event_tx.clone(),
+        ));
+        ai_bridge.start_insight_generator();
+
         // Start background task to forward integration events to Swift
         integration_bridge.start_event_forwarder();
 
@@ -591,6 +609,7 @@ impl CyanSystem {
             db: db_arc,
             peers_per_group,
             integration_bridge,
+            ai_bridge,
         };
 
         let db_clone = system.db.clone();
@@ -4290,6 +4309,10 @@ pub extern "C" fn cyan_poll_integration_events() -> *mut c_char {
     }
 }
 
+// ==================== AI FFI ====================
+
+
+
 // ==================== NOTEBOOK CELLS FFI ====================
 
 /// Load all notebook cells for a board, ordered by cell_order
@@ -4671,5 +4694,63 @@ pub extern "C" fn cyan_load_cell_elements(cell_id: *const c_char) -> *mut c_char
     match serde_json::to_string(&elements) {
         Ok(json) => CString::new(json).unwrap().into_raw(),
         Err(_) => CString::new("[]").unwrap().into_raw(),
+    }
+}
+
+// AI Bridge FFI Exports
+
+/// Handle AI commands via JSON
+/// Commands: initialize, image_to_mermaid, ask_analyst, feed_event,
+///           set_proactive, register_model, unload_model, infer_model, list_models
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_ai_command(json: *const c_char) -> *mut c_char {
+    let cmd_json = match unsafe { CStr::from_ptr(json) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            return CString::new(r#"{"success":false,"error":"Invalid UTF-8"}"#)
+                .unwrap()
+                .into_raw();
+        }
+    };
+
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new(r#"{"success":false,"error":"System not initialized"}"#)
+            .unwrap()
+            .into_raw();
+    };
+
+    let Some(runtime) = RUNTIME.get() else {
+        return CString::new(r#"{"success":false,"error":"Runtime not initialized"}"#)
+            .unwrap()
+            .into_raw();
+    };
+
+    let result = runtime.block_on(async { sys.ai_bridge.handle_command(&cmd_json).await });
+
+    CString::new(result)
+        .unwrap_or_else(|_| {
+            CString::new(r#"{"success":false,"error":"CString conversion failed"}"#).unwrap()
+        })
+        .into_raw()
+}
+
+/// Poll for AI events (proactive insights for ConsoleView)
+/// Returns JSON string or null if no events pending
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_poll_ai_events() -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+
+    let Some(runtime) = RUNTIME.get() else {
+        return std::ptr::null_mut();
+    };
+
+    match runtime.block_on(sys.ai_bridge.poll_insights()) {
+        Some(insight) => match serde_json::to_string(&insight) {
+            Ok(json) => CString::new(json).unwrap().into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
     }
 }
