@@ -1,116 +1,176 @@
-#!/bin/bash
+#!/bin/zsh
 
-# build-universal.sh
-# Builds Cyan backend for all Apple platforms and creates XCFramework
+# build_static_lib.sh
+# Uses ONLY Apple's system clang - avoids Homebrew LLVM ABI issues
+# Run from cyan-backend directory
 
-set -e  # Exit on error
+set -e
+setopt +o nomatch
 
-echo "🦀 Building Cyan Backend for all Apple platforms..."
+# =============================================================================
+# Re-link LLVM on exit (success or failure)
+# =============================================================================
+trap 'echo "🔧 Re-linking Homebrew LLVM..."; brew link llvm 2>/dev/null || true' EXIT
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+echo "🦀 Building Cyan Backend XCFramework (Apple Clang)..."
 
-# Check if required targets are installed
+# =============================================================================
+# Unlink Homebrew LLVM to avoid ABI conflicts
+# =============================================================================
+echo "🔧 Unlinking Homebrew LLVM..."
+brew unlink llvm 2>/dev/null || true
+
+# =============================================================================
+# CRITICAL: Use Apple's system clang, NOT Homebrew LLVM
+# =============================================================================
+
+# Unset any Homebrew LLVM environment variables
+unset CC
+unset CXX
+unset AR
+unset LIBCLANG_PATH
+unset CXXFLAGS
+unset LDFLAGS
+unset CMAKE_CXX_FLAGS
+
+# Force Apple's system clang
+export CC=/usr/bin/clang
+export CXX=/usr/bin/clang++
+export AR=/usr/bin/ar
+
+# Use Xcode's LIBCLANG for bindgen
+export LIBCLANG_PATH="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+
+# Deployment targets
+export MACOSX_DEPLOYMENT_TARGET=14.0
+export IPHONEOS_DEPLOYMENT_TARGET=17.0
+
+echo "🔧 Using Apple System Clang:"
+echo "   CC:  $CC"
+echo "   CXX: $CXX"
+echo "   LIBCLANG_PATH: $LIBCLANG_PATH"
+$CC --version | head -1
+
+# =============================================================================
+# Clean everything - CRITICAL for ABI fix
+# =============================================================================
+
+echo "🧹 Nuclear clean of all build artifacts..."
+
+cargo clean
+
+# Remove llama-cpp from cargo cache
+rm -rf ~/.cargo/registry/cache/*/llama-cpp-* 2>/dev/null || true
+rm -rf ~/.cargo/git/checkouts/llama-cpp-* 2>/dev/null || true
+
+# Clean build directory
+rm -rf ./build
+mkdir -p ./build
+
+echo "✓ Clean complete"
+
+# =============================================================================
+# Check Rust targets
+# =============================================================================
+
 check_target() {
     if ! rustup target list --installed | grep -q "$1"; then
-        echo -e "${YELLOW}Installing target: $1${NC}"
+        echo "Installing target: $1"
         rustup target add "$1"
     fi
 }
 
-# Install all required targets
 echo "📦 Checking Rust targets..."
 check_target "aarch64-apple-darwin"
-check_target "x86_64-apple-darwin"
 check_target "aarch64-apple-ios"
 check_target "aarch64-apple-ios-sim"
-check_target "x86_64-apple-ios"
 
-# Clean previous builds
-echo "🧹 Cleaning previous builds..."
-rm -rf ./build
-mkdir -p ./build
+# =============================================================================
+# Build each target
+# =============================================================================
 
-# Build for all targets
-echo "🔨 Building for macOS (Apple Silicon)..."
-cargo build --release --target aarch64-apple-darwin
+build_target() {
+    local TARGET=$1
+    local SDK=$2
+    local DESC=$3
 
-echo "🔨 Building for macOS (Intel)..."
-if cargo build --release --target x86_64-apple-darwin 2>/dev/null; then
-    INTEL_MAC_BUILT=true
-else
-    echo -e "${YELLOW}Skipping Intel Mac build (cross-compilation not set up)${NC}"
-    INTEL_MAC_BUILT=false
-fi
+    echo ""
+    echo "🔨 Building for ${DESC}..."
 
-echo "🔨 Building for iOS devices..."
-cargo build --release --target aarch64-apple-ios
+    export SDKROOT=$(xcrun --sdk $SDK --show-sdk-path)
 
-echo "🔨 Building for iOS Simulator (Apple Silicon)..."
-cargo build --release --target aarch64-apple-ios-sim
+    # Set bindgen to use the SDK's headers
+    if [[ "$SDK" == "iphoneos" ]]; then
+        export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=${SDKROOT} -target arm64-apple-ios${IPHONEOS_DEPLOYMENT_TARGET}"
+    elif [[ "$SDK" == "iphonesimulator" ]]; then
+        export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=${SDKROOT} -target arm64-apple-ios${IPHONEOS_DEPLOYMENT_TARGET}-simulator"
+    else
+        export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=${SDKROOT}"
+    fi
 
-echo "🔨 Building for iOS Simulator (Intel)..."
-if cargo build --release --target x86_64-apple-ios 2>/dev/null; then
-    INTEL_SIM_BUILT=true
-else
-    echo -e "${YELLOW}Skipping Intel Simulator build${NC}"
-    INTEL_SIM_BUILT=false
-fi
+    cargo build --release --target "$TARGET" 2>&1 | tee -a build.log
 
-# Create universal libraries
-echo "🔗 Creating universal libraries..."
+    if [[ ${pipestatus[1]} -eq 0 ]]; then
+        echo "✅ ${DESC} build succeeded"
+    else
+        echo "❌ ${DESC} build FAILED"
+        echo ""
+        echo "Check build.log for details"
+        exit 1
+    fi
+}
 
-# macOS universal binary
-if [ "$INTEL_MAC_BUILT" = true ]; then
-    lipo -create \
-        target/aarch64-apple-darwin/release/libcyan_backend.a \
-        target/x86_64-apple-darwin/release/libcyan_backend.a \
-        -output build/libcyan_backend_macos.a
-else
-    cp target/aarch64-apple-darwin/release/libcyan_backend.a build/libcyan_backend_macos.a
-fi
+# Build all targets
+build_target "aarch64-apple-darwin" "macosx" "macOS (Apple Silicon)"
+build_target "aarch64-apple-ios" "iphoneos" "iOS Device"
+build_target "aarch64-apple-ios-sim" "iphonesimulator" "iOS Simulator"
 
-# iOS Simulator universal binary
-if [ "$INTEL_SIM_BUILT" = true ]; then
-    lipo -create \
-        target/aarch64-apple-ios-sim/release/libcyan_backend.a \
-        target/x86_64-apple-ios/release/libcyan_backend.a \
-        -output build/libcyan_backend_simulator.a
-else
-    cp target/aarch64-apple-ios-sim/release/libcyan_backend.a build/libcyan_backend_simulator.a
-fi
+# =============================================================================
+# Create XCFramework
+# =============================================================================
 
-# iOS device library
-cp target/aarch64-apple-ios/release/libcyan_backend.a build/libcyan_backend_ios.a
-
-# Create XCFramework without headers
+echo ""
 echo "📦 Creating XCFramework..."
+
+cp target/aarch64-apple-darwin/release/libcyan_backend.a build/libcyan_backend_macos.a
+cp target/aarch64-apple-ios/release/libcyan_backend.a build/libcyan_backend_ios.a
+cp target/aarch64-apple-ios-sim/release/libcyan_backend.a build/libcyan_backend_simulator.a
+
+rm -rf build/CyanBackend.xcframework
+
 xcodebuild -create-xcframework \
     -library build/libcyan_backend_macos.a \
     -library build/libcyan_backend_ios.a \
     -library build/libcyan_backend_simulator.a \
     -output build/CyanBackend.xcframework
 
-# Copy to Xcode project if path is provided
-if [ -n "$1" ]; then
-    XCODE_PROJECT_PATH="$1"
-    echo "📋 Copying to Xcode project at: $XCODE_PROJECT_PATH"
-    rm -rf "$XCODE_PROJECT_PATH/CyanBackend.xcframework"
-    cp -R build/CyanBackend.xcframework "$XCODE_PROJECT_PATH/"
-    echo -e "${GREEN}✅ XCFramework copied to Xcode project${NC}"
+echo "✅ XCFramework created"
+
+# =============================================================================
+# Copy to Xcode project (optional)
+# =============================================================================
+
+if [[ -n "$1" ]]; then
+    echo "📋 Copying to: $1"
+    rm -rf "$1/CyanBackend.xcframework"
+    cp -R build/CyanBackend.xcframework "$1/"
+    echo "✅ Copied to Xcode project"
 fi
 
-echo -e "${GREEN}✅ Build complete! XCFramework created at: build/CyanBackend.xcframework${NC}"
+# =============================================================================
+# Summary
+# =============================================================================
 
-# Show framework info
 echo ""
-echo "📊 Framework contents:"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "✅ BUILD COMPLETE"
+echo ""
+echo "📁 XCFramework: build/CyanBackend.xcframework"
+echo ""
 find build/CyanBackend.xcframework -name "*.a" -exec ls -lh {} \;
-
-# Verify symbols are present
 echo ""
-echo "🔍 Verifying cyan symbols in macOS library:"
-nm build/libcyan_backend_macos.a | grep "_cyan_" | head -5
+echo "🔍 Symbols:"
+nm build/libcyan_backend_macos.a 2>/dev/null | grep "_cyan_" | head -3
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Note: LLVM will be re-linked automatically by the EXIT trap
