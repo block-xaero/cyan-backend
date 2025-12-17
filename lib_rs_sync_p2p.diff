@@ -1,0 +1,92 @@
+1780a1781,1811
+>                                             // ---- Board metadata events (P2P sync) ----
+>                                             NetworkEvent::BoardMetadataUpdated {
+>                                                 board_id,
+>                                                 labels,
+>                                                 rating,
+>                                                 contains_model,
+>                                                 contains_skills,
+>                                             } => {
+>                                                 let db = db.lock().unwrap();
+>                                                 let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string());
+>                                                 let skills_json = serde_json::to_string(&contains_skills).unwrap_or_else(|_| "[]".to_string());
+>                                                 let _ = db.execute(
+>                                                     "INSERT INTO board_metadata (board_id, labels, rating, contains_model, contains_skills) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(board_id) DO UPDATE SET labels = ?2, rating = ?3, contains_model = ?4, contains_skills = ?5",
+>                                                     params![board_id, labels_json, rating, contains_model, skills_json],
+>                                                 );
+>                                             }
+>                                             NetworkEvent::BoardLabelsUpdated { board_id, labels } => {
+>                                                 let db = db.lock().unwrap();
+>                                                 let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string());
+>                                                 let _ = db.execute(
+>                                                     "INSERT INTO board_metadata (board_id, labels) VALUES (?1, ?2) ON CONFLICT(board_id) DO UPDATE SET labels = ?2",
+>                                                     params![board_id, labels_json],
+>                                                 );
+>                                             }
+>                                             NetworkEvent::BoardRated { board_id, rating } => {
+>                                                 let db = db.lock().unwrap();
+>                                                 let _ = db.execute(
+>                                                     "INSERT INTO board_metadata (board_id, rating) VALUES (?1, ?2) ON CONFLICT(board_id) DO UPDATE SET rating = ?2",
+>                                                     params![board_id, rating],
+>                                                 );
+>                                             }
+1893a1925,1938
+>                 // Restore board metadata from snapshot
+>                 for meta in tree_dto.board_metadata {
+>                     let labels_json = serde_json::to_string(&meta.labels).unwrap_or_else(|_| "[]".to_string());
+>                     let skills_json = serde_json::to_string(&meta.contains_skills).unwrap_or_else(|_| "[]".to_string());
+>                     let _ = db.execute(
+>                         "INSERT OR REPLACE INTO board_metadata (board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+>                         params![
+>                             meta.board_id, labels_json, meta.rating, meta.view_count,
+>                             meta.contains_model, skills_json, meta.board_type, meta.last_accessed
+>                         ],
+>                     );
+>                     tracing::debug!("Board metadata for {} restored", meta.board_id);
+>                 }
+>
+2496a2542,2543
+>     #[serde(default)]
+>     board_metadata: Vec<BoardMetadataDTO>,
+2540a2588,2599
+> #[derive(Debug, Serialize, Deserialize)]
+> struct BoardMetadataDTO {
+>     board_id: String,
+>     labels: Vec<String>,
+>     rating: i32,
+>     view_count: i32,
+>     contains_model: Option<String>,
+>     contains_skills: Vec<String>,
+>     board_type: String,
+>     last_accessed: i64,
+> }
+>
+2697a2757,2782
+>
+>     // Get board metadata for all boards in this group
+>     let board_metadata: Vec<BoardMetadataDTO> = {
+>         match db.prepare(
+>             "SELECT m.board_id, m.labels, m.rating, m.view_count, m.contains_model, m.contains_skills, m.board_type, m.last_accessed FROM board_metadata m JOIN objects o ON m.board_id = o.id JOIN workspaces w ON o.workspace_id = w.id WHERE w.group_id = ?1"
+>         ) {
+>             Ok(mut stmt) => {
+>                 stmt.query_map(params![group_id], |row| {
+>                     let labels_json: String = row.get(1)?;
+>                     let skills_json: String = row.get(5)?;
+>                     Ok(BoardMetadataDTO {
+>                         board_id: row.get(0)?,
+>                         labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+>                         rating: row.get(2)?,
+>                         view_count: row.get(3)?,
+>                         contains_model: row.get(4)?,
+>                         contains_skills: serde_json::from_str(&skills_json).unwrap_or_default(),
+>                         board_type: row.get(6)?,
+>                         last_accessed: row.get(7)?,
+>                     })
+>                 }).unwrap().filter_map(|r| r.ok()).collect()
+>             }
+>             Err(_) => vec![],
+>         }
+>     };
+>
+2705a2791
+>         board_metadata,

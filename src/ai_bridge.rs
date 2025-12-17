@@ -234,13 +234,19 @@ impl AIBridge {
     }
 
     pub async fn handle_command(&self, json: &str) -> String {
+        tracing::debug!("🔍 AIBridge received command: {}", json);
         let response = match serde_json::from_str::<AICommand>(json) {
-            Ok(cmd) => self.dispatch(cmd).await,
+            Ok(cmd) => {
+                tracing::debug!("🔍 Parsed command: {:?}", cmd);
+                self.dispatch(cmd).await
+            }
             Err(e) => CommandResponse::err(format!("Invalid JSON: {}", e)),
         };
-        serde_json::to_string(&response).unwrap_or_else(|_| {
+        let result = serde_json::to_string(&response).unwrap_or_else(|_| {
             r#"{"success":false,"error":"Serialization failed"}"#.to_string()
-        })
+        });
+        tracing::debug!("🔍 AIBridge response: {}", result);
+        result
     }
 
     pub async fn poll_insights(&self) -> Option<ProactiveInsight> {
@@ -268,6 +274,7 @@ impl AIBridge {
     // ========================================================================
 
     async fn cmd_initialize(&self, models_dir: &str) -> CommandResponse {
+        tracing::info!("🔍 cmd_initialize: models_dir={}", models_dir);
         let models_path = PathBuf::from(models_dir);
 
         // Directory names match HuggingFace repos and download_models.sh
@@ -275,40 +282,101 @@ impl AIBridge {
         let ocr_dir = models_path.join("paddleocr");       // PaddleOCR recognition
         let phi_dir = models_path.join("cyan-lens");       // blockxaero/cyan-lens
 
+        tracing::info!("🔍 Checking model directories:");
+        tracing::info!("   yolo_dir: {:?} exists={}", yolo_dir, yolo_dir.exists());
+        tracing::info!("   ocr_dir:  {:?} exists={}", ocr_dir, ocr_dir.exists());
+        tracing::info!("   phi_dir:  {:?} exists={}", phi_dir, phi_dir.exists());
+
         for (name, dir) in [("YOLO (cyan-sketch)", &yolo_dir), ("OCR (paddleocr)", &ocr_dir), ("Phi (cyan-lens)", &phi_dir)] {
             if !dir.exists() {
+                tracing::error!("❌ {} not found: {:?}", name, dir);
                 return CommandResponse::err(format!("{} not found: {:?}. Run download_models.sh first.", name, dir));
             }
         }
 
+        // List contents of phi_dir for debugging
+        tracing::info!("🔍 Contents of phi_dir ({:?}):", phi_dir);
+        if let Ok(entries) = std::fs::read_dir(&phi_dir) {
+            for entry in entries.flatten() {
+                tracing::info!("   - {:?}", entry.file_name());
+            }
+        }
+
         // Initialize pipeline
+        tracing::info!("🔍 Initializing WhiteboardPipeline...");
         match WhiteboardPipeline::new(&yolo_dir, &ocr_dir, &phi_dir) {
             Ok(pipeline) => {
                 *self.pipeline.write().await = Some(pipeline);
                 tracing::info!("✅ Pipeline initialized");
             }
-            Err(e) => return CommandResponse::err(format!("Pipeline failed: {}", e)),
+            Err(e) => {
+                tracing::error!("❌ Pipeline failed: {}", e);
+                return CommandResponse::err(format!("Pipeline failed: {}", e));
+            }
         }
 
-        // Initialize analyst runtime
+        // Initialize analyst runtime - NOW FATAL ON FAILURE
+        tracing::info!("🔍 Initializing analyst runtime...");
         if let Err(e) = self.init_analyst(&phi_dir).await {
-            tracing::warn!("⚠️ Analyst init failed: {}", e);
+            tracing::error!("❌ Analyst init failed: {}", e);
+            return CommandResponse::err(format!("Analyst init failed: {}", e));
         }
 
         *self.models_dir.write().await = Some(models_path);
         *self.initialized.write().await = true;
 
+        tracing::info!("✅ AI Bridge fully initialized");
         CommandResponse::ok()
     }
 
     async fn init_analyst(&self, phi_dir: &Path) -> anyhow::Result<()> {
+        tracing::info!("🔍 init_analyst: phi_dir={:?}", phi_dir);
+
+        // Check for SKILL.md
+        let skill_path = phi_dir.join("SKILL.md");
+        tracing::info!("🔍 SKILL.md path: {:?} exists={}", skill_path, skill_path.exists());
+
+        if !skill_path.exists() {
+            return Err(anyhow::anyhow!("SKILL.md not found at {:?}", skill_path));
+        }
+
+        // Read SKILL.md content for debugging
+        if let Ok(content) = std::fs::read_to_string(&skill_path) {
+            tracing::info!("🔍 SKILL.md content (first 500 chars): {}", &content[..content.len().min(500)]);
+        }
+
+        tracing::info!("🔍 Creating Runtime...");
         let mut runtime = Runtime::new()?;
+        tracing::info!("✅ Runtime created");
+
+        tracing::info!("🔍 Loading Skill from {:?}...", phi_dir);
         let skill = Skill::load(phi_dir)?;
+        tracing::info!("✅ Skill loaded: name={}, version={}, kind={:?}",
+            skill.name, skill.version, skill.kind);
+        tracing::info!("🔍 Skill model_file={:?}", skill.model_file);
+
         let name = skill.name.clone();
+
+        // Check if model file exists
+        if let Some(ref model_file) = skill.model_file {
+            let model_path = phi_dir.join(model_file);
+            tracing::info!("🔍 Model file path: {:?} exists={}", model_path, model_path.exists());
+            if model_path.exists() {
+                if let Ok(metadata) = std::fs::metadata(&model_path) {
+                    tracing::info!("🔍 Model file size: {} bytes ({:.2} MB)",
+                        metadata.len(), metadata.len() as f64 / 1_048_576.0);
+                }
+            }
+        }
+
+        tracing::info!("🔍 Loading model from skill...");
         runtime.load_from_skill(&skill, phi_dir)?;
+        tracing::info!("✅ Model loaded into runtime");
+
         *self.analyst_runtime.write().await = Some(runtime);
-        *self.analyst_model_name.write().await = Some(name);
-        tracing::info!("✅ Analyst initialized");
+        *self.analyst_model_name.write().await = Some(name.clone());
+
+        tracing::info!("✅ Analyst initialized with model: {}", name);
         Ok(())
     }
 
@@ -365,38 +433,65 @@ impl AIBridge {
     // ========================================================================
 
     async fn cmd_ask_analyst(&self, question: &str) -> CommandResponse {
+        tracing::info!("🔍 cmd_ask_analyst: question={}", question);
+
         if !*self.initialized.read().await {
+            tracing::warn!("❌ Not initialized");
             return CommandResponse::err("Not initialized");
         }
 
         let buffer = self.event_buffer.read().await;
         let context = self.build_context(&buffer);
+        tracing::debug!("🔍 Context built: {} chars", context.len());
 
         let prompt = format!(
             "<|user|>\nYou are a design analyst. Analyze project activity and answer concisely.\n\n\
             ## Activity\n{}\n\n## Question\n{}\n<|end|>\n<|assistant|>\n",
             context, question
         );
+        tracing::debug!("🔍 Prompt length: {} chars", prompt.len());
 
         let mut runtime = self.analyst_runtime.write().await;
         let name = self.analyst_model_name.read().await;
 
+        tracing::info!("🔍 Runtime present: {}, Model name: {:?}",
+            runtime.is_some(), name.as_ref());
+
         let (rt, model_name) = match (runtime.as_mut(), name.as_ref()) {
             (Some(r), Some(n)) => (r, n.clone()),
-            _ => return CommandResponse::err("Analyst not available"),
+            (None, _) => {
+                tracing::error!("❌ Analyst runtime is None");
+                return CommandResponse::err("Analyst not available (runtime is None)");
+            }
+            (_, None) => {
+                tracing::error!("❌ Analyst model name is None");
+                return CommandResponse::err("Analyst not available (model name is None)");
+            }
         };
+
+        tracing::info!("🔍 Running inference with model: {}", model_name);
+        let start = std::time::Instant::now();
 
         match rt.infer_sync(&model_name, InferenceInput::Text { prompt }) {
             Ok(InferenceOutput::Text { content }) => {
+                let elapsed = start.elapsed();
+                tracing::info!("✅ Inference complete in {:?}, output length: {} chars",
+                    elapsed, content.len());
                 let citations: Vec<String> = buffer.iter().take(5).map(|e| e.anchor_id.clone()).collect();
                 CommandResponse::ok_with_data(serde_json::to_value(AnalysisResult {
                     success: true, response: Some(content), citations: Some(citations), error: None,
                 }).unwrap())
             }
-            Ok(_) => CommandResponse::err("Unexpected output"),
-            Err(e) => CommandResponse::ok_with_data(serde_json::to_value(AnalysisResult {
-                success: false, response: None, citations: None, error: Some(e.to_string()),
-            }).unwrap()),
+            Ok(other) => {
+                tracing::error!("❌ Unexpected output type: {:?}", other);
+                CommandResponse::err("Unexpected output")
+            }
+            Err(e) => {
+                tracing::error!("❌ Inference error: {}", e);
+                CommandResponse::ok_with_data(serde_json::to_value(AnalysisResult {
+                    success: false, response: None, citations: None, error: Some(e.to_string()),
+                }).unwrap())
+            }
         }
     }
 
@@ -522,16 +617,22 @@ impl AIBridge {
     }
 
     async fn load_cell_runtime(&self, cell_model: &CellModel) -> anyhow::Result<Runtime> {
+        tracing::info!("🔍 load_cell_runtime: model_path={:?}", cell_model.model_path);
+
         let mut runtime = Runtime::new()?;
 
         // Try to find SKILL.md in same directory
         let skill_path = cell_model.model_path.parent().map(|p| p.join("SKILL.md"));
+        tracing::info!("🔍 Looking for SKILL.md at {:?}", skill_path);
 
         if let Some(sp) = skill_path.filter(|p| p.exists()) {
+            tracing::info!("🔍 Found SKILL.md, loading skill...");
             let skill = Skill::load(sp.parent().unwrap())?;
+            tracing::info!("🔍 Loading model from skill: {}", skill.name);
             runtime.load_from_skill(&skill, sp.parent().unwrap())?;
+            tracing::info!("✅ Cell model loaded");
         } else {
-            // Manual load without SKILL.md
+            tracing::error!("❌ SKILL.md not found");
             return Err(anyhow::anyhow!("SKILL.md required for model loading"));
         }
 
