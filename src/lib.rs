@@ -56,6 +56,7 @@ static SYSTEM: OnceCell<Arc<CyanSystem>> = OnceCell::new();
 static DISCOVERY_KEY: OnceCell<String> = OnceCell::new();
 static DATA_DIR: OnceCell<PathBuf> = OnceCell::new();
 static NODE_ID: OnceCell<String> = OnceCell::new();
+static AI_RESPONSE_QUEUE: OnceCell<Mutex<VecDeque<String>>> = OnceCell::new();
 
 // ---------- Core types ----------
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +236,22 @@ pub enum NetworkEvent {
         board_id: String,
         mode: String,
     },
+    // ---- Board metadata events ----
+    BoardMetadataUpdated {
+        board_id: String,
+        labels: Vec<String>,
+        rating: i32,
+        contains_model: Option<String>,
+        contains_skills: Vec<String>,
+    },
+    BoardLabelsUpdated {
+        board_id: String,
+        labels: Vec<String>,
+    },
+    BoardRated {
+        board_id: String,
+        rating: i32,
+    },
 }
 
 // ---------- Internal commands ----------
@@ -281,6 +298,19 @@ enum NetworkCommand {
         hash: String,
         source_peer: String,
     },
+}
+
+// ---------- Board Metadata ----------
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BoardMetadata {
+    pub board_id: String,
+    pub labels: Vec<String>,
+    pub rating: i32,
+    pub view_count: i32,
+    pub contains_model: Option<String>,
+    pub contains_skills: Vec<String>,
+    pub board_type: String,
+    pub last_accessed: i64,
 }
 
 /// Message sent through channel to chat stream writer task
@@ -509,6 +539,18 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             FOREIGN KEY(board_id) REFERENCES objects(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_notebook_cells_order ON notebook_cells(board_id, cell_order);
+        CREATE TABLE IF NOT EXISTS board_metadata (
+            board_id TEXT PRIMARY KEY,
+            labels TEXT DEFAULT '[]',
+            rating INTEGER DEFAULT 0,
+            view_count INTEGER DEFAULT 0,
+            contains_model TEXT,
+            contains_skills TEXT DEFAULT '[]',
+            board_type TEXT DEFAULT 'freeform',
+            last_accessed INTEGER DEFAULT 0,
+            FOREIGN KEY (board_id) REFERENCES objects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_board_rating ON board_metadata(rating DESC);
         "#,
     )?;
     Ok(())
@@ -540,6 +582,12 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     if conn.prepare("SELECT board_mode FROM objects LIMIT 1").is_err() {
         tracing::info!("Migration: adding board_mode column to objects");
         let _ = conn.execute("ALTER TABLE objects ADD COLUMN board_mode TEXT DEFAULT 'freeform'", []);
+    }
+    // Check and create board_metadata table if not exists
+    if conn.prepare("SELECT board_id FROM board_metadata LIMIT 1").is_err() {
+        tracing::info!("Migration: creating board_metadata table");
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS board_metadata (board_id TEXT PRIMARY KEY, labels TEXT DEFAULT '[]', rating INTEGER DEFAULT 0, view_count INTEGER DEFAULT 0, contains_model TEXT, contains_skills TEXT DEFAULT '[]', board_type TEXT DEFAULT 'freeform', last_accessed INTEGER DEFAULT 0)", []);
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_board_rating ON board_metadata(rating DESC)", []);
     }
     Ok(())
 }
@@ -1730,7 +1778,40 @@ impl NetworkActor {
                                                     params![mode, board_id],
                                                 );
                                             }
+                                            // ---- Board metadata events (P2P sync) ----
+                                            NetworkEvent::BoardMetadataUpdated {
+                                                board_id,
+                                                labels,
+                                                rating,
+                                                contains_model,
+                                                contains_skills,
+                                            } => {
+                                                let db = db.lock().unwrap();
+                                                let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string());
+                                                let skills_json = serde_json::to_string(&contains_skills).unwrap_or_else(|_| "[]".to_string());
+                                                let _ = db.execute(
+                                                    "INSERT INTO board_metadata (board_id, labels, rating, contains_model, contains_skills) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(board_id) DO UPDATE SET labels = ?2, rating = ?3, contains_model = ?4, contains_skills = ?5",
+                                                    params![board_id, labels_json, rating, contains_model, skills_json],
+                                                );
+                                            }
+                                            NetworkEvent::BoardLabelsUpdated { board_id, labels } => {
+                                                let db = db.lock().unwrap();
+                                                let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string());
+                                                let _ = db.execute(
+                                                    "INSERT INTO board_metadata (board_id, labels) VALUES (?1, ?2) ON CONFLICT(board_id) DO UPDATE SET labels = ?2",
+                                                    params![board_id, labels_json],
+                                                );
+                                            }
+                                            NetworkEvent::BoardRated { board_id, rating } => {
+                                                let db = db.lock().unwrap();
+                                                let _ = db.execute(
+                                                    "INSERT INTO board_metadata (board_id, rating) VALUES (?1, ?2) ON CONFLICT(board_id) DO UPDATE SET rating = ?2",
+                                                    params![board_id, rating],
+                                                );
+                                            }
                                         }
+
+                                        // Send to Swift
 
                                         // Send to Swift
                                         let _ = event_tx.send(SwiftEvent::Network(evt));
@@ -1842,7 +1923,18 @@ impl NetworkActor {
                     );
                     tracing::debug!("Chat {chat:?} successfully inserted");
                 }
-
+                // Restore board metadata from snapshot
+                for meta in tree_dto.board_metadata {
+                    let labels_json = serde_json::to_string(&meta.labels).unwrap_or_else(|_| "[]".to_string());
+                    let skills_json = serde_json::to_string(&meta.contains_skills).unwrap_or_else(|_| "[]".to_string());
+                    let _ = db.execute(
+                        "INSERT OR REPLACE INTO board_metadata (board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            meta.board_id, labels_json, meta.rating, meta.view_count,
+                            meta.contains_model, skills_json, meta.board_type, meta.last_accessed
+                        ],
+                    );
+                }
                 // Mark snapshot as received
                 if let Some(flag) = self.need_snapshot.lock().unwrap().get(&group_id) {
                     flag.store(false, Ordering::Relaxed);
@@ -2446,6 +2538,19 @@ struct TreeSnapshotDTO {
     chats: Vec<ChatDTO>,
     #[serde(default)]
     integrations: Vec<IntegrationBindingDTO>,
+    #[serde(default)]
+    board_metadata: Vec<BoardMetadataDTO>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct BoardMetadataDTO {
+    board_id: String,
+    labels: Vec<String>,
+    rating: i32,
+    view_count: i32,
+    contains_model: Option<String>,
+    contains_skills: Vec<String>,
+    board_type: String,
+    last_accessed: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2647,6 +2752,29 @@ fn build_group_snapshot(db: &Arc<Mutex<Connection>>, group_id: &str) -> Result<T
             Err(_) => vec![], // Table doesn't exist yet
         }
     };
+    let board_metadata: Vec<BoardMetadataDTO> = {
+        match db.prepare(
+            "SELECT m.board_id, m.labels, m.rating, m.view_count, m.contains_model, m.contains_skills, m.board_type, m.last_accessed FROM board_metadata m JOIN objects o ON m.board_id = o.id JOIN workspaces w ON o.workspace_id = w.id WHERE w.group_id = ?1"
+        ) {
+            Ok(mut stmt) => {
+                stmt.query_map(params![group_id], |row| {
+                    let labels_json: String = row.get(1)?;
+                    let skills_json: String = row.get(5)?;
+                    Ok(BoardMetadataDTO {
+                        board_id: row.get(0)?,
+                        labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                        rating: row.get(2)?,
+                        view_count: row.get(3)?,
+                        contains_model: row.get(4)?,
+                        contains_skills: serde_json::from_str(&skills_json).unwrap_or_default(),
+                        board_type: row.get(6)?,
+                        last_accessed: row.get(7)?,
+                    })
+                }).unwrap().filter_map(|r| r.ok()).collect()
+            }
+            Err(_) => vec![],
+        }
+    };
     let group_clone = group.name.clone();
     let snapshot = TreeSnapshotDTO {
         groups: vec![group],
@@ -2655,6 +2783,7 @@ fn build_group_snapshot(db: &Arc<Mutex<Connection>>, group_id: &str) -> Result<T
         files,
         chats,
         integrations,
+        board_metadata,
     };
     tracing::info!("snapshot {snapshot:?} built for group : {group_clone:?}");
     Ok(snapshot)
@@ -2769,7 +2898,31 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                     .filter_map(|r| r.ok())
                     .collect()
             }
-            Err(_) => vec![], // Table doesn't exist yet
+            Err(_) => vec![],
+        }
+    };
+
+    let board_metadata: Vec<BoardMetadataDTO> = {
+        match db.prepare(
+            "SELECT board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed FROM board_metadata"
+        ) {
+            Ok(mut stmt) => {
+                stmt.query_map([], |row| {
+                    let labels_json: String = row.get(1)?;
+                    let skills_json: String = row.get(5)?;
+                    Ok(BoardMetadataDTO {
+                        board_id: row.get(0)?,
+                        labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                        rating: row.get(2)?,
+                        view_count: row.get(3)?,
+                        contains_model: row.get(4)?,
+                        contains_skills: serde_json::from_str(&skills_json).unwrap_or_default(),
+                        board_type: row.get(6)?,
+                        last_accessed: row.get(7)?,
+                    })
+                }).unwrap().filter_map(|r| r.ok()).collect()
+            }
+            Err(_) => vec![],
         }
     };
 
@@ -2780,6 +2933,7 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
         files,
         chats,
         integrations,
+        board_metadata,
     };
     serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
 }
@@ -4699,45 +4853,76 @@ pub extern "C" fn cyan_load_cell_elements(cell_id: *const c_char) -> *mut c_char
 
 // AI Bridge FFI Exports
 
+fn ai_response_queue() -> &'static Mutex<VecDeque<String>> {
+    AI_RESPONSE_QUEUE.get_or_init(|| Mutex::new(VecDeque::with_capacity(16)))
+}
+
 /// Handle AI commands via JSON
 /// Commands: initialize, image_to_mermaid, ask_analyst, feed_event,
 ///           set_proactive, register_model, unload_model, infer_model, list_models
+/// Returns immediately - poll cyan_poll_ai_response for result
 #[unsafe(no_mangle)]
-pub extern "C" fn cyan_ai_command(json: *const c_char) -> *mut c_char {
+pub extern "C" fn cyan_ai_command(json: *const c_char) -> bool {
     let cmd_json = match unsafe { CStr::from_ptr(json) }.to_str() {
         Ok(s) => s.to_string(),
         Err(_) => {
-            return CString::new(r#"{"success":false,"error":"Invalid UTF-8"}"#)
-                .unwrap()
-                .into_raw();
+            if let Ok(mut q) = ai_response_queue().lock() {
+                q.push_back(r#"{"success":false,"error":"Invalid UTF-8"}"#.to_string());
+            }
+            return false;
         }
     };
 
     let Some(sys) = SYSTEM.get() else {
-        return CString::new(r#"{"success":false,"error":"System not initialized"}"#)
-            .unwrap()
-            .into_raw();
+        if let Ok(mut q) = ai_response_queue().lock() {
+            q.push_back(r#"{"success":false,"error":"System not initialized"}"#.to_string());
+        }
+        return false;
     };
 
     let Some(runtime) = RUNTIME.get() else {
-        return CString::new(r#"{"success":false,"error":"Runtime not initialized"}"#)
-            .unwrap()
-            .into_raw();
+        if let Ok(mut q) = ai_response_queue().lock() {
+            q.push_back(r#"{"success":false,"error":"Runtime not initialized"}"#.to_string());
+        }
+        return false;
     };
 
-    let result = runtime.block_on(async { sys.ai_bridge.handle_command(&cmd_json).await });
+    // Spawn async task - returns immediately
+    let bridge = Arc::clone(&sys.ai_bridge);
+    runtime.spawn(async move {
+        let result = bridge.handle_command(&cmd_json).await;
+        eprintln!("🎯 [cyan_ai_command] Queuing response: {} chars", result.len());
+        if let Ok(mut q) = ai_response_queue().lock() {
+            q.push_back(result);
+        }
+    });
 
-    CString::new(result)
-        .unwrap_or_else(|_| {
-            CString::new(r#"{"success":false,"error":"CString conversion failed"}"#).unwrap()
-        })
-        .into_raw()
+    true
 }
 
-/// Poll for AI events (proactive insights for ConsoleView)
-/// Returns JSON string or null if no events pending
+/// Poll for AI command response
+/// Returns JSON string or null if no response pending
 #[unsafe(no_mangle)]
-pub extern "C" fn cyan_poll_ai_events() -> *mut c_char {
+pub extern "C" fn cyan_poll_ai_response() -> *mut c_char {
+    let Ok(mut queue) = ai_response_queue().lock() else {
+        return std::ptr::null_mut();
+    };
+
+    match queue.pop_front() {
+        Some(response) => {
+            eprintln!("📤 [cyan_poll_ai_response] Returning: {} chars", response.len());
+            CString::new(response)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut())
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Poll for AI proactive insights (for ConsoleView)
+/// Returns JSON string or null if no insights pending
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_poll_ai_insights() -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
         return std::ptr::null_mut();
     };
@@ -4752,5 +4937,563 @@ pub extern "C" fn cyan_poll_ai_events() -> *mut c_char {
             Err(_) => std::ptr::null_mut(),
         },
         None => std::ptr::null_mut(),
+    }
+}
+// ============== Board Metadata FFI ==============
+// Add this before the final closing brace in lib.rs (after cyan_poll_ai_insights)
+
+/// Get metadata for a single board
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+
+    let metadata: Option<BoardMetadata> = {
+        let db = sys.db.lock().unwrap();
+
+        db.query_row(
+            "SELECT board_id, labels, rating, view_count, contains_model,
+                    contains_skills, board_type, last_accessed
+             FROM board_metadata WHERE board_id = ?1",
+            params![&bid],
+            |row| {
+                let labels_json: String = row.get(1)?;
+                let skills_json: String = row.get(5)?;
+
+                Ok(BoardMetadata {
+                    board_id: row.get(0)?,
+                    labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                    rating: row.get(2)?,
+                    view_count: row.get(3)?,
+                    contains_model: row.get(4)?,
+                    contains_skills: serde_json::from_str(&skills_json).unwrap_or_default(),
+                    board_type: row.get(6)?,
+                    last_accessed: row.get(7)?,
+                })
+            }
+        ).ok()
+    };
+
+    let result = metadata.unwrap_or_else(|| {
+        let db = sys.db.lock().unwrap();
+        let board_type: String = db.query_row(
+            "SELECT COALESCE(board_mode, 'freeform') FROM objects WHERE id = ?1",
+            params![&bid],
+            |row| row.get(0)
+        ).unwrap_or_else(|_| "freeform".to_string());
+
+        BoardMetadata {
+            board_id: bid,
+            board_type,
+            ..Default::default()
+        }
+    });
+
+    match serde_json::to_string(&result) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Get metadata for all boards in a scope
+/// scope_type: "workspace" | "group" | "all"
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: *const c_char) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    let stype = unsafe { CStr::from_ptr(scope_type) }.to_string_lossy().to_string();
+    let sid = unsafe { CStr::from_ptr(scope_id) }.to_string_lossy().to_string();
+
+    let results: Vec<BoardMetadata> = {
+        let db = sys.db.lock().unwrap();
+
+        let query = match stype.as_str() {
+            "workspace" => {
+                "SELECT o.id, COALESCE(m.labels, '[]'), COALESCE(m.rating, 0),
+                        COALESCE(m.view_count, 0), m.contains_model,
+                        COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'freeform'),
+                        COALESCE(m.last_accessed, 0)
+                 FROM objects o
+                 LEFT JOIN board_metadata m ON o.id = m.board_id
+                 WHERE o.workspace_id = ?1 AND o.type = 'whiteboard'
+                 ORDER BY COALESCE(m.rating, 0) DESC, o.created_at DESC"
+            }
+            "group" => {
+                "SELECT o.id, COALESCE(m.labels, '[]'), COALESCE(m.rating, 0),
+                        COALESCE(m.view_count, 0), m.contains_model,
+                        COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'freeform'),
+                        COALESCE(m.last_accessed, 0)
+                 FROM objects o
+                 JOIN workspaces w ON o.workspace_id = w.id
+                 LEFT JOIN board_metadata m ON o.id = m.board_id
+                 WHERE w.group_id = ?1 AND o.type = 'whiteboard'
+                 ORDER BY COALESCE(m.rating, 0) DESC, o.created_at DESC"
+            }
+            _ => {
+                "SELECT o.id, COALESCE(m.labels, '[]'), COALESCE(m.rating, 0),
+                        COALESCE(m.view_count, 0), m.contains_model,
+                        COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'freeform'),
+                        COALESCE(m.last_accessed, 0)
+                 FROM objects o
+                 LEFT JOIN board_metadata m ON o.id = m.board_id
+                 WHERE o.type = 'whiteboard'
+                 ORDER BY COALESCE(m.rating, 0) DESC, o.created_at DESC
+                 LIMIT 100"
+            }
+        };
+
+        let mut stmt = match db.prepare(query) {
+            Ok(s) => s,
+            Err(_) => return CString::new("[]").unwrap().into_raw(),
+        };
+
+        let param = if stype == "all" { "" } else { &sid };
+
+        stmt.query_map(params![param], |row| {
+            let labels_json: String = row.get(1)?;
+            let skills_json: String = row.get(5)?;
+
+            Ok(BoardMetadata {
+                board_id: row.get(0)?,
+                labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                rating: row.get(2)?,
+                view_count: row.get(3)?,
+                contains_model: row.get(4)?,
+                contains_skills: serde_json::from_str(&skills_json).unwrap_or_default(),
+                board_type: row.get(6)?,
+                last_accessed: row.get(7)?,
+            })
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    };
+
+    match serde_json::to_string(&results) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => CString::new("[]").unwrap().into_raw(),
+    }
+}
+
+/// Get top N boards by rating for a group
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_top_boards(group_id: *const c_char, limit: i32) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    let gid = unsafe { CStr::from_ptr(group_id) }.to_string_lossy().to_string();
+    let lim = if limit <= 0 { 10 } else { limit.min(50) };
+
+    let results: Vec<serde_json::Value> = {
+        let db = sys.db.lock().unwrap();
+
+        let mut stmt = match db.prepare(
+            "SELECT o.id, o.name, o.workspace_id, w.name as workspace_name,
+                    COALESCE(m.labels, '[]'), COALESCE(m.rating, 0),
+                    COALESCE(o.board_mode, 'freeform'), m.contains_model
+             FROM objects o
+             JOIN workspaces w ON o.workspace_id = w.id
+             LEFT JOIN board_metadata m ON o.id = m.board_id
+             WHERE w.group_id = ?1 AND o.type = 'whiteboard'
+             ORDER BY COALESCE(m.rating, 0) DESC, COALESCE(m.view_count, 0) DESC
+             LIMIT ?2"
+        ) {
+            Ok(s) => s,
+            Err(_) => return CString::new("[]").unwrap().into_raw(),
+        };
+
+        stmt.query_map(params![&gid, lim], |row| {
+            let labels_json: String = row.get(4)?;
+            let labels: Vec<String> = serde_json::from_str(&labels_json).unwrap_or_default();
+
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "workspace_id": row.get::<_, String>(2)?,
+                "workspace_name": row.get::<_, String>(3)?,
+                "labels": labels,
+                "rating": row.get::<_, i32>(5)?,
+                "board_type": row.get::<_, String>(6)?,
+                "contains_model": row.get::<_, Option<String>>(7)?
+            }))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    };
+
+    match serde_json::to_string(&results) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => CString::new("[]").unwrap().into_raw(),
+    }
+}
+
+/// Set labels for a board
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_set_board_labels(board_id: *const c_char, labels_json: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+    let json_str = unsafe { CStr::from_ptr(labels_json) }.to_string_lossy().to_string();
+
+    let labels: Vec<String> = match serde_json::from_str(&json_str) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+
+    let group_id: String;
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        group_id = db.query_row(
+            "SELECT w.group_id FROM objects o
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE o.id = ?1",
+            params![&bid],
+            |row| row.get(0)
+        ).unwrap_or_default();
+
+        // Upsert metadata
+        if db.execute(
+            "INSERT INTO board_metadata (board_id, labels) VALUES (?1, ?2)
+             ON CONFLICT(board_id) DO UPDATE SET labels = ?2",
+            params![&bid, &json_str]
+        ).is_err() {
+            return false;
+        }
+    }
+
+    // Broadcast
+    if !group_id.is_empty() {
+        let event = NetworkEvent::BoardLabelsUpdated {
+            board_id: bid,
+            labels,
+        };
+
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id,
+            event,
+        });
+    }
+
+    true
+}
+
+/// Add a single label to a board
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_add_board_label(board_id: *const c_char, label: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+    let new_label = unsafe { CStr::from_ptr(label) }.to_string_lossy().to_string();
+
+    let group_id: String;
+    let updated_labels: Vec<String>;
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        group_id = db.query_row(
+            "SELECT w.group_id FROM objects o
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE o.id = ?1",
+            params![&bid],
+            |row| row.get(0)
+        ).unwrap_or_default();
+
+        // Get existing labels
+        let existing: String = db.query_row(
+            "SELECT COALESCE(labels, '[]') FROM board_metadata WHERE board_id = ?1",
+            params![&bid],
+            |row| row.get(0)
+        ).unwrap_or_else(|_| "[]".to_string());
+
+        let mut labels: Vec<String> = serde_json::from_str(&existing).unwrap_or_default();
+
+        // Add if not exists
+        if !labels.contains(&new_label) {
+            labels.push(new_label);
+        }
+
+        updated_labels = labels.clone();
+        let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string());
+
+        // Upsert
+        if db.execute(
+            "INSERT INTO board_metadata (board_id, labels) VALUES (?1, ?2)
+             ON CONFLICT(board_id) DO UPDATE SET labels = ?2",
+            params![&bid, &labels_json]
+        ).is_err() {
+            return false;
+        }
+    }
+
+    if !group_id.is_empty() {
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id,
+            event: NetworkEvent::BoardLabelsUpdated {
+                board_id: bid,
+                labels: updated_labels,
+            },
+        });
+    }
+
+    true
+}
+
+/// Remove a label from a board
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_remove_board_label(board_id: *const c_char, label: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+    let remove_label = unsafe { CStr::from_ptr(label) }.to_string_lossy().to_string();
+
+    let group_id: String;
+    let updated_labels: Vec<String>;
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        group_id = db.query_row(
+            "SELECT w.group_id FROM objects o
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE o.id = ?1",
+            params![&bid],
+            |row| row.get(0)
+        ).unwrap_or_default();
+
+        let existing: String = db.query_row(
+            "SELECT COALESCE(labels, '[]') FROM board_metadata WHERE board_id = ?1",
+            params![&bid],
+            |row| row.get(0)
+        ).unwrap_or_else(|_| "[]".to_string());
+
+        let mut labels: Vec<String> = serde_json::from_str(&existing).unwrap_or_default();
+        labels.retain(|l| l != &remove_label);
+
+        updated_labels = labels.clone();
+        let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string());
+
+        let _ = db.execute(
+            "UPDATE board_metadata SET labels = ?1 WHERE board_id = ?2",
+            params![&labels_json, &bid]
+        );
+    }
+
+    if !group_id.is_empty() {
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id,
+            event: NetworkEvent::BoardLabelsUpdated {
+                board_id: bid,
+                labels: updated_labels,
+            },
+        });
+    }
+
+    true
+}
+
+/// Rate a board (0-5)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_rate_board(board_id: *const c_char, rating: i32) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+    let clamped_rating = rating.clamp(0, 5);
+
+    let group_id: String;
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        group_id = db.query_row(
+            "SELECT w.group_id FROM objects o
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE o.id = ?1",
+            params![&bid],
+            |row| row.get(0)
+        ).unwrap_or_default();
+
+        if db.execute(
+            "INSERT INTO board_metadata (board_id, rating) VALUES (?1, ?2)
+             ON CONFLICT(board_id) DO UPDATE SET rating = ?2",
+            params![&bid, clamped_rating]
+        ).is_err() {
+            return false;
+        }
+    }
+
+    if !group_id.is_empty() {
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id,
+            event: NetworkEvent::BoardRated {
+                board_id: bid,
+                rating: clamped_rating,
+            },
+        });
+    }
+
+    true
+}
+
+/// Increment view count and update last_accessed
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_record_board_view(board_id: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let db = sys.db.lock().unwrap();
+
+    db.execute(
+        "INSERT INTO board_metadata (board_id, view_count, last_accessed) VALUES (?1, 1, ?2)
+         ON CONFLICT(board_id) DO UPDATE SET view_count = view_count + 1, last_accessed = ?2",
+        params![&bid, now]
+    ).is_ok()
+}
+
+/// Set model info for a board (called when notebook has model cell)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_set_board_model(board_id: *const c_char, model_name: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+    let model = if model_name.is_null() {
+        None
+    } else {
+        let m = unsafe { CStr::from_ptr(model_name) }.to_string_lossy().to_string();
+        if m.is_empty() { None } else { Some(m) }
+    };
+
+    let db = sys.db.lock().unwrap();
+
+    db.execute(
+        "INSERT INTO board_metadata (board_id, contains_model) VALUES (?1, ?2)
+         ON CONFLICT(board_id) DO UPDATE SET contains_model = ?2",
+        params![&bid, &model]
+    ).is_ok()
+}
+
+/// Set skills for a board
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_set_board_skills(board_id: *const c_char, skills_json: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+    let json_str = unsafe { CStr::from_ptr(skills_json) }.to_string_lossy().to_string();
+
+    // Validate JSON
+    if serde_json::from_str::<Vec<String>>(&json_str).is_err() {
+        return false;
+    }
+
+    let db = sys.db.lock().unwrap();
+
+    db.execute(
+        "INSERT INTO board_metadata (board_id, contains_skills) VALUES (?1, ?2)
+         ON CONFLICT(board_id) DO UPDATE SET contains_skills = ?2",
+        params![&bid, &json_str]
+    ).is_ok()
+}
+
+/// Generate deep link URL for a board
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_board_link(board_id: *const c_char) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+
+    let link: Option<String> = {
+        let db = sys.db.lock().unwrap();
+
+        db.query_row(
+            "SELECT w.group_id, o.workspace_id
+             FROM objects o
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE o.id = ?1",
+            params![&bid],
+            |row| {
+                let group_id: String = row.get(0)?;
+                let workspace_id: String = row.get(1)?;
+                Ok(format!("cyan://group/{}/workspace/{}/board/{}", group_id, workspace_id, bid))
+            }
+        ).ok()
+    };
+
+    match link {
+        Some(url) => CString::new(url).unwrap().into_raw(),
+        None => CString::new(format!("cyan://board/{}", bid)).unwrap().into_raw(),
+    }
+}
+
+/// Search boards by label
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    let search_label = unsafe { CStr::from_ptr(label) }.to_string_lossy().to_string();
+    let pattern = format!("%\"{}%", search_label); // JSON contains pattern
+
+    let results: Vec<serde_json::Value> = {
+        let db = sys.db.lock().unwrap();
+
+        let mut stmt = match db.prepare(
+            "SELECT o.id, o.name, o.workspace_id, w.name, w.group_id,
+                    COALESCE(m.labels, '[]'), COALESCE(m.rating, 0)
+             FROM board_metadata m
+             JOIN objects o ON m.board_id = o.id
+             JOIN workspaces w ON o.workspace_id = w.id
+             WHERE m.labels LIKE ?1
+             ORDER BY m.rating DESC
+             LIMIT 50"
+        ) {
+            Ok(s) => s,
+            Err(_) => return CString::new("[]").unwrap().into_raw(),
+        };
+
+        stmt.query_map(params![&pattern], |row| {
+            let labels_json: String = row.get(5)?;
+
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "workspace_id": row.get::<_, String>(2)?,
+                "workspace_name": row.get::<_, String>(3)?,
+                "group_id": row.get::<_, String>(4)?,
+                "labels": serde_json::from_str::<Vec<String>>(&labels_json).unwrap_or_default(),
+                "rating": row.get::<_, i32>(6)?,
+                "link": format!("cyan://group/{}/workspace/{}/board/{}",
+                    row.get::<_, String>(4)?, row.get::<_, String>(2)?, row.get::<_, String>(0)?)
+            }))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    };
+
+    match serde_json::to_string(&results) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => CString::new("[]").unwrap().into_raw(),
     }
 }
