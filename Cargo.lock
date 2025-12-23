@@ -6233,6 +6233,7 @@ dependencies = [
  "llama-cpp-2",
  "once_cell",
  "ort",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
