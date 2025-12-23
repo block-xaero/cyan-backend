@@ -1,0 +1,130 @@
+--- a/src/ai_bridge.rs
++++ b/src/ai_bridge.rs
+@@ -219,6 +219,8 @@ pub struct AIBridge {
+     event_tx: tokio::sync::mpsc::UnboundedSender<SwiftEvent>,
+     pipeline: RwLock<Option<WhiteboardPipeline>>,
+     analyst_runtime: RwLock<Option<Runtime>>,
++    sql_runtime: RwLock<Option<Runtime>>,
++    sql_model_name: RwLock<Option<String>>,
+     analyst_model_name: RwLock<Option<String>>,
+     event_buffer: RwLock<VecDeque<AIIntegrationEvent>>,
+     insight_queue: RwLock<VecDeque<ProactiveInsight>>,
+@@ -255,6 +257,8 @@ impl AIBridge {
+             db, event_tx,
+             pipeline: RwLock::new(None),
+             analyst_runtime: RwLock::new(None),
++            sql_runtime: RwLock::new(None),
++            sql_model_name: RwLock::new(None),
+             analyst_model_name: RwLock::new(None),
+             event_buffer: RwLock::new(VecDeque::with_capacity(EVENT_BUFFER_SIZE)),
+             insight_queue: RwLock::new(VecDeque::new()),
+@@ -349,6 +353,7 @@ impl AIBridge {
+         let yolo_dir = models_path.join("cyan-sketch");
+         let ocr_dir = models_path.join("paddleocr");
+         let phi_dir = models_path.join("cyan-lens");
++        let sql_dir = models_path.join("cyan-sql");
+
+         for (name, dir) in [("YOLO (cyan-sketch)", &yolo_dir), ("OCR (paddleocr)", &ocr_dir), ("Phi (cyan-lens)", &phi_dir)] {
+             if !dir.exists() {
+@@ -364,6 +369,14 @@ impl AIBridge {
+             return CommandResponse::err(format!("Analyst init failed: {}", e));
+         }
+
++        // Load cyan-sql for lens search (optional - falls back to cyan-lens if missing)
++        if sql_dir.exists() {
++            match self.init_sql_model(&sql_dir).await {
++                Ok(_) => tracing::info!("✅ cyan-sql loaded for lens search"),
++                Err(e) => tracing::warn!("⚠️ cyan-sql init failed (using cyan-lens): {}", e),
++            }
++        }
++
+         *self.models_dir.write().await = Some(models_path);
+         *self.initialized.write().await = true;
+         *self.lens.write().await = Some(CyanLens::new("cyan-lens"));
+@@ -382,6 +395,17 @@ impl AIBridge {
+         Ok(())
+     }
+
++    async fn init_sql_model(&self, sql_dir: &Path) -> anyhow::Result<()> {
++        let skill = Skill::load(sql_dir)?;
++        let mut runtime = Runtime::new()?;
++        let name = skill.name.clone();
++        runtime.load_from_skill(&skill, sql_dir)?;
++        *self.sql_runtime.write().await = Some(runtime);
++        *self.sql_model_name.write().await = Some(name.clone());
++        tracing::info!("✅ SQL model initialized: {}", name);
++        Ok(())
++    }
++
+     // ========================================================================
+     // Image → Mermaid
+     // ========================================================================
+@@ -519,10 +543,18 @@ impl AIBridge {
+         let request_id = uuid::Uuid::new_v4().to_string();
+         tracing::info!("🔍 lens_search: query={}, id={}", query, &request_id[..8]);
+
+-        let model_name_guard = self.analyst_model_name.read().await;
+-        let model_name = match model_name_guard.as_ref() {
+-            Some(n) => n.clone(),
+-            None => return CommandResponse::err("Analyst model not loaded"),
++        // Prefer sql_runtime if available, fallback to analyst_runtime
++        let (use_sql_runtime, model_name) = {
++            let sql_name = self.sql_model_name.read().await;
++            if let Some(n) = sql_name.as_ref() {
++                (true, n.clone())
++            } else {
++                let analyst_name = self.analyst_model_name.read().await;
++                match analyst_name.as_ref() {
++                    Some(n) => (false, n.clone()),
++                    None => return CommandResponse::err("No model loaded for lens search"),
++                }
++            }
+         };
+-        drop(model_name_guard);
++        tracing::info!("🔍 Using {} for lens search", if use_sql_runtime { "cyan-sql" } else { "cyan-lens (fallback)" });
+
+         let cyan_db_path_guard = self.cyan_db_path.read().await;
+         let cyan_db_path = match cyan_db_path_guard.as_ref() {
+@@ -542,17 +574,25 @@ impl AIBridge {
+             playbook::list_active(&playbook_db, "cyan-sql").unwrap_or_default()
+         };
+
+-        let mut runtime_guard = self.analyst_runtime.write().await;
+-        let runtime = match runtime_guard.as_mut() {
+-            Some(r) => r,
+-            None => return CommandResponse::err("Analyst runtime not available"),
+-        };
+-
+         // Build prompt
+         let prompt = self.build_sql_prompt(query, &playbook_bullets);
+
+         // Run inference
+         let start = std::time::Instant::now();
+-        let generated_text = match runtime.infer_sync(&model_name, InferenceInput::Text { prompt }) {
++        let generated_text = if use_sql_runtime {
++            let mut runtime_guard = self.sql_runtime.write().await;
++            let runtime = match runtime_guard.as_mut() {
++                Some(r) => r,
++                None => return CommandResponse::err("SQL runtime not available"),
++            };
++            match runtime.infer_sync(&model_name, InferenceInput::Text { prompt }) {
++                Ok(InferenceOutput::Text { content }) => content,
++                Ok(_) => return CommandResponse::err("Unexpected output type"),
++                Err(e) => return CommandResponse::err(format!("Inference failed: {}", e)),
++            }
++        } else {
++            let mut runtime_guard = self.analyst_runtime.write().await;
++            let runtime = match runtime_guard.as_mut() {
++                Some(r) => r,
++                None => return CommandResponse::err("Analyst runtime not available"),
++            };
++            match runtime.infer_sync(&model_name, InferenceInput::Text { prompt }) {
+             Ok(InferenceOutput::Text { content }) => content,
+             Ok(_) => return CommandResponse::err("Unexpected output type"),
+             Err(e) => return CommandResponse::err(format!("Inference failed: {}", e)),
++            }
+         };
+-        drop(runtime_guard);
+
+         // Parse output using executor
+         let parsed = match Executor::parse_output(&generated_text) {

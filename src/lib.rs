@@ -611,7 +611,7 @@ impl CyanSystem {
         let node_id = secret_key.public().to_string();
 
         println!("🔑 Node ID: {} (persistent={})", &node_id[..16], provided_secret_key.is_some());
-
+        let db_path_clone = db_path.clone();
         let db = Connection::open(db_path)?;
         ensure_schema(&db)?;
         run_migrations(&db)?;
@@ -641,6 +641,9 @@ impl CyanSystem {
             db_arc.clone(),
             event_tx.clone(),
         ));
+        if let Some(data_dir) = DATA_DIR.get() {
+            ai_bridge.set_cyan_db_path(data_dir.join("cyan.db")).await;
+        }
         ai_bridge.start_insight_generator();
 
         // Start background task to forward integration events to Swift
