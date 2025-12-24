@@ -546,7 +546,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             view_count INTEGER DEFAULT 0,
             contains_model TEXT,
             contains_skills TEXT DEFAULT '[]',
-            board_type TEXT DEFAULT 'freeform',
+            board_type TEXT DEFAULT 'canvas',
             last_accessed INTEGER DEFAULT 0,
             FOREIGN KEY (board_id) REFERENCES objects(id) ON DELETE CASCADE
         );
@@ -581,12 +581,16 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     // Check and add board_mode column to objects
     if conn.prepare("SELECT board_mode FROM objects LIMIT 1").is_err() {
         tracing::info!("Migration: adding board_mode column to objects");
-        let _ = conn.execute("ALTER TABLE objects ADD COLUMN board_mode TEXT DEFAULT 'freeform'", []);
+        let _ = conn.execute("ALTER TABLE objects ADD COLUMN board_mode TEXT DEFAULT 'canvas'", []);
     }
+
+    // Migrate existing 'freeform' values to 'canvas'
+    let _ = conn.execute("UPDATE objects SET board_mode = 'canvas' WHERE board_mode = 'freeform' OR board_mode IS NULL", []);
+
     // Check and create board_metadata table if not exists
     if conn.prepare("SELECT board_id FROM board_metadata LIMIT 1").is_err() {
         tracing::info!("Migration: creating board_metadata table");
-        let _ = conn.execute("CREATE TABLE IF NOT EXISTS board_metadata (board_id TEXT PRIMARY KEY, labels TEXT DEFAULT '[]', rating INTEGER DEFAULT 0, view_count INTEGER DEFAULT 0, contains_model TEXT, contains_skills TEXT DEFAULT '[]', board_type TEXT DEFAULT 'freeform', last_accessed INTEGER DEFAULT 0)", []);
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS board_metadata (board_id TEXT PRIMARY KEY, labels TEXT DEFAULT '[]', rating INTEGER DEFAULT 0, view_count INTEGER DEFAULT 0, contains_model TEXT, contains_skills TEXT DEFAULT '[]', board_type TEXT DEFAULT 'canvas', last_accessed INTEGER DEFAULT 0)", []);
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_board_rating ON board_metadata(rating DESC)", []);
     }
     Ok(())
@@ -641,9 +645,7 @@ impl CyanSystem {
             db_arc.clone(),
             event_tx.clone(),
         ));
-        if let Some(data_dir) = DATA_DIR.get() {
-            ai_bridge.set_cyan_db_path(data_dir.join("cyan.db")).await;
-        }
+        ai_bridge.set_cyan_db_path(PathBuf::from(db_path_clone)).await;
         ai_bridge.start_insight_generator();
 
         // Start background task to forward integration events to Swift
@@ -3013,12 +3015,27 @@ fn to_c_string(s: String) -> *const c_char {
 // ---------- FFI: lifecycle ----------
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_set_data_dir(path: *const c_char) -> bool {
+    eprintln!("🔥 cyan_set_data_dir ENTERED");
     let Some(s) = (unsafe { cstr_arg(path) }) else {
+        eprintln!("❌ cyan_set_data_dir: path is null");
         return false;
     };
-    DATA_DIR.set(PathBuf::from(s)).is_ok()
-}
+    eprintln!("📁 cyan_set_data_dir path: {}", s);
+    let path_buf = PathBuf::from(s);
 
+    // Set cyan_db_path on AIBridge if system exists
+    if let Some(system) = SYSTEM.get() {
+        let cyan_db_path = path_buf.join("cyan.db");
+        let ai_bridge = system.ai_bridge.clone();
+        if let Some(rt) = RUNTIME.get() {
+            rt.spawn(async move {
+                ai_bridge.set_cyan_db_path(cyan_db_path).await;
+            });
+        }
+    }
+
+    DATA_DIR.set(path_buf).is_ok()
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_set_discovery_key(key: *const c_char) -> bool {
     let Some(s) = (unsafe { cstr_arg(key) }) else {
@@ -3072,6 +3089,7 @@ pub extern "C" fn cyan_init_with_identity(
     db_path: *const c_char,
     secret_key_hex: *const c_char,
 ) -> bool {
+    eprintln!("🔥 cyan_init_with_identity");
     if SYSTEM.get().is_some() {
         return true;
     }
@@ -4735,28 +4753,35 @@ pub extern "C" fn cyan_reorder_notebook_cells(board_id: *const c_char, cell_ids_
     true
 }
 
-/// Get board mode (freeform or notebook)
+/// Get board mode (canvas, notebook, or notes)
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_get_board_mode(board_id: *const c_char) -> *mut c_char {
     let Some(sys) = SYSTEM.get() else {
-        return CString::new("freeform").unwrap().into_raw();
+        return CString::new("canvas").unwrap().into_raw();
     };
 
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
 
     let mode: String = {
         let db = sys.db.lock().unwrap();
-        db.query_row(
-            "SELECT COALESCE(board_mode, 'freeform') FROM objects WHERE id = ?1",
+        let raw_mode: String = db.query_row(
+            "SELECT COALESCE(board_mode, 'canvas') FROM objects WHERE id = ?1",
             params![bid],
             |row| row.get(0)
-        ).unwrap_or_else(|_| "freeform".to_string())
+        ).unwrap_or_else(|_| "canvas".to_string());
+
+        // Normalize legacy 'freeform' to 'canvas'
+        if raw_mode == "freeform" {
+            "canvas".to_string()
+        } else {
+            raw_mode
+        }
     };
 
     CString::new(mode).unwrap().into_raw()
 }
 
-/// Set board mode (freeform or notebook)
+/// Set board mode (canvas, notebook, or notes)
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_set_board_mode(board_id: *const c_char, mode: *const c_char) -> bool {
     let Some(sys) = SYSTEM.get() else {
@@ -4766,7 +4791,16 @@ pub extern "C" fn cyan_set_board_mode(board_id: *const c_char, mode: *const c_ch
     let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
     let mode_str = unsafe { CStr::from_ptr(mode) }.to_string_lossy().to_string();
 
-    if mode_str != "freeform" && mode_str != "notebook" {
+    // Normalize legacy 'freeform' to 'canvas'
+    let normalized_mode = if mode_str == "freeform" {
+        "canvas".to_string()
+    } else {
+        mode_str.clone()
+    };
+
+    // Validate mode
+    if normalized_mode != "canvas" && normalized_mode != "notebook" && normalized_mode != "notes" {
+        tracing::warn!("Invalid board mode: {}", normalized_mode);
         return false;
     }
 
@@ -4785,7 +4819,7 @@ pub extern "C" fn cyan_set_board_mode(board_id: *const c_char, mode: *const c_ch
 
         if db.execute(
             "UPDATE objects SET board_mode = ?1 WHERE id = ?2",
-            params![&mode_str, &bid]
+            params![&normalized_mode, &bid]
         ).is_err() {
             return false;
         }
@@ -4794,7 +4828,7 @@ pub extern "C" fn cyan_set_board_mode(board_id: *const c_char, mode: *const c_ch
     if !group_id.is_empty() {
         let event = NetworkEvent::BoardModeChanged {
             board_id: bid.clone(),
-            mode: mode_str.clone(),
+            mode: normalized_mode.clone(),
         };
 
         let _ = sys.network_tx.send(NetworkCommand::Broadcast {
@@ -4983,10 +5017,10 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
     let result = metadata.unwrap_or_else(|| {
         let db = sys.db.lock().unwrap();
         let board_type: String = db.query_row(
-            "SELECT COALESCE(board_mode, 'freeform') FROM objects WHERE id = ?1",
+            "SELECT COALESCE(board_mode, 'canvas') FROM objects WHERE id = ?1",
             params![&bid],
             |row| row.get(0)
-        ).unwrap_or_else(|_| "freeform".to_string());
+        ).unwrap_or_else(|_| "canvas".to_string());
 
         BoardMetadata {
             board_id: bid,
@@ -5019,7 +5053,7 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
             "workspace" => {
                 "SELECT o.id, COALESCE(m.labels, '[]'), COALESCE(m.rating, 0),
                         COALESCE(m.view_count, 0), m.contains_model,
-                        COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'freeform'),
+                        COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'canvas'),
                         COALESCE(m.last_accessed, 0)
                  FROM objects o
                  LEFT JOIN board_metadata m ON o.id = m.board_id
@@ -5029,7 +5063,7 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
             "group" => {
                 "SELECT o.id, COALESCE(m.labels, '[]'), COALESCE(m.rating, 0),
                         COALESCE(m.view_count, 0), m.contains_model,
-                        COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'freeform'),
+                        COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'canvas'),
                         COALESCE(m.last_accessed, 0)
                  FROM objects o
                  JOIN workspaces w ON o.workspace_id = w.id
@@ -5040,7 +5074,7 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
             _ => {
                 "SELECT o.id, COALESCE(m.labels, '[]'), COALESCE(m.rating, 0),
                         COALESCE(m.view_count, 0), m.contains_model,
-                        COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'freeform'),
+                        COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'canvas'),
                         COALESCE(m.last_accessed, 0)
                  FROM objects o
                  LEFT JOIN board_metadata m ON o.id = m.board_id
@@ -5096,7 +5130,7 @@ pub extern "C" fn cyan_get_top_boards(group_id: *const c_char, limit: i32) -> *m
         let mut stmt = match db.prepare(
             "SELECT o.id, o.name, o.workspace_id, w.name as workspace_name,
                     COALESCE(m.labels, '[]'), COALESCE(m.rating, 0),
-                    COALESCE(o.board_mode, 'freeform'), m.contains_model
+                    COALESCE(o.board_mode, 'canvas'), m.contains_model
              FROM objects o
              JOIN workspaces w ON o.workspace_id = w.id
              LEFT JOIN board_metadata m ON o.id = m.board_id
