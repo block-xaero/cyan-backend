@@ -25,7 +25,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, SecretKey};
 use iroh_blobs::store::fs::FsStore as BlobStore;
-use iroh_blobs::util::SendStream;
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipTopic},
     proto::state::TopicId,
@@ -252,6 +251,12 @@ pub enum NetworkEvent {
         board_id: String,
         rating: i32,
     },
+    // ---- User profile events ----
+    ProfileUpdated {
+        node_id: String,
+        display_name: String,
+        avatar_hash: Option<String>,
+    },
 }
 
 // ---------- Internal commands ----------
@@ -383,6 +388,21 @@ enum CommandMsg {
         workspace_id: String,
     },
 
+    // ---- Direct Message commands ----
+    StartDirectChat {
+        peer_id: String,
+        workspace_id: String,
+    },
+    SendDirectMessage {
+        peer_id: String,
+        workspace_id: String,
+        message: String,
+        parent_id: Option<String>,
+    },
+    LoadDirectMessageHistory {
+        peer_id: String,
+    },
+
     Snapshot {},
     SeedDemoIfEmpty,
 }
@@ -437,6 +457,14 @@ pub enum SwiftEvent {
     /// AI proactive insight generated
     AIInsight {
         insight_json: String,
+    },
+    /// Direct message received from peer
+    DirectMessageReceived {
+        id: String,
+        peer_id: String,
+        message: String,
+        timestamp: i64,
+        is_incoming: bool,
     },
 }
 
@@ -593,6 +621,44 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         let _ = conn.execute("CREATE TABLE IF NOT EXISTS board_metadata (board_id TEXT PRIMARY KEY, labels TEXT DEFAULT '[]', rating INTEGER DEFAULT 0, view_count INTEGER DEFAULT 0, contains_model TEXT, contains_skills TEXT DEFAULT '[]', board_type TEXT DEFAULT 'canvas', last_accessed INTEGER DEFAULT 0)", []);
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_board_rating ON board_metadata(rating DESC)", []);
     }
+
+    // Check and create user_profiles table if not exists
+    if conn.prepare("SELECT node_id FROM user_profiles LIMIT 1").is_err() {
+        tracing::info!("Migration: creating user_profiles table");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS user_profiles (
+                node_id TEXT PRIMARY KEY,
+                display_name TEXT,
+                avatar_hash TEXT,
+                status TEXT DEFAULT 'offline',
+                last_seen INTEGER,
+                updated_at INTEGER
+            )",
+            [],
+        );
+    }
+
+    // Check and create direct_messages table if not exists
+    if conn.prepare("SELECT id FROM direct_messages LIMIT 1").is_err() {
+        tracing::info!("Migration: creating direct_messages table");
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS direct_messages (
+                id TEXT PRIMARY KEY,
+                peer_id TEXT NOT NULL,
+                workspace_id TEXT,
+                message TEXT NOT NULL,
+                parent_id TEXT,
+                is_outgoing INTEGER DEFAULT 0,
+                timestamp INTEGER NOT NULL
+            )",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dm_peer ON direct_messages(peer_id, timestamp)",
+            [],
+        );
+    }
+
     Ok(())
 }
 
@@ -1097,6 +1163,83 @@ impl CommandActor {
                     }
                 }
 
+                CommandMsg::StartDirectChat { peer_id, workspace_id } => {
+                    tracing::info!("Starting direct chat with peer: {peer_id}");
+                    let _ = self.network_tx.send(NetworkCommand::StartChatStream {
+                        peer_id: peer_id.clone(),
+                        workspace_id: workspace_id.clone(),
+                    });
+                }
+
+                CommandMsg::SendDirectMessage { peer_id, workspace_id, message, parent_id } => {
+                    let id = blake3::hash(
+                        format!("dm:{}-{}-{}-{}", &peer_id, &workspace_id, &message, chrono::Utc::now()).as_bytes()
+                    ).to_hex().to_string();
+                    let now = chrono::Utc::now().timestamp();
+
+                    // Store in local DB
+                    {
+                        let db = self.db.lock().unwrap();
+                        let _ = db.execute(
+                            "INSERT INTO direct_messages (id, peer_id, workspace_id, message, parent_id, is_outgoing, timestamp) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                            params![id, peer_id, workspace_id, message, parent_id, now],
+                        );
+                    }
+
+                    // Forward to network layer
+                    let _ = self.network_tx.send(NetworkCommand::SendDirectChat {
+                        peer_id: peer_id.clone(),
+                        workspace_id: workspace_id.clone(),
+                        message: message.clone(),
+                        parent_id: parent_id.clone(),
+                    });
+
+                    // Emit event for Swift UI
+                    let _ = self.event_tx.send(SwiftEvent::DirectMessageReceived {
+                        id,
+                        peer_id,
+                        message,
+                        timestamp: now,
+                        is_incoming: false,
+                    });
+                }
+
+                CommandMsg::LoadDirectMessageHistory { peer_id } => {
+                    tracing::info!("Loading DM history with peer: {peer_id}");
+
+                    let messages: Vec<(String, String, String, Option<String>, i32, i64)> = {
+                        let db = self.db.lock().unwrap();
+                        let mut stmt = db.prepare(
+                            "SELECT id, peer_id, message, parent_id, is_outgoing, timestamp \
+                             FROM direct_messages WHERE peer_id = ?1 ORDER BY timestamp ASC LIMIT 100"
+                        ).unwrap();
+
+                        stmt.query_map(params![peer_id], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, i32>(4)?,
+                                row.get::<_, i64>(5)?,
+                            ))
+                        }).unwrap().filter_map(|r| r.ok()).collect()
+                    };
+
+                    tracing::info!("Found {} DM messages with peer {}", messages.len(), peer_id);
+
+                    for (id, peer, msg, _parent, is_outgoing, timestamp) in messages {
+                        let _ = self.event_tx.send(SwiftEvent::DirectMessageReceived {
+                            id,
+                            peer_id: peer,
+                            message: msg,
+                            timestamp,
+                            is_incoming: is_outgoing == 0,
+                        });
+                    }
+                }
+
                 CommandMsg::Snapshot {} => {
                     let json = dump_tree_json(&self.db);
                     let _ = self.event_tx.send(SwiftEvent::TreeLoaded(json.clone()));
@@ -1193,15 +1336,41 @@ async fn handle_chat_stream(
                                     );
                                 }
 
-                                // Notify Swift
+                                // Also store in direct_messages table
+                                {
+                                    let db = db.lock().unwrap();
+                                    let _ = db.execute(
+                                        "INSERT OR IGNORE INTO direct_messages (id, peer_id, workspace_id, message, parent_id, is_outgoing, timestamp) \
+                                         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+                                        params![
+                                            id.clone(),
+                                            peer_id.clone(),
+                                            workspace_id.clone(),
+                                            chat_msg.message.clone(),
+                                            chat_msg.parent_id.clone(),
+                                            now
+                                        ],
+                                    );
+                                }
+
+                                // Notify Swift via ChatSent (for backward compat)
                                 let _ = event_tx.send(SwiftEvent::Network(NetworkEvent::ChatSent {
-                                    id,
+                                    id: id.clone(),
                                     workspace_id: workspace_id.clone(),
-                                    message: chat_msg.message,
+                                    message: chat_msg.message.clone(),
                                     author: peer_id.clone(),
-                                    parent_id: chat_msg.parent_id,
+                                    parent_id: chat_msg.parent_id.clone(),
                                     timestamp: now,
                                 }));
+
+                                // Also emit DirectMessageReceived for DM-specific handling
+                                let _ = event_tx.send(SwiftEvent::DirectMessageReceived {
+                                    id,
+                                    peer_id: peer_id.clone(),
+                                    message: chat_msg.message,
+                                    timestamp: now,
+                                    is_incoming: true,
+                                });
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to parse chat message: {e}");
@@ -1812,6 +1981,21 @@ impl NetworkActor {
                                                 let _ = db.execute(
                                                     "INSERT INTO board_metadata (board_id, rating) VALUES (?1, ?2) ON CONFLICT(board_id) DO UPDATE SET rating = ?2",
                                                     params![board_id, rating],
+                                                );
+                                            }
+                                            NetworkEvent::ProfileUpdated { node_id, display_name, avatar_hash } => {
+                                                // Store/update the peer's profile
+                                                let now = chrono::Utc::now().timestamp();
+                                                let db = db.lock().unwrap();
+                                                let _ = db.execute(
+                                                    "INSERT INTO user_profiles (node_id, display_name, avatar_hash, status, updated_at)
+                                                     VALUES (?1, ?2, ?3, 'online', ?4)
+                                                     ON CONFLICT(node_id) DO UPDATE SET
+                                                        display_name = excluded.display_name,
+                                                        avatar_hash = COALESCE(excluded.avatar_hash, user_profiles.avatar_hash),
+                                                        status = 'online',
+                                                        updated_at = excluded.updated_at",
+                                                    params![node_id, display_name, avatar_hash, now],
                                                 );
                                             }
                                         }
@@ -5533,4 +5717,278 @@ pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_ch
         Ok(json) => CString::new(json).unwrap().into_raw(),
         Err(_) => CString::new("[]").unwrap().into_raw(),
     }
+}
+// ============================================================
+// USER PROFILE FFI FUNCTIONS
+// ============================================================
+
+/// Get user profile by node_id
+/// Returns JSON: {"node_id": "...", "display_name": "...", "avatar_hash": "...", "status": "...", "last_seen": 123}
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_user_profile(node_id: *const c_char) -> *mut c_char {
+    let Some(nid) = (unsafe { cstr_arg(node_id) }) else {
+        return std::ptr::null_mut();
+    };
+
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+
+    let profile: Option<serde_json::Value> = {
+        let db = sys.db.lock().unwrap();
+        db.query_row(
+            "SELECT node_id, display_name, avatar_hash, status, last_seen, updated_at
+             FROM user_profiles WHERE node_id = ?1",
+            params![nid],
+            |row| {
+                Ok(serde_json::json!({
+                    "node_id": row.get::<_, String>(0)?,
+                    "display_name": row.get::<_, Option<String>>(1)?,
+                    "avatar_hash": row.get::<_, Option<String>>(2)?,
+                    "status": row.get::<_, String>(3)?,
+                    "last_seen": row.get::<_, Option<i64>>(4)?,
+                    "updated_at": row.get::<_, Option<i64>>(5)?
+                }))
+            }
+        ).optional().unwrap_or(None)
+    };
+
+    match profile {
+        Some(p) => CString::new(p.to_string()).unwrap().into_raw(),
+        None => {
+            let fallback = serde_json::json!({
+                "node_id": nid,
+                "display_name": null,
+                "avatar_hash": null,
+                "status": "unknown",
+                "last_seen": null
+            });
+            CString::new(fallback.to_string()).unwrap().into_raw()
+        }
+    }
+}
+
+/// Get multiple user profiles at once (batch lookup)
+/// Input: JSON array of node_ids ["id1", "id2", ...]
+/// Returns: JSON object {"id1": {...}, "id2": {...}, ...}
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_profiles_batch(node_ids_json: *const c_char) -> *mut c_char {
+    let Some(json_str) = (unsafe { cstr_arg(node_ids_json) }) else {
+        return CString::new("{}").unwrap().into_raw();
+    };
+
+    let node_ids: Vec<String> = match serde_json::from_str(&json_str) {
+        Ok(ids) => ids,
+        Err(_) => return CString::new("{}").unwrap().into_raw(),
+    };
+
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("{}").unwrap().into_raw();
+    };
+
+    let mut result = serde_json::Map::new();
+
+    {
+        let db = sys.db.lock().unwrap();
+
+        for nid in &node_ids {
+            let profile: Option<serde_json::Value> = db.query_row(
+                "SELECT node_id, display_name, avatar_hash, status, last_seen
+                 FROM user_profiles WHERE node_id = ?1",
+                params![nid],
+                |row| {
+                    Ok(serde_json::json!({
+                        "node_id": row.get::<_, String>(0)?,
+                        "display_name": row.get::<_, Option<String>>(1)?,
+                        "avatar_hash": row.get::<_, Option<String>>(2)?,
+                        "status": row.get::<_, String>(3)?,
+                        "last_seen": row.get::<_, Option<i64>>(4)?
+                    }))
+                }
+            ).optional().unwrap_or(None);
+
+            if let Some(p) = profile {
+                result.insert(nid.clone(), p);
+            } else {
+                result.insert(nid.clone(), serde_json::json!({
+                    "node_id": nid,
+                    "display_name": null,
+                    "status": "unknown"
+                }));
+            }
+        }
+    }
+
+    CString::new(serde_json::Value::Object(result).to_string()).unwrap().into_raw()
+}
+
+/// Set my profile (display name and optional avatar)
+/// avatar_path can be null - if provided, file is hashed and stored in blobs
+/// Broadcasts ProfileUpdated to all groups I'm a member of
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_set_my_profile(
+    display_name: *const c_char,
+    avatar_path: *const c_char
+) -> bool {
+    let Some(name) = (unsafe { cstr_arg(display_name) }) else {
+        return false;
+    };
+
+    let avatar_path_opt = unsafe { cstr_arg(avatar_path) };
+
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let node_id = sys.node_id.clone();
+    let now = chrono::Utc::now().timestamp();
+
+    // Handle avatar if provided
+    let avatar_hash: Option<String> = if let Some(path) = avatar_path_opt {
+        match std::fs::read(&path) {
+            Ok(data) => {
+                let hash = blake3::hash(&data).to_hex().to_string();
+                if let Some(data_dir) = DATA_DIR.get() {
+                    let blobs_dir = data_dir.join("blobs");
+                    let _ = std::fs::create_dir_all(&blobs_dir);
+                    let blob_path = blobs_dir.join(&hash);
+                    let _ = std::fs::write(&blob_path, &data);
+                }
+                Some(hash)
+            }
+            Err(_) => None,
+        }
+    } else {
+        let db = sys.db.lock().unwrap();
+        db.query_row(
+            "SELECT avatar_hash FROM user_profiles WHERE node_id = ?1",
+            params![&node_id],
+            |row| row.get(0)
+        ).ok()
+    };
+
+    // Upsert profile
+    {
+        let db = sys.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT INTO user_profiles (node_id, display_name, avatar_hash, status, updated_at)
+             VALUES (?1, ?2, ?3, 'online', ?4)
+             ON CONFLICT(node_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                avatar_hash = COALESCE(excluded.avatar_hash, user_profiles.avatar_hash),
+                status = 'online',
+                updated_at = excluded.updated_at",
+            params![&node_id, &name, &avatar_hash, now],
+        );
+    }
+
+    // Broadcast to all groups
+    let group_ids: Vec<String> = {
+        let db = sys.db.lock().unwrap();
+        let mut stmt = db.prepare("SELECT id FROM groups").unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    let evt = NetworkEvent::ProfileUpdated {
+        node_id: node_id.clone(),
+        display_name: name.clone(),
+        avatar_hash: avatar_hash.clone(),
+    };
+
+    for gid in group_ids {
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id: gid,
+            event: evt.clone(),
+        });
+    }
+
+    let _ = sys.event_tx.send(SwiftEvent::Network(evt));
+
+    true
+}
+
+/// Get my own node ID (the Iroh public key)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_my_node_id() -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+
+    CString::new(sys.node_id.clone()).unwrap().into_raw()
+}
+
+/// Get my own profile
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_my_profile() -> *mut c_char {
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+
+    let node_id = sys.node_id.clone();
+
+    let profile: Option<serde_json::Value> = {
+        let db = sys.db.lock().unwrap();
+        db.query_row(
+            "SELECT node_id, display_name, avatar_hash, status, last_seen, updated_at
+             FROM user_profiles WHERE node_id = ?1",
+            params![&node_id],
+            |row| {
+                Ok(serde_json::json!({
+                    "node_id": row.get::<_, String>(0)?,
+                    "display_name": row.get::<_, Option<String>>(1)?,
+                    "avatar_hash": row.get::<_, Option<String>>(2)?,
+                    "status": row.get::<_, String>(3)?,
+                    "last_seen": row.get::<_, Option<i64>>(4)?,
+                    "updated_at": row.get::<_, Option<i64>>(5)?
+                }))
+            }
+        ).optional().unwrap_or(None)
+    };
+
+    match profile {
+        Some(p) => CString::new(p.to_string()).unwrap().into_raw(),
+        None => {
+            let fallback = serde_json::json!({
+                "node_id": node_id,
+                "display_name": null,
+                "avatar_hash": null,
+                "status": "online",
+                "last_seen": null
+            });
+            CString::new(fallback.to_string()).unwrap().into_raw()
+        }
+    }
+}
+
+/// Update a peer's status (called when gossip events occur)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_update_peer_status(node_id: *const c_char, status: *const c_char) -> bool {
+    let Some(nid) = (unsafe { cstr_arg(node_id) }) else {
+        return false;
+    };
+    let Some(stat) = (unsafe { cstr_arg(status) }) else {
+        return false;
+    };
+
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let now = chrono::Utc::now().timestamp();
+
+    let db = sys.db.lock().unwrap();
+    let result = db.execute(
+        "INSERT INTO user_profiles (node_id, status, last_seen, updated_at)
+         VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(node_id) DO UPDATE SET
+            status = excluded.status,
+            last_seen = excluded.last_seen,
+            updated_at = excluded.updated_at",
+        params![nid, stat, now],
+    );
+
+    result.is_ok()
 }
