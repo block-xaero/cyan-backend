@@ -275,9 +275,16 @@ impl AIBridge {
     /// Set the path to cyan.db for lens search
     /// Call this with: data_dir.join("cyan.db") where data_dir is the PathBuf
     pub async fn set_cyan_db_path(&self, path: PathBuf) {
-        tracing::info!("🔍 Setting cyan.db path: {:?}", path);
+        eprintln!("🔍 Setting cyan.db path: {:?}", path);
         *self.cyan_db_path.write().await = Some(path);
         *self.lens.write().await = Some(CyanLens::new("cyan-lens"));
+    }
+
+    /// Helper: Open cyan.db connection for playbook operations
+    async fn open_cyan_db(&self) -> Option<Connection> {
+        let path_guard = self.cyan_db_path.read().await;
+        let path = path_guard.as_ref()?;
+        Connection::open(path).ok()
     }
 
     pub fn start_insight_generator(self: &Arc<Self>) {
@@ -541,7 +548,7 @@ impl AIBridge {
         current_workspace_id: Option<String>,
     ) -> CommandResponse {
         let request_id = uuid::Uuid::new_v4().to_string();
-        tracing::info!("🔍 lens_search: query={}, id={}", query, &request_id[..8]);
+       eprintln!("🔍 lens_search: query={}, id={}", query, &request_id[..8]);
 
         // Determine which model/scope to use
         let (use_sql_runtime, model_name, scope) = {
@@ -556,7 +563,7 @@ impl AIBridge {
                 }
             }
         };
-        tracing::info!("🔍 Using {} for lens search (scope: {})", if use_sql_runtime { "cyan-sql" } else { "cyan-lens" }, scope);
+        eprintln!("🔍 Using {} for lens search (scope: {})", if use_sql_runtime { "cyan-sql" } else { "cyan-lens" }, scope);
 
         let cyan_db_path_guard = self.cyan_db_path.read().await;
         let cyan_db_path = match cyan_db_path_guard.as_ref() {
@@ -570,11 +577,9 @@ impl AIBridge {
             Err(e) => return CommandResponse::err(format!("Failed to open cyan.db: {}", e)),
         };
 
-        // Get playbook bullets from the correct scope
-        let playbook_bullets = {
-            let playbook_db = self.db.lock().unwrap();
-            playbook::list_active(&playbook_db, scope).unwrap_or_default()
-        };
+        // Get playbook bullets from cyan.db (FIXED: was using self.db)
+        let playbook_bullets = playbook::list_active(&cyan_db, scope).unwrap_or_default();
+        eprintln!("📚 Loaded {} playbook bullets for scope {}", playbook_bullets.len(), scope);
 
         // Build prompt
         let prompt = self.build_sql_prompt(query, &playbook_bullets);
@@ -741,13 +746,27 @@ impl AIBridge {
         prompt.push_str("<|system|>\n");
         prompt.push_str("You are CyanLens, an AI assistant for Cyan workspace management.\n\n");
 
+        // CRITICAL RULES from playbook - in system section for maximum weight
+        if !bullets.is_empty() {
+            prompt.push_str("## CRITICAL RULES (MUST FOLLOW):\n");
+            for bullet in bullets {
+                prompt.push_str(&format!("- {}\n", bullet.content));
+            }
+            prompt.push('\n');
+        }
+
         prompt.push_str("## Schema\n");
         prompt.push_str("- groups(id, name, icon, color, created_at)\n");
         prompt.push_str("- workspaces(id, group_id, name, description, created_at)\n");
-        prompt.push_str("- objects(id, workspace_id, type, name, board_mode, archived, created_at, updated_at)\n");
+        prompt.push_str("- objects(id, group_id, workspace_id, type, name, hash, size, board_id, board_mode, created_at)\n");
         prompt.push_str("- notebook_cells(id, board_id, cell_type, content, cell_order)\n");
         prompt.push_str("- board_labels(id, board_id, label)\n");
         prompt.push_str("- board_metadata(board_id, starred, template, rating)\n\n");
+
+        prompt.push_str("## IMPORTANT CONSTRAINTS:\n");
+        prompt.push_str("- The objects table has NO 'archived' column. NEVER use 'archived' in queries.\n");
+        prompt.push_str("- When searching by name, use simple: SELECT id, name FROM objects WHERE LOWER(name) LIKE '%term%'\n");
+        prompt.push_str("- Do NOT filter by group name unless user explicitly specifies a group.\n\n");
 
         prompt.push_str("## Relationships\n");
         prompt.push_str("- objects.workspace_id → workspaces.id\n");
@@ -762,22 +781,13 @@ impl AIBridge {
         prompt.push_str("<|end|>\n");
 
         prompt.push_str("<|user|>\n");
-
-        if !bullets.is_empty() {
-            prompt.push_str("## Learned patterns (IMPORTANT - follow these):\n");
-            for bullet in bullets {
-                prompt.push_str(&format!("- {}\n", bullet.content));
-            }
-            prompt.push('\n');
-        }
-
         prompt.push_str(query);
         prompt.push_str("\n<|end|>\n");
         prompt.push_str("<|assistant|>\n");
 
         prompt
     }
-
+    
     // ========================================================================
     // Lens Feedback - FIXED: saves to correct scope
     // ========================================================================
@@ -798,12 +808,16 @@ impl AIBridge {
         };
         tracing::info!("📝 Saving feedback to scope: {}", scope);
 
-        let db = self.db.lock().unwrap();
+        // Open cyan.db for playbook operations (FIXED: was using self.db)
+        let cyan_db = match self.open_cyan_db().await {
+            Some(db) => db,
+            None => return CommandResponse::err("Cyan DB not available for feedback"),
+        };
 
         // Record bullet feedback
         for bf in &bullet_feedback {
             let tag = FeedbackTag::from_str(&bf.tag);
-            if let Err(e) = playbook::record_feedback(&db, &bf.bullet_id, tag) {
+            if let Err(e) = playbook::record_feedback(&cyan_db, &bf.bullet_id, tag) {
                 tracing::warn!("Failed to record feedback for {}: {}", bf.bullet_id, e);
             }
         }
@@ -816,8 +830,11 @@ impl AIBridge {
                 corr.explanation
             );
             let section = if was_helpful { Section::Strategies } else { Section::Mistakes };
-            match playbook::add_with_source(&db, scope, section, &content, "lens_feedback", request_id) {
-                Ok(id) => Some(id),
+            match playbook::add_with_source(&cyan_db, scope, section, &content, "lens_feedback", request_id) {
+                Ok(id) => {
+                    tracing::info!("✅ Created correction bullet: {} in scope {}", id, scope);
+                    Some(id)
+                }
                 Err(e) => {
                     tracing::warn!("Failed to add correction bullet: {}", e);
                     None
@@ -839,9 +856,12 @@ impl AIBridge {
     // ========================================================================
 
     async fn cmd_playbook_add(&self, scope: &str, section: &str, content: &str) -> CommandResponse {
-        let db = self.db.lock().unwrap();
+        let cyan_db = match self.open_cyan_db().await {
+            Some(db) => db,
+            None => return CommandResponse::err("Cyan DB not available"),
+        };
         let section_enum = Section::from_str(section);
-        match playbook::add(&db, scope, section_enum, content) {
+        match playbook::add(&cyan_db, scope, section_enum, content) {
             Ok(bullet_id) => CommandResponse::ok_with_data(serde_json::json!({
                 "bullet_id": bullet_id, "scope": scope, "section": section,
             })),
@@ -850,17 +870,23 @@ impl AIBridge {
     }
 
     async fn cmd_playbook_feedback(&self, bullet_id: &str, tag: &str) -> CommandResponse {
-        let db = self.db.lock().unwrap();
+        let cyan_db = match self.open_cyan_db().await {
+            Some(db) => db,
+            None => return CommandResponse::err("Cyan DB not available"),
+        };
         let tag_enum = FeedbackTag::from_str(tag);
-        match playbook::record_feedback(&db, bullet_id, tag_enum) {
+        match playbook::record_feedback(&cyan_db, bullet_id, tag_enum) {
             Ok(()) => CommandResponse::ok_with_data(serde_json::json!({ "bullet_id": bullet_id, "tag": tag })),
             Err(e) => CommandResponse::err(format!("Failed to record feedback: {}", e)),
         }
     }
 
     async fn cmd_playbook_list(&self, scope: &str) -> CommandResponse {
-        let db = self.db.lock().unwrap();
-        match playbook::list_all(&db, scope) {
+        let cyan_db = match self.open_cyan_db().await {
+            Some(db) => db,
+            None => return CommandResponse::err("Cyan DB not available"),
+        };
+        match playbook::list_all(&cyan_db, scope) {
             Ok(bullets) => {
                 let items: Vec<serde_json::Value> = bullets.iter().map(|b| serde_json::json!({
                     "id": b.id, "section": b.section.as_str(), "content": b.content,
@@ -873,8 +899,11 @@ impl AIBridge {
     }
 
     async fn cmd_playbook_stats(&self, scope: &str) -> CommandResponse {
-        let db = self.db.lock().unwrap();
-        match playbook::stats(&db, scope) {
+        let cyan_db = match self.open_cyan_db().await {
+            Some(db) => db,
+            None => return CommandResponse::err("Cyan DB not available"),
+        };
+        match playbook::stats(&cyan_db, scope) {
             Ok(stats) => CommandResponse::ok_with_data(serde_json::json!({
                 "scope": scope, "total_bullets": stats.total_bullets,
                 "by_section": stats.by_section, "avg_score": stats.avg_score,
@@ -884,17 +913,23 @@ impl AIBridge {
     }
 
     async fn cmd_playbook_delete(&self, bullet_id: &str) -> CommandResponse {
-        let db = self.db.lock().unwrap();
-        match playbook::delete(&db, bullet_id) {
+        let cyan_db = match self.open_cyan_db().await {
+            Some(db) => db,
+            None => return CommandResponse::err("Cyan DB not available"),
+        };
+        match playbook::delete(&cyan_db, bullet_id) {
             Ok(()) => CommandResponse::ok_with_data(serde_json::json!({ "bullet_id": bullet_id, "deleted": true })),
             Err(e) => CommandResponse::err(format!("Failed to delete: {}", e)),
         }
     }
 
     async fn cmd_playbook_seed(&self, scope: &str) -> CommandResponse {
-        let db = self.db.lock().unwrap();
+        let cyan_db = match self.open_cyan_db().await {
+            Some(db) => db,
+            None => return CommandResponse::err("Cyan DB not available"),
+        };
 
-        if let Ok(stats) = playbook::stats(&db, scope) {
+        if let Ok(stats) = playbook::stats(&cyan_db, scope) {
             if stats.total_bullets > 0 {
                 return CommandResponse::ok_with_data(serde_json::json!({
                     "scope": scope, "seeded": false, "existing_count": stats.total_bullets,
@@ -924,7 +959,7 @@ impl AIBridge {
 
         let mut added = 0;
         for (section, content) in seeds {
-            if playbook::add(&db, scope, section, content).is_ok() { added += 1; }
+            if playbook::add(&cyan_db, scope, section, content).is_ok() { added += 1; }
         }
 
         tracing::info!("✅ Playbook seeded: {} bullets", added);
