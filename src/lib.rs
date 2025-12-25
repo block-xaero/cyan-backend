@@ -316,6 +316,7 @@ pub struct BoardMetadata {
     pub contains_skills: Vec<String>,
     pub board_type: String,
     pub last_accessed: i64,
+    pub is_pinned: bool,
 }
 
 /// Message sent through channel to chat stream writer task
@@ -576,11 +577,13 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             contains_skills TEXT DEFAULT '[]',
             board_type TEXT DEFAULT 'canvas',
             last_accessed INTEGER DEFAULT 0,
+            is_pinned INTEGER DEFAULT 0,
             FOREIGN KEY (board_id) REFERENCES objects(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_board_rating ON board_metadata(rating DESC);
         "#,
     )?;
+
     Ok(())
 }
 
@@ -618,8 +621,16 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     // Check and create board_metadata table if not exists
     if conn.prepare("SELECT board_id FROM board_metadata LIMIT 1").is_err() {
         tracing::info!("Migration: creating board_metadata table");
-        let _ = conn.execute("CREATE TABLE IF NOT EXISTS board_metadata (board_id TEXT PRIMARY KEY, labels TEXT DEFAULT '[]', rating INTEGER DEFAULT 0, view_count INTEGER DEFAULT 0, contains_model TEXT, contains_skills TEXT DEFAULT '[]', board_type TEXT DEFAULT 'canvas', last_accessed INTEGER DEFAULT 0)", []);
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS board_metadata (board_id TEXT PRIMARY KEY, labels TEXT DEFAULT '[]', rating INTEGER DEFAULT 0, view_count INTEGER DEFAULT 0, contains_model TEXT, contains_skills TEXT DEFAULT '[]', board_type TEXT DEFAULT 'canvas', last_accessed INTEGER DEFAULT 0, is_pinned INTEGER DEFAULT 0)", []);
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_board_rating ON board_metadata(rating DESC)", []);
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_board_pinned ON board_metadata(is_pinned DESC)", []);
+    }
+
+    // Migration: Add is_pinned column if missing
+    if conn.prepare("SELECT is_pinned FROM board_metadata LIMIT 1").is_err() {
+        tracing::info!("Migration: adding is_pinned column to board_metadata");
+        let _ = conn.execute("ALTER TABLE board_metadata ADD COLUMN is_pinned INTEGER DEFAULT 0", []);
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_board_pinned ON board_metadata(is_pinned DESC)", []);
     }
 
     // Check and create user_profiles table if not exists
@@ -658,6 +669,12 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             [],
         );
     }
+
+    // Ensure is_pinned index exists (after column migration has run)
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_board_pinned ON board_metadata(is_pinned DESC)",
+        [],
+    );
 
     Ok(())
 }
@@ -2740,6 +2757,8 @@ struct BoardMetadataDTO {
     contains_skills: Vec<String>,
     board_type: String,
     last_accessed: i64,
+    #[serde(default)]
+    is_pinned: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2943,7 +2962,7 @@ fn build_group_snapshot(db: &Arc<Mutex<Connection>>, group_id: &str) -> Result<T
     };
     let board_metadata: Vec<BoardMetadataDTO> = {
         match db.prepare(
-            "SELECT m.board_id, m.labels, m.rating, m.view_count, m.contains_model, m.contains_skills, m.board_type, m.last_accessed FROM board_metadata m JOIN objects o ON m.board_id = o.id JOIN workspaces w ON o.workspace_id = w.id WHERE w.group_id = ?1"
+            "SELECT m.board_id, m.labels, m.rating, m.view_count, m.contains_model, m.contains_skills, m.board_type, m.last_accessed, COALESCE(m.is_pinned, 0) FROM board_metadata m JOIN objects o ON m.board_id = o.id JOIN workspaces w ON o.workspace_id = w.id WHERE w.group_id = ?1"
         ) {
             Ok(mut stmt) => {
                 stmt.query_map(params![group_id], |row| {
@@ -2958,6 +2977,7 @@ fn build_group_snapshot(db: &Arc<Mutex<Connection>>, group_id: &str) -> Result<T
                         contains_skills: serde_json::from_str(&skills_json).unwrap_or_default(),
                         board_type: row.get(6)?,
                         last_accessed: row.get(7)?,
+                        is_pinned: row.get::<_, i32>(8)? != 0,
                     })
                 }).unwrap().filter_map(|r| r.ok()).collect()
             }
@@ -3093,7 +3113,7 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
 
     let board_metadata: Vec<BoardMetadataDTO> = {
         match db.prepare(
-            "SELECT board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed FROM board_metadata"
+            "SELECT board_id, labels, rating, view_count, contains_model, contains_skills, board_type, last_accessed, COALESCE(is_pinned, 0) FROM board_metadata"
         ) {
             Ok(mut stmt) => {
                 stmt.query_map([], |row| {
@@ -3108,6 +3128,7 @@ fn dump_tree_json(db: &Arc<Mutex<Connection>>) -> String {
                         contains_skills: serde_json::from_str(&skills_json).unwrap_or_default(),
                         board_type: row.get(6)?,
                         last_accessed: row.get(7)?,
+                        is_pinned: row.get::<_, i32>(8)? != 0,
                     })
                 }).unwrap().filter_map(|r| r.ok()).collect()
             }
@@ -3904,11 +3925,16 @@ pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
         let db = sys.db.lock().unwrap();
 
         let mut stmt = db.prepare(
-            "SELECT o.id, o.workspace_id, w.group_id, o.name, o.created_at
+            "SELECT o.id, o.workspace_id, w.group_id, o.name, o.created_at,
+                    COALESCE(m.is_pinned, 0) as is_pinned,
+                    COALESCE(m.labels, '[]') as labels,
+                    COALESCE(m.rating, 0) as rating,
+                    COALESCE(m.last_accessed, 0) as last_accessed
              FROM objects o
              LEFT JOIN workspaces w ON o.workspace_id = w.id
+             LEFT JOIN board_metadata m ON o.id = m.board_id
              WHERE o.type = 'whiteboard'
-             ORDER BY o.created_at DESC"
+             ORDER BY COALESCE(m.is_pinned, 0) DESC, o.created_at DESC"
         ).unwrap();
 
         stmt.query_map([], |row| {
@@ -3918,7 +3944,11 @@ pub extern "C" fn cyan_get_all_boards() -> *mut c_char {
                 "group_id": row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 "name": row.get::<_, String>(3)?,
                 "created_at": row.get::<_, i64>(4)?,
-                "element_count": 0
+                "element_count": 0,
+                "is_pinned": row.get::<_, i32>(5)? != 0,
+                "labels": row.get::<_, String>(6)?,
+                "rating": row.get::<_, i32>(7)?,
+                "last_accessed": row.get::<_, i64>(8)?
             }))
         }).unwrap().filter_map(|r| r.ok()).collect()
     };
@@ -4668,8 +4698,114 @@ pub extern "C" fn cyan_poll_integration_events() -> *mut c_char {
     }
 }
 
-// ==================== AI FFI ====================
+// ---------- FFI: Integration Graph ----------
 
+/// Get list of connected integrations for a scope
+/// Returns JSON array: ["slack", "jira", ...]
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_connected_integrations(scope_id: *const c_char) -> *mut c_char {
+    let Some(sid) = (unsafe { cstr_arg(scope_id) }) else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+    let Some(runtime) = RUNTIME.get() else {
+        return CString::new("[]").unwrap().into_raw();
+    };
+
+    // Use the get_graph command to get connected integrations
+    let cmd = serde_json::json!({
+        "cmd": "get_graph",
+        "scope_id": sid
+    });
+
+    let result = runtime.block_on(async {
+        sys.integration_bridge.handle_command(&cmd.to_string()).await
+    });
+
+    // Parse result and extract connected_integrations
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
+        if let Some(data) = parsed.get("data") {
+            if let Some(integrations) = data.get("connected_integrations") {
+                return CString::new(integrations.to_string())
+                    .unwrap_or_else(|_| CString::new("[]").unwrap())
+                    .into_raw();
+            }
+        }
+    }
+
+    CString::new("[]").unwrap().into_raw()
+}
+
+/// Get the full integration graph for a scope
+/// Returns JSON: { "nodes": [...], "edges": [...], ... }
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_integration_graph(scope_id: *const c_char) -> *mut c_char {
+    let Some(sid) = (unsafe { cstr_arg(scope_id) }) else {
+        return CString::new("{}").unwrap().into_raw();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new("{}").unwrap().into_raw();
+    };
+    let Some(runtime) = RUNTIME.get() else {
+        return CString::new("{}").unwrap().into_raw();
+    };
+
+    let cmd = serde_json::json!({
+        "cmd": "get_graph",
+        "scope_id": sid
+    });
+
+    let result = runtime.block_on(async {
+        sys.integration_bridge.handle_command(&cmd.to_string()).await
+    });
+
+    // Parse and return just the data portion (the graph)
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
+        if parsed.get("success").and_then(|v| v.as_bool()) == Some(true) {
+            if let Some(data) = parsed.get("data") {
+                return CString::new(data.to_string())
+                    .unwrap_or_else(|_| CString::new("{}").unwrap())
+                    .into_raw();
+            }
+        }
+    }
+
+    CString::new("{}").unwrap().into_raw()
+}
+
+/// Set focus node for graph visualization
+/// node_id can be null to clear focus
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_set_graph_focus(scope_id: *const c_char, node_id: *const c_char) -> *mut c_char {
+    let Some(sid) = (unsafe { cstr_arg(scope_id) }) else {
+        return CString::new(r#"{"success":false,"error":"Invalid scope_id"}"#).unwrap().into_raw();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return CString::new(r#"{"success":false,"error":"System not initialized"}"#).unwrap().into_raw();
+    };
+    let Some(runtime) = RUNTIME.get() else {
+        return CString::new(r#"{"success":false,"error":"Runtime not initialized"}"#).unwrap().into_raw();
+    };
+
+    // node_id can be null to clear focus
+    let nid = unsafe { cstr_arg(node_id) };
+
+    let cmd = serde_json::json!({
+        "cmd": "set_focus",
+        "scope_id": sid,
+        "node_id": nid
+    });
+
+    let result = runtime.block_on(async {
+        sys.integration_bridge.handle_command(&cmd.to_string()).await
+    });
+
+    CString::new(result).unwrap_or_else(|_| {
+        CString::new(r#"{"success":false,"error":"CString conversion failed"}"#).unwrap()
+    }).into_raw()
+}
 
 
 // ==================== NOTEBOOK CELLS FFI ====================
@@ -5177,7 +5313,7 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
 
         db.query_row(
             "SELECT board_id, labels, rating, view_count, contains_model,
-                    contains_skills, board_type, last_accessed
+                    contains_skills, board_type, last_accessed, COALESCE(is_pinned, 0)
              FROM board_metadata WHERE board_id = ?1",
             params![&bid],
             |row| {
@@ -5193,6 +5329,7 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
                     contains_skills: serde_json::from_str(&skills_json).unwrap_or_default(),
                     board_type: row.get(6)?,
                     last_accessed: row.get(7)?,
+                    is_pinned: row.get::<_, i32>(8)? != 0,
                 })
             }
         ).ok()
@@ -5209,6 +5346,7 @@ pub extern "C" fn cyan_get_board_metadata(board_id: *const c_char) -> *mut c_cha
         BoardMetadata {
             board_id: bid,
             board_type,
+            is_pinned: false,
             ..Default::default()
         }
     });
@@ -5238,32 +5376,32 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
                 "SELECT o.id, COALESCE(m.labels, '[]'), COALESCE(m.rating, 0),
                         COALESCE(m.view_count, 0), m.contains_model,
                         COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'canvas'),
-                        COALESCE(m.last_accessed, 0)
+                        COALESCE(m.last_accessed, 0), COALESCE(m.is_pinned, 0)
                  FROM objects o
                  LEFT JOIN board_metadata m ON o.id = m.board_id
                  WHERE o.workspace_id = ?1 AND o.type = 'whiteboard'
-                 ORDER BY COALESCE(m.rating, 0) DESC, o.created_at DESC"
+                 ORDER BY COALESCE(m.is_pinned, 0) DESC, COALESCE(m.rating, 0) DESC, o.created_at DESC"
             }
             "group" => {
                 "SELECT o.id, COALESCE(m.labels, '[]'), COALESCE(m.rating, 0),
                         COALESCE(m.view_count, 0), m.contains_model,
                         COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'canvas'),
-                        COALESCE(m.last_accessed, 0)
+                        COALESCE(m.last_accessed, 0), COALESCE(m.is_pinned, 0)
                  FROM objects o
                  JOIN workspaces w ON o.workspace_id = w.id
                  LEFT JOIN board_metadata m ON o.id = m.board_id
                  WHERE w.group_id = ?1 AND o.type = 'whiteboard'
-                 ORDER BY COALESCE(m.rating, 0) DESC, o.created_at DESC"
+                 ORDER BY COALESCE(m.is_pinned, 0) DESC, COALESCE(m.rating, 0) DESC, o.created_at DESC"
             }
             _ => {
                 "SELECT o.id, COALESCE(m.labels, '[]'), COALESCE(m.rating, 0),
                         COALESCE(m.view_count, 0), m.contains_model,
                         COALESCE(m.contains_skills, '[]'), COALESCE(o.board_mode, 'canvas'),
-                        COALESCE(m.last_accessed, 0)
+                        COALESCE(m.last_accessed, 0), COALESCE(m.is_pinned, 0)
                  FROM objects o
                  LEFT JOIN board_metadata m ON o.id = m.board_id
                  WHERE o.type = 'whiteboard'
-                 ORDER BY COALESCE(m.rating, 0) DESC, o.created_at DESC
+                 ORDER BY COALESCE(m.is_pinned, 0) DESC, COALESCE(m.rating, 0) DESC, o.created_at DESC
                  LIMIT 100"
             }
         };
@@ -5288,6 +5426,7 @@ pub extern "C" fn cyan_get_boards_metadata(scope_type: *const c_char, scope_id: 
                 contains_skills: serde_json::from_str(&skills_json).unwrap_or_default(),
                 board_type: row.get(6)?,
                 last_accessed: row.get(7)?,
+                is_pinned: row.get::<_, i32>(8)? != 0,
             })
         }).unwrap().filter_map(|r| r.ok()).collect()
     };
@@ -5718,6 +5857,70 @@ pub extern "C" fn cyan_search_boards_by_label(label: *const c_char) -> *mut c_ch
         Err(_) => CString::new("[]").unwrap().into_raw(),
     }
 }
+
+// ============================================================
+// BOARD PINNING FFI FUNCTIONS
+// ============================================================
+
+/// Pin a board (show at top of grid)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pin_board(board_id: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+
+    let result = {
+        let db = sys.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO board_metadata (board_id, is_pinned) VALUES (?1, 1)
+             ON CONFLICT(board_id) DO UPDATE SET is_pinned = 1",
+            params![bid],
+        )
+    };
+
+    result.is_ok()
+}
+
+/// Unpin a board
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_unpin_board(board_id: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+
+    let result = {
+        let db = sys.db.lock().unwrap();
+        db.execute(
+            "UPDATE board_metadata SET is_pinned = 0 WHERE board_id = ?1",
+            params![bid],
+        )
+    };
+
+    result.is_ok()
+}
+
+/// Check if a board is pinned
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_is_board_pinned(board_id: *const c_char) -> bool {
+    let Some(sys) = SYSTEM.get() else {
+        return false;
+    };
+
+    let bid = unsafe { CStr::from_ptr(board_id) }.to_string_lossy().to_string();
+
+    let db = sys.db.lock().unwrap();
+    db.query_row(
+        "SELECT COALESCE(is_pinned, 0) FROM board_metadata WHERE board_id = ?1",
+        params![bid],
+        |row| row.get::<_, i32>(0),
+    )
+        .unwrap_or(0) != 0
+}
+
 // ============================================================
 // USER PROFILE FFI FUNCTIONS
 // ============================================================

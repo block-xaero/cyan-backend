@@ -5,19 +5,9 @@
 // This module:
 // 1. Wraps IntegrationManager from cyan-backend-integrations
 // 2. Persists integration bindings to SQLite (no tokens)
-// 3. Transforms IntegrationEvent → SwiftEvent::IntegrationGraph
+// 3. Transforms IntegrationEvent → SwiftEvent::IntegrationGraph (force graph format)
 // 4. Provides single FFI entry point: cyan_integration_command(json)
-//
-// Usage in lib.rs:
-//   mod integration_bridge;
-//   pub use integration_bridge::IntegrationBridge;
-//
-//   // In CyanSystem struct:
-//   pub integration_bridge: Arc<IntegrationBridge>,
-//
-//   // In CyanSystem::new():
-//   let integration_bridge = Arc::new(IntegrationBridge::new(db.clone(), event_tx.clone()));
-//   integration_bridge.start_event_forwarder();
+// 5. Prepares events for future QUIC broadcast to Cyan Lens
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -33,6 +23,7 @@ use cyan_backend_integrations::{
     IntegrationType as CrateIntegrationType,
     Node,
     NodeKind,
+    NodeStatus as CrateNodeStatus,
 };
 
 use crate::SwiftEvent;
@@ -78,42 +69,112 @@ impl IntegrationType {
 }
 
 // ============================================================================
-// Graph Types (for Console display)
+// Force Graph Types (for visualization)
 // ============================================================================
 
-/// A mention edge - connects a source node to an anchor
+/// Node in the force-directed graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MentionEdge {
-    pub source_node_id: String,      // The Slack message that mentions
-    pub source_kind: String,         // "slackmessage", "githubpr", etc.
-    pub author: String,              // Who wrote it
-    pub summary: String,             // Truncated content
+pub struct GraphNode {
+    pub id: String,
+    pub external_id: String,        // PROJ-123, #channel, PR #42
+    pub kind: String,               // slack, jira, github_pr, confluence, gdocs
+    pub title: Option<String>,
+    pub summary: Option<String>,
     pub url: Option<String>,
-    pub ts: u64,
-    pub relation: String,            // "mentions", "fixes", "implements"
+    pub status: String,             // real, ephemeral, not_found
+    pub metadata: HashMap<String, String>,
+    pub mention_count: u32,
+    pub last_activity: u64,
+    pub created_at: u64,
 }
 
-/// A graph entry - an anchor node with all its mentions
+/// Edge connecting two nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphEntry {
-    pub anchor_id: String,           // External ID: "PROJ-123", "PR #456"
-    pub anchor_kind: String,         // "jira", "github_pr", "github_issue"
-    pub anchor_status: String,       // "ephemeral", "resolved", "real"
-    pub anchor_title: Option<String>,// Title if resolved
-    pub anchor_url: Option<String>,
-    pub mention_count: u32,
-    pub mentions: Vec<MentionEdge>,  // All edges pointing to this anchor
-    pub first_seen: u64,
-    pub last_activity: u64,
+pub struct GraphEdge {
+    pub id: String,
+    pub source_id: String,
+    pub target_id: String,
+    pub relation: String,           // mentions, implements, fixes, documents, links
+    pub weight: f32,                // 0.0-1.0, affects line thickness
+    pub context: Option<String>,    // Snippet showing connection
+    pub created_at: u64,
 }
 
 /// The full graph payload sent to Swift
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrationGraph {
     pub scope_id: String,
-    pub entries: Vec<GraphEntry>,    // Anchors with their mentions
-    pub unlinked_count: u32,         // Messages with no correlations
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub focus_node_id: Option<String>,
+    pub connected_integrations: Vec<String>,
+    pub stats: GraphStats,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphStats {
+    pub total_nodes: u32,
+    pub real_nodes: u32,
+    pub ephemeral_nodes: u32,
+    pub total_edges: u32,
+    pub unlinked_messages: u32,
+}
+
+// ============================================================================
+// Legacy Types (for backward compatibility during migration)
+// ============================================================================
+
+/// A mention edge - connects a source node to an anchor
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MentionEdge {
+    pub source_node_id: String,
+    pub source_kind: String,
+    pub author: String,
+    pub summary: String,
+    pub url: Option<String>,
+    pub ts: u64,
+    pub relation: String,
+}
+
+/// Legacy graph entry format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphEntry {
+    pub anchor_id: String,
+    pub anchor_kind: String,
+    pub anchor_status: String,
+    pub anchor_title: Option<String>,
+    pub anchor_url: Option<String>,
+    pub mention_count: u32,
+    pub mentions: Vec<MentionEdge>,
+    pub first_seen: u64,
+    pub last_activity: u64,
+}
+
+// ============================================================================
+// Broadcast Event (for future QUIC to Cyan Lens)
+// ============================================================================
+
+/// Event prepared for broadcast to Cyan Lens cloud
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroadcastEvent {
+    pub event_type: String,
+    pub scope_id: String,
+    pub timestamp: u64,
+    pub payload: BroadcastPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum BroadcastPayload {
+    #[serde(rename = "node_created")]
+    NodeCreated { node: GraphNode },
+    #[serde(rename = "node_updated")]
+    NodeUpdated { node: GraphNode },
+    #[serde(rename = "edge_created")]
+    EdgeCreated { edge: GraphEdge },
+    #[serde(rename = "graph_snapshot")]
+    GraphSnapshot { graph: IntegrationGraph },
 }
 
 // ============================================================================
@@ -123,7 +184,6 @@ pub struct IntegrationGraph {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum IntegrationCommand {
-    /// Start an integration and auto-save binding
     Start {
         scope_type: String,
         scope_id: String,
@@ -131,29 +191,33 @@ enum IntegrationCommand {
         token: String,
         config: serde_json::Value,
     },
-    /// Stop an integration (binding remains)
     Stop {
         scope_id: String,
         integration_type: String,
     },
-    /// Remove binding (stop + delete from DB)
     RemoveBinding {
         scope_id: String,
         integration_type: String,
     },
-    /// Get bindings for a scope
     GetBindings {
         scope_type: Option<String>,
         scope_id: String,
     },
-    /// Check if integration is running
     IsRunning {
         scope_id: String,
         integration_type: String,
     },
-    /// List available channels (for Slack setup UI)
     ListSlackChannels {
         scope_id: String,
+    },
+    /// Get the current graph for a scope
+    GetGraph {
+        scope_id: String,
+    },
+    /// Set focus node for graph visualization
+    SetFocus {
+        scope_id: String,
+        node_id: Option<String>,
     },
 }
 
@@ -187,13 +251,14 @@ impl CommandResponse {
 pub struct IntegrationBridge {
     db: Arc<Mutex<Connection>>,
     event_tx: mpsc::UnboundedSender<SwiftEvent>,
-    /// The actual integration manager from cyan-backend-integrations
     manager: Arc<IntegrationManager>,
-    /// Track which integrations are running: key = "scope_id:integration_type"
     running: RwLock<HashMap<String, RunningIntegration>>,
     sent_ids: RwLock<HashSet<String>>,
-    /// Track last graph hash to avoid sending duplicates
     last_graph_hash: RwLock<HashMap<String, u64>>,
+    /// Focus node per scope
+    focus_nodes: RwLock<HashMap<String, String>>,
+    /// Broadcast queue for Cyan Lens (future QUIC)
+    broadcast_queue: RwLock<Vec<BroadcastEvent>>,
 }
 
 struct RunningIntegration {
@@ -203,7 +268,6 @@ struct RunningIntegration {
 }
 
 impl IntegrationBridge {
-    /// Create new bridge. Call once during CyanSystem::new()
     pub fn new(
         db: Arc<Mutex<Connection>>,
         event_tx: mpsc::UnboundedSender<SwiftEvent>,
@@ -217,11 +281,11 @@ impl IntegrationBridge {
             running: RwLock::new(HashMap::new()),
             sent_ids: RwLock::new(HashSet::new()),
             last_graph_hash: RwLock::new(HashMap::new()),
+            focus_nodes: RwLock::new(HashMap::new()),
+            broadcast_queue: RwLock::new(Vec::new()),
         }
     }
 
-    /// Start the background event forwarder task.
-    /// Call this after creating IntegrationBridge.
     pub fn start_event_forwarder(self: &Arc<Self>) {
         let bridge = Arc::clone(self);
 
@@ -244,44 +308,47 @@ impl IntegrationBridge {
         }
 
         for (_key, info) in running.iter() {
-            // Get events and nodes from the manager
             let events = self.manager.get_all_events(&info.scope_id).await;
             let nodes = self.manager.get_all_nodes(&info.scope_id).await;
 
-            // Build the graph
-            let graph = self.build_graph(&events, &nodes, &info.scope_type, &info.scope_id);
+            // Build force graph (new format)
+            let graph = self.build_force_graph(&events, &nodes, &info.scope_type, &info.scope_id).await;
 
-            // Skip if graph is empty
-            if graph.entries.is_empty() {
+            if graph.nodes.is_empty() {
                 continue;
             }
 
-            // Compute simple hash to detect changes
-            let graph_hash = self.compute_graph_hash(&graph);
+            // Compute hash to detect changes
+            let graph_hash = self.compute_graph_hash_v2(&graph);
 
-            // Check if graph changed
             {
                 let last_hashes = self.last_graph_hash.read().await;
                 if let Some(&last) = last_hashes.get(&graph.scope_id) {
                     if last == graph_hash {
-                        continue; // No change, skip
+                        continue;
                     }
                 }
             }
 
-            // Update hash
             {
                 let mut last_hashes = self.last_graph_hash.write().await;
                 last_hashes.insert(graph.scope_id.clone(), graph_hash);
             }
 
-            // Serialize and send
+            // Queue for broadcast (future Cyan Lens)
+            self.queue_broadcast(BroadcastEvent {
+                event_type: "graph_update".to_string(),
+                scope_id: graph.scope_id.clone(),
+                timestamp: graph.updated_at,
+                payload: BroadcastPayload::GraphSnapshot { graph: graph.clone() },
+            }).await;
+
             let graph_json = serde_json::to_string(&graph).unwrap_or_default();
 
             tracing::info!(
-                "📊 Sending graph: {} anchors, {} unlinked for {}",
-                graph.entries.len(),
-                graph.unlinked_count,
+                "📊 Sending force graph: {} nodes, {} edges for {}",
+                graph.nodes.len(),
+                graph.edges.len(),
                 graph.scope_id
             );
 
@@ -294,24 +361,42 @@ impl IntegrationBridge {
         }
     }
 
-    /// Compute a simple hash for change detection
-    fn compute_graph_hash(&self, graph: &IntegrationGraph) -> u64 {
+    /// Queue event for future QUIC broadcast to Cyan Lens
+    async fn queue_broadcast(&self, event: BroadcastEvent) {
+        let mut queue = self.broadcast_queue.write().await;
+        queue.push(event);
+
+        // Keep queue bounded
+        if queue.len() > 1000 {
+            queue.drain(0..500);
+        }
+    }
+
+    /// Get queued broadcast events (for future QUIC sender)
+    pub async fn drain_broadcast_queue(&self) -> Vec<BroadcastEvent> {
+        let mut queue = self.broadcast_queue.write().await;
+        std::mem::take(&mut *queue)
+    }
+
+    fn compute_graph_hash_v2(&self, graph: &IntegrationGraph) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        graph.entries.len().hash(&mut hasher);
-        graph.unlinked_count.hash(&mut hasher);
-        for entry in &graph.entries {
-            entry.anchor_id.hash(&mut hasher);
-            entry.mention_count.hash(&mut hasher);
-            entry.last_activity.hash(&mut hasher);
+        graph.nodes.len().hash(&mut hasher);
+        graph.edges.len().hash(&mut hasher);
+        for node in &graph.nodes {
+            node.id.hash(&mut hasher);
+            node.last_activity.hash(&mut hasher);
+        }
+        for edge in &graph.edges {
+            edge.id.hash(&mut hasher);
         }
         hasher.finish()
     }
 
-    /// Build the event graph from nodes and correlation events
-    fn build_graph(
+    /// Build force-directed graph structure
+    async fn build_force_graph(
         &self,
         events: &[CrateIntegrationEvent],
         nodes: &[Node],
@@ -323,18 +408,64 @@ impl IntegrationBridge {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        // Index nodes by ID for quick lookup
-        let node_map: HashMap<String, &Node> = nodes.iter()
-            .map(|n| (n.id.clone(), n))
-            .collect();
+        let scope_key = format!("{}:{}", scope_type, scope_id);
 
-        // Group events by their anchor (the thing being mentioned)
-        // Key = external_id (e.g., "PROJ-123"), Value = (anchor_kind, mentions)
-        let mut anchors: HashMap<String, (String, Vec<MentionEdge>)> = HashMap::new();
-        let mut linked_node_ids: HashSet<String> = HashSet::new();
+        // Convert crate nodes to graph nodes
+        let mut graph_nodes: HashMap<String, GraphNode> = HashMap::new();
+        let mut graph_edges: Vec<GraphEdge> = Vec::new();
+        let mut connected_integrations: HashSet<String> = HashSet::new();
 
+        // First pass: create nodes from all Node objects
+        for node in nodes {
+            let kind = match node.kind {
+                NodeKind::SlackMessage | NodeKind::SlackThread => "slack",
+                NodeKind::JiraTicket => "jira",
+                NodeKind::GitHubPR => "github_pr",
+                NodeKind::GitHubIssue => "github_issue",
+                NodeKind::GitHubCommit => "github_commit",
+                NodeKind::ConfluencePage => "confluence",
+                NodeKind::GoogleDoc => "gdocs",
+                _ => "unknown",
+            };
+
+            connected_integrations.insert(kind.split('_').next().unwrap_or(kind).to_string());
+
+            let status = match node.status {
+                CrateNodeStatus::Real => "real",
+                CrateNodeStatus::Ephemeral => "ephemeral",
+                CrateNodeStatus::Resolved => "resolved",
+                CrateNodeStatus::NotFound => "not_found",
+                CrateNodeStatus::Error(_) => "error",
+            };
+
+            let mut metadata = HashMap::new();
+            metadata.insert("author".to_string(), node.metadata.author.clone());
+            if let Some(ref title) = node.metadata.title {
+                metadata.insert("title".to_string(), title.clone());
+            }
+            if let Some(ref status) = node.metadata.status {
+                metadata.insert("status".to_string(), status.clone());
+            }
+
+            let graph_node = GraphNode {
+                id: node.id.clone(),
+                external_id: node.external_id.clone(),
+                kind: kind.to_string(),
+                title: node.metadata.title.clone(),
+                summary: Some(truncate_str(&node.content, 200).to_string()),
+                url: if node.metadata.url.is_empty() { None } else { Some(node.metadata.url.clone()) },
+                status: status.to_string(),
+                metadata,
+                mention_count: node.metadata.mention_count,
+                last_activity: node.last_updated,
+                created_at: node.first_seen,
+            };
+
+            graph_nodes.insert(node.id.clone(), graph_node);
+        }
+
+        // Second pass: create edges from events
         for event in events {
-            // Parse payload to get anchor info
             let payload: serde_json::Value = serde_json::from_str(&event.base.payload)
                 .unwrap_or(serde_json::json!({}));
 
@@ -342,112 +473,142 @@ impl IntegrationBridge {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
 
-            // Extract anchor ID and kind based on event type
-            let (anchor_id, anchor_kind) = match event_type {
-                "jira_mention" => {
+            // Get target node info from event
+            let (target_external_id, target_kind, relation) = match event_type {
+                "jira_mention" | "jira_reference" => {
                     let jira_id = payload.get("jira_id")
+                        .or_else(|| payload.get("jira_key"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    (jira_id, "jira".to_string())
+                    (jira_id, "jira", "mentions")
                 }
                 "github_pr_reference" => {
                     let pr_num = payload.get("pr_number")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    (format!("PR #{}", pr_num), "github_pr".to_string())
+                        .unwrap_or("");
+                    (format!("PR #{}", pr_num), "github_pr", "links")
                 }
                 "github_issue_reference" => {
                     let issue_num = payload.get("issue_number")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    (format!("Issue #{}", issue_num), "github_issue".to_string())
+                        .unwrap_or("");
+                    (format!("Issue #{}", issue_num), "github_issue", "links")
                 }
-                _ => continue, // Skip unknown event types
+                "commit_fixes_issue" => {
+                    let jira_key = payload.get("jira_key")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    (jira_key.to_string(), "jira", "fixes")
+                }
+                "confluence_reference" => {
+                    let page_id = payload.get("page_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    (page_id.to_string(), "confluence", "documents")
+                }
+                _ => continue,
             };
 
-            if anchor_id.is_empty() {
+            if target_external_id.is_empty() {
                 continue;
             }
 
-            // Find the source node (the message that mentions the anchor)
-            let source_node = node_map.get(&event.base.source);
+            // Ensure target node exists (create ephemeral if needed)
+            let target_node_id = blake3::hash(
+                format!("{}:{}", target_kind, target_external_id).as_bytes()
+            ).to_hex().to_string();
 
-            let mention = MentionEdge {
-                source_node_id: event.base.source.clone(),
-                source_kind: source_node
-                    .map(|n| format!("{:?}", n.kind).to_lowercase())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                author: source_node
-                    .map(|n| n.metadata.author.clone())
-                    .unwrap_or_default(),
-                summary: source_node
-                    .map(|n| truncate_str(&n.content, 60).to_string())
-                    .unwrap_or_else(|| "Unknown message".to_string()),
-                url: source_node.and_then(|n| {
-                    if n.metadata.url.is_empty() { None } else { Some(n.metadata.url.clone()) }
-                }),
-                ts: event.base.ts,
-                relation: format!("{:?}", event.relation).to_lowercase(),
+            if !graph_nodes.contains_key(&target_node_id) {
+                // Create ephemeral node for the referenced entity
+                let ephemeral_node = GraphNode {
+                    id: target_node_id.clone(),
+                    external_id: target_external_id.clone(),
+                    kind: target_kind.to_string(),
+                    title: None,
+                    summary: None,
+                    url: None,
+                    status: "ephemeral".to_string(),
+                    metadata: HashMap::new(),
+                    mention_count: 1,
+                    last_activity: event.base.ts,
+                    created_at: event.discovered_at,
+                };
+                graph_nodes.insert(target_node_id.clone(), ephemeral_node);
+            } else {
+                // Update mention count
+                if let Some(node) = graph_nodes.get_mut(&target_node_id) {
+                    node.mention_count += 1;
+                    node.last_activity = node.last_activity.max(event.base.ts);
+                }
+            }
+
+            // Get context snippet
+            let context = payload.get("context")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            // Create edge
+            let edge_id = format!("{}:{}:{}", event.base.source, target_node_id, relation);
+            let edge = GraphEdge {
+                id: edge_id,
+                source_id: event.base.source.clone(),
+                target_id: target_node_id,
+                relation: relation.to_string(),
+                weight: event.confidence as f32,
+                context,
+                created_at: event.discovered_at,
             };
 
-            // Track this node as linked
-            linked_node_ids.insert(event.base.source.clone());
-
-            // Add to anchor's mentions
-            anchors
-                .entry(anchor_id.clone())
-                .or_insert_with(|| (anchor_kind.clone(), Vec::new()))
-                .1
-                .push(mention);
+            graph_edges.push(edge);
         }
 
-        // Build graph entries
-        let mut entries: Vec<GraphEntry> = anchors
-            .into_iter()
-            .map(|(anchor_id, (anchor_kind, mut mentions))| {
-                // Sort mentions by timestamp
-                mentions.sort_by_key(|m| m.ts);
+        // Deduplicate edges (increase weight for repeated references)
+        let mut edge_map: HashMap<String, GraphEdge> = HashMap::new();
+        for edge in graph_edges {
+            let key = format!("{}:{}:{}", edge.source_id, edge.target_id, edge.relation);
+            if let Some(existing) = edge_map.get_mut(&key) {
+                existing.weight = (existing.weight + 0.1).min(1.0);
+            } else {
+                edge_map.insert(key, edge);
+            }
+        }
 
-                let first_seen = mentions.first().map(|m| m.ts).unwrap_or(now);
-                let last_activity = mentions.last().map(|m| m.ts).unwrap_or(now);
+        // Count stats
+        let nodes_vec: Vec<GraphNode> = graph_nodes.into_values().collect();
+        let edges_vec: Vec<GraphEdge> = edge_map.into_values().collect();
 
-                GraphEntry {
-                    anchor_id,
-                    anchor_kind,
-                    anchor_status: "ephemeral".to_string(), // TODO: check NodeCache
-                    anchor_title: None,  // TODO: resolve from NodeCache
-                    anchor_url: None,    // TODO: resolve from NodeCache
-                    mention_count: mentions.len() as u32,
-                    mentions,
-                    first_seen,
-                    last_activity,
-                }
-            })
+        let real_count = nodes_vec.iter().filter(|n| n.status == "real").count() as u32;
+        let ephemeral_count = nodes_vec.iter().filter(|n| n.status == "ephemeral").count() as u32;
+
+        // Count unlinked slack messages
+        let linked_node_ids: HashSet<String> = edges_vec.iter()
+            .flat_map(|e| vec![e.source_id.clone(), e.target_id.clone()])
             .collect();
-
-        // Sort entries by last activity (most recent first)
-        entries.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
-
-        // Count unlinked nodes (messages with no correlations)
-        let unlinked_count = nodes.iter()
-            .filter(|n| {
-                matches!(n.kind, NodeKind::SlackMessage | NodeKind::SlackThread)
-                    && !linked_node_ids.contains(&n.id)
-            })
+        let unlinked = nodes_vec.iter()
+            .filter(|n| n.kind == "slack" && !linked_node_ids.contains(&n.id))
             .count() as u32;
 
+        // Get focus node
+        let focus_node_id = self.focus_nodes.read().await.get(&scope_key).cloned();
+        let edges_vec_clone = edges_vec.clone();
         IntegrationGraph {
-            scope_id: format!("{}:{}", scope_type, scope_id),
-            entries,
-            unlinked_count,
+            scope_id: scope_key,
+            nodes: nodes_vec,
+            edges: edges_vec,
+            focus_node_id,
+            connected_integrations: connected_integrations.into_iter().collect(),
+            stats: GraphStats {
+                total_nodes: real_count + ephemeral_count,
+                real_nodes: real_count,
+                ephemeral_nodes: ephemeral_count,
+                total_edges: edges_vec_clone.len() as u32,
+                unlinked_messages: unlinked,
+            },
             updated_at: now,
         }
     }
 
-    /// Handle a JSON command from FFI. Returns JSON response.
     pub async fn handle_command(&self, json: &str) -> String {
         let response = match serde_json::from_str::<IntegrationCommand>(json) {
             Ok(cmd) => self.dispatch(cmd).await,
@@ -458,10 +619,6 @@ impl IntegrationBridge {
             r#"{"success":false,"error":"Serialization failed"}"#.to_string()
         })
     }
-
-    // ========================================================================
-    // Command Dispatch
-    // ========================================================================
 
     async fn dispatch(&self, cmd: IntegrationCommand) -> CommandResponse {
         match cmd {
@@ -483,6 +640,12 @@ impl IntegrationBridge {
             IntegrationCommand::ListSlackChannels { scope_id } => {
                 self.cmd_list_slack_channels(&scope_id).await
             }
+            IntegrationCommand::GetGraph { scope_id } => {
+                self.cmd_get_graph(&scope_id).await
+            }
+            IntegrationCommand::SetFocus { scope_id, node_id } => {
+                self.cmd_set_focus(&scope_id, node_id).await
+            }
         }
     }
 
@@ -498,25 +661,21 @@ impl IntegrationBridge {
         token: &str,
         config: serde_json::Value,
     ) -> CommandResponse {
-        // Validate integration type
         let i_type = match IntegrationType::from_str(integration_type) {
             Some(t) => t,
             None => return CommandResponse::err(format!("Unknown integration type: {}", integration_type)),
         };
 
-        // Validate scope type
         if scope_type != "group" && scope_type != "workspace" {
             return CommandResponse::err("scope_type must be 'group' or 'workspace'");
         }
 
         let actor_key = format!("{}:{}", scope_id, integration_type);
 
-        // Check if already running
         if self.running.read().await.contains_key(&actor_key) {
             return CommandResponse::err("Integration already running for this scope");
         }
 
-        // Start the integration via IntegrationManager
         let result = match i_type {
             IntegrationType::Slack => {
                 let channels: Vec<String> = config["channels"]
@@ -598,19 +757,16 @@ impl IntegrationBridge {
             return CommandResponse::err(format!("Failed to start integration: {}", e));
         }
 
-        // Track as running
         self.running.write().await.insert(actor_key, RunningIntegration {
             scope_type: scope_type.to_string(),
             scope_id: scope_id.to_string(),
             integration_type: i_type.clone(),
         });
 
-        // Save binding to DB (no token)
         if let Err(e) = self.save_binding(scope_type, scope_id, integration_type, &config) {
             return CommandResponse::err(format!("Failed to save binding: {}", e));
         }
 
-        // Send status event
         let _ = self.event_tx.send(SwiftEvent::IntegrationStatus {
             scope_id: format!("{}:{}", scope_type, scope_id),
             integration_type: integration_type.to_string(),
@@ -624,14 +780,12 @@ impl IntegrationBridge {
     async fn cmd_stop(&self, scope_id: &str, integration_type: &str) -> CommandResponse {
         let actor_key = format!("{}:{}", scope_id, integration_type);
 
-        // Check if running
         let was_running = self.running.write().await.remove(&actor_key).is_some();
 
         if !was_running {
             return CommandResponse::err("Integration not running");
         }
 
-        // Stop via IntegrationManager
         let result = match integration_type {
             "slack" => self.manager.stop_slack(scope_id).await,
             "jira" => self.manager.stop_jira(scope_id).await,
@@ -645,7 +799,6 @@ impl IntegrationBridge {
             tracing::warn!("Error stopping integration: {}", e);
         }
 
-        // Send status event
         let _ = self.event_tx.send(SwiftEvent::IntegrationStatus {
             scope_id: scope_id.to_string(),
             integration_type: integration_type.to_string(),
@@ -657,10 +810,8 @@ impl IntegrationBridge {
     }
 
     async fn cmd_remove_binding(&self, scope_id: &str, integration_type: &str) -> CommandResponse {
-        // Stop actor first
         let _ = self.cmd_stop(scope_id, integration_type).await;
 
-        // Delete from DB
         let result = {
             let db = self.db.lock().unwrap();
             db.execute(
@@ -719,10 +870,39 @@ impl IntegrationBridge {
         CommandResponse::ok_with_data(serde_json::json!({ "running": running }))
     }
 
-    async fn cmd_list_slack_channels(&self, scope_id: &str) -> CommandResponse {
-        // This would require storing the SlackClient reference
-        // For now, return error - channels should be selected during OAuth flow
+    async fn cmd_list_slack_channels(&self, _scope_id: &str) -> CommandResponse {
         CommandResponse::err("List channels via OAuth flow in Swift, not here")
+    }
+
+    async fn cmd_get_graph(&self, scope_id: &str) -> CommandResponse {
+        // Find running integration for this scope
+        let running = self.running.read().await;
+
+        let info = running.values()
+            .find(|r| r.scope_id == scope_id || format!("{}:{}", r.scope_type, r.scope_id) == scope_id);
+
+        match info {
+            Some(info) => {
+                let events = self.manager.get_all_events(&info.scope_id).await;
+                let nodes = self.manager.get_all_nodes(&info.scope_id).await;
+                let graph = self.build_force_graph(&events, &nodes, &info.scope_type, &info.scope_id).await;
+
+                CommandResponse::ok_with_data(serde_json::to_value(&graph).unwrap_or_default())
+            }
+            None => CommandResponse::err("No integration running for this scope")
+        }
+    }
+
+    async fn cmd_set_focus(&self, scope_id: &str, node_id: Option<String>) -> CommandResponse {
+        let mut focus_nodes = self.focus_nodes.write().await;
+
+        if let Some(id) = node_id {
+            focus_nodes.insert(scope_id.to_string(), id);
+        } else {
+            focus_nodes.remove(scope_id);
+        }
+
+        CommandResponse::ok()
     }
 
     // ========================================================================
@@ -784,12 +964,7 @@ impl IntegrationBridge {
         }))
     }
 
-    // ========================================================================
-    // App Restart: Restore integrations from bindings
-    // ========================================================================
-
     /// Called on app startup to restore integrations.
-    /// Swift must call this with tokens retrieved from Keychain.
     pub async fn restore_integration(
         &self,
         scope_type: &str,
@@ -797,7 +972,6 @@ impl IntegrationBridge {
         integration_type: &str,
         token: &str,
     ) -> Result<(), String> {
-        // Get binding from DB
         let config = {
             let db = self.db.lock().unwrap();
             let config_str: Option<String> = db.query_row(
@@ -812,7 +986,6 @@ impl IntegrationBridge {
             }
         };
 
-        // Start the integration
         let cmd_json = serde_json::json!({
             "cmd": "start",
             "scope_type": scope_type,
@@ -833,7 +1006,6 @@ impl IntegrationBridge {
     }
 }
 
-// Put this somewhere common, maybe in lib.rs or a utils module
 pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
