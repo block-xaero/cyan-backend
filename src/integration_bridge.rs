@@ -396,6 +396,12 @@ impl IntegrationBridge {
     }
 
     /// Build force-directed graph structure
+    // Replace the build_force_graph function in integration_bridge.rs (around line 399-610)
+    // with this improved version that:
+    // 1. Sets meaningful titles for Slack messages (first ~50 chars of content)
+    // 2. Resolves ephemeral Jira tickets to "real" if Jira integration is connected
+    // 3. Improves display labels for all node types
+
     async fn build_force_graph(
         &self,
         events: &[CrateIntegrationEvent],
@@ -409,6 +415,14 @@ impl IntegrationBridge {
             .unwrap_or(0);
 
         let scope_key = format!("{}:{}", scope_type, scope_id);
+
+        // Check which integrations are running for this scope
+        let running = self.running.read().await;
+        let connected_types: HashSet<String> = running
+            .values()
+            .filter(|r| r.scope_id == scope_id)
+            .map(|r| r.integration_type.to_string())
+            .collect();
 
         // Convert crate nodes to graph nodes
         let mut graph_nodes: HashMap<String, GraphNode> = HashMap::new();
@@ -447,11 +461,44 @@ impl IntegrationBridge {
                 metadata.insert("status".to_string(), status.clone());
             }
 
+            // === FIX 1: Generate meaningful titles for Slack messages ===
+            let title = match node.kind {
+                NodeKind::SlackMessage | NodeKind::SlackThread => {
+                    // Use first ~50 chars of content as title
+                    let content_preview = truncate_str(&node.content, 50);
+                    if content_preview.is_empty() {
+                        node.metadata.title.clone()
+                    } else {
+                        Some(content_preview.to_string())
+                    }
+                }
+                _ => node.metadata.title.clone(),
+            };
+
+            // === FIX 2: Better external_id display for Slack ===
+            let display_external_id = match node.kind {
+                NodeKind::SlackMessage | NodeKind::SlackThread => {
+                    // Format: "msg" + last 6 digits for compactness, or use channel if available
+                    if let Some(channel) = metadata.get("channel") {
+                        format!("#{}", channel)
+                    } else {
+                        // Use shortened timestamp
+                        let ts = &node.external_id;
+                        if ts.len() > 6 {
+                            format!("msg:{}", &ts[ts.len()-6..])
+                        } else {
+                            node.external_id.clone()
+                        }
+                    }
+                }
+                _ => node.external_id.clone(),
+            };
+
             let graph_node = GraphNode {
                 id: node.id.clone(),
-                external_id: node.external_id.clone(),
+                external_id: display_external_id,
                 kind: kind.to_string(),
-                title: node.metadata.title.clone(),
+                title,
                 summary: Some(truncate_str(&node.content, 200).to_string()),
                 url: if node.metadata.url.is_empty() { None } else { Some(node.metadata.url.clone()) },
                 status: status.to_string(),
@@ -520,15 +567,29 @@ impl IntegrationBridge {
             ).to_hex().to_string();
 
             if !graph_nodes.contains_key(&target_node_id) {
-                // Create ephemeral node for the referenced entity
+                // === FIX 3: Determine if this "ephemeral" node should be "real" ===
+                // If the corresponding integration is connected, mark as "real"
+                // (the integration will eventually fetch full details)
+                let base_kind = target_kind.split('_').next().unwrap_or(target_kind);
+                let is_integration_connected = connected_types.contains(base_kind);
+
+                let node_status = if is_integration_connected {
+                    // Integration is connected - this is a real reference that will be resolved
+                    "real"
+                } else {
+                    // Integration not connected - show as ephemeral (needs connection)
+                    "ephemeral"
+                };
+
+                // Create node for the referenced entity
                 let ephemeral_node = GraphNode {
                     id: target_node_id.clone(),
                     external_id: target_external_id.clone(),
                     kind: target_kind.to_string(),
-                    title: None,
+                    title: Some(target_external_id.clone()), // Use external_id as title for now
                     summary: None,
                     url: None,
-                    status: "ephemeral".to_string(),
+                    status: node_status.to_string(),
                     metadata: HashMap::new(),
                     mention_count: 1,
                     last_activity: event.base.ts,
@@ -581,7 +642,7 @@ impl IntegrationBridge {
         let real_count = nodes_vec.iter().filter(|n| n.status == "real").count() as u32;
         let ephemeral_count = nodes_vec.iter().filter(|n| n.status == "ephemeral").count() as u32;
 
-        // Count unlinked slack messages
+        // Count unlinked slack messages (messages that don't connect to anything)
         let linked_node_ids: HashSet<String> = edges_vec.iter()
             .flat_map(|e| vec![e.source_id.clone(), e.target_id.clone()])
             .collect();
@@ -591,18 +652,18 @@ impl IntegrationBridge {
 
         // Get focus node
         let focus_node_id = self.focus_nodes.read().await.get(&scope_key).cloned();
-        let edges_vec_clone = edges_vec.clone();
+
         IntegrationGraph {
             scope_id: scope_key,
             nodes: nodes_vec,
-            edges: edges_vec,
+            edges: edges_vec.clone(),
             focus_node_id,
             connected_integrations: connected_integrations.into_iter().collect(),
             stats: GraphStats {
                 total_nodes: real_count + ephemeral_count,
                 real_nodes: real_count,
                 ephemeral_nodes: ephemeral_count,
-                total_edges: edges_vec_clone.len() as u32,
+                total_edges: edges_vec.len() as u32,
                 unlinked_messages: unlinked,
             },
             updated_at: now,
@@ -678,10 +739,15 @@ impl IntegrationBridge {
 
         let result = match i_type {
             IntegrationType::Slack => {
-                let channels: Vec<String> = config["channels"]
-                    .as_array()
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
+                // Handle both array and JSON-string formats from Swift
+                let channels: Vec<String> = if let Some(arr) = config["channels"].as_array() {
+                    arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                } else if let Some(s) = config["channels"].as_str() {
+                    // Try to parse as JSON string
+                    serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
+                } else {
+                    vec![]
+                };
 
                 self.manager.start_slack(
                     scope_id.to_string(),
