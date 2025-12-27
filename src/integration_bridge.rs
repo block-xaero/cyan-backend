@@ -528,19 +528,28 @@ impl IntegrationBridge {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    (jira_id, "jira", "mentions")
+                    let rel = payload.get("relation")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("mentions");
+                    (jira_id, "jira", rel)
                 }
                 "github_pr_reference" => {
                     let pr_num = payload.get("pr_number")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    (format!("PR #{}", pr_num), "github_pr", "links")
+                    let rel = payload.get("relation")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("references");
+                    (format!("PR #{}", pr_num), "github_pr", rel)
                 }
                 "github_issue_reference" => {
                     let issue_num = payload.get("issue_number")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    (format!("Issue #{}", issue_num), "github_issue", "links")
+                    let rel = payload.get("relation")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("references");
+                    (format!("Issue #{}", issue_num), "github_issue", rel)
                 }
                 "commit_fixes_issue" => {
                     let jira_key = payload.get("jira_key")
@@ -552,13 +561,78 @@ impl IntegrationBridge {
                     let page_id = payload.get("page_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    (page_id.to_string(), "confluence", "documents")
+                    let rel = payload.get("relation")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("documents");
+                    (page_id.to_string(), "confluence", rel)
+                }
+                "gdocs_reference" => {
+                    let doc_id = payload.get("doc_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let rel = payload.get("relation")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("documents");
+                    (doc_id.to_string(), "gdocs", rel)
                 }
                 _ => continue,
             };
 
             if target_external_id.is_empty() {
                 continue;
+            }
+
+            // === Get source node info from event payload ===
+            let source_kind = payload.get("source_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("slack")
+                .to_string();
+
+            let source_node_id = payload.get("source_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    // Fallback: use event.base.source
+                    event.base.source.clone()
+                });
+
+            // === Ensure source node exists (for non-Slack sources) ===
+            if !graph_nodes.contains_key(&source_node_id) {
+                let source_external_id = payload.get("source_external_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&source_node_id)
+                    .to_string();
+
+                let source_url = payload.get("source_url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                let context = payload.get("context")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let source_node = GraphNode {
+                    id: source_node_id.clone(),
+                    external_id: source_external_id.clone(),
+                    kind: source_kind.clone(),
+                    title: Some(source_external_id),
+                    summary: if context.is_empty() { None } else { Some(context) },
+                    url: source_url,
+                    status: "real".to_string(),
+                    metadata: HashMap::new(),
+                    mention_count: 0,
+                    last_activity: event.base.ts,
+                    created_at: event.discovered_at,
+                };
+                graph_nodes.insert(source_node_id.clone(), source_node);
+
+                connected_integrations.insert(source_kind.clone());
+
+                tracing::debug!(
+                    "📊 Created source node: {} ({})",
+                    source_node_id, source_kind
+                );
             }
 
             // Ensure target node exists (create ephemeral if needed)
@@ -609,11 +683,11 @@ impl IntegrationBridge {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            // Create edge
-            let edge_id = format!("{}:{}:{}", event.base.source, target_node_id, relation);
+            // Create edge using source_node_id from payload
+            let edge_id = format!("{}:{}:{}", source_node_id, target_node_id, relation);
             let edge = GraphEdge {
                 id: edge_id,
-                source_id: event.base.source.clone(),
+                source_id: source_node_id.clone(),
                 target_id: target_node_id,
                 relation: relation.to_string(),
                 weight: event.confidence as f32,
