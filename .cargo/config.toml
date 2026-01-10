@@ -24,15 +24,16 @@ rustflags = [
 [target.aarch64-apple-ios]
 rustflags = [
     "-C", "link-arg=-lc++",
-    "-C", "link-arg=-L/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/17/lib/darwin",
-    "-C", "link-arg=-lclang_rt.ios",
+    "-C", "link-arg=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/17.0.0/lib/darwin/libclang_rt.ios.a",
     "-C", "link-arg=-miphoneos-version-min=17.0",
 ]
+
+
 
 [target.aarch64-apple-ios-sim]
 rustflags = [
     "-C", "link-arg=-lc++",
-    "-C", "link-arg=-L/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/17/lib/darwin",
+    "-C", "link-arg=-L/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/17.0.0/lib/darwin",
     "-C", "link-arg=-lclang_rt.iossim",
     "-C", "link-arg=-miphoneos-version-min=17.0",
 ]

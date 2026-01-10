@@ -1,0 +1,154 @@
+// src/models/dto.rs
+//
+// Data Transfer Objects for storage and network serialization
+
+use crate::models::core::{Group, Workspace};
+use serde::{Deserialize, Serialize};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TREE SNAPSHOT DTO (for UI refresh)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TreeSnapshotDTO {
+    pub groups: Vec<Group>,
+    pub workspaces: Vec<Workspace>,
+    pub whiteboards: Vec<WhiteboardDTO>,
+    pub files: Vec<FileDTO>,
+    pub chats: Vec<ChatDTO>,
+    #[serde(default)]
+    pub whiteboard_elements: Vec<WhiteboardElementDTO>,
+    #[serde(default)]
+    pub notebook_cells: Vec<NotebookCellDTO>,
+    #[serde(default)]
+    pub integrations: Vec<IntegrationBindingDTO>,
+    #[serde(default)]
+    pub board_metadata: Vec<BoardMetadataDTO>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BOARD METADATA
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BoardMetadataDTO {
+    pub board_id: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub rating: i32,
+    #[serde(default)]
+    pub view_count: i32,
+    pub contains_model: Option<String>,
+    #[serde(default)]
+    pub contains_skills: Vec<String>,
+    #[serde(default = "default_board_type")]
+    pub board_type: String,
+    #[serde(default)]
+    pub last_accessed: i64,
+    #[serde(default)]
+    pub is_pinned: bool,
+}
+
+fn default_board_type() -> String {
+    "canvas".to_string()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTEGRATION BINDING
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrationBindingDTO {
+    pub id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub integration_type: String,
+    #[serde(default)]
+    pub config: serde_json::Value,
+    pub created_at: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WHITEBOARD (Board shell)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhiteboardDTO {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub created_at: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FILE
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDTO {
+    pub id: String,
+    pub group_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub board_id: Option<String>,
+    pub name: String,
+    pub hash: String,
+    pub size: u64,
+    pub source_peer: Option<String>,
+    pub local_path: Option<String>,
+    pub created_at: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CHAT
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatDTO {
+    pub id: String,
+    pub workspace_id: String,
+    pub message: String,
+    pub author: String,
+    pub parent_id: Option<String>,
+    pub timestamp: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WHITEBOARD ELEMENT
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhiteboardElementDTO {
+    pub id: String,
+    pub board_id: String,
+    pub element_type: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub z_index: i32,
+    pub style_json: Option<String>,
+    pub content_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NOTEBOOK CELL
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotebookCellDTO {
+    pub id: String,
+    pub board_id: String,
+    pub cell_type: String,
+    pub cell_order: i32,
+    pub content: Option<String>,
+    pub output: Option<String>,
+    #[serde(default)]
+    pub collapsed: bool,
+    pub height: Option<f64>,
+    pub metadata_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}

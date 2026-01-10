@@ -1,0 +1,90 @@
+// src/models/protocol.rs
+//
+// Network protocol types for peer-to-peer communication
+
+use serde::{Deserialize, Serialize};
+
+use crate::models::core::{Group, Workspace};
+use crate::models::dto::{
+    BoardMetadataDTO, ChatDTO, FileDTO, IntegrationBindingDTO,
+    NotebookCellDTO, WhiteboardDTO, WhiteboardElementDTO,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SNAPSHOT FRAME - Used for peer-to-peer state sync
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Snapshot frames are sent over QUIC to sync group state between peers.
+///
+/// The protocol sends frames in order:
+/// 1. Structure - group, workspaces, boards (UI unblocks immediately)
+/// 2. Content - elements, cells (board content populates)
+/// 3. Metadata - chats, files, integrations, board_metadata
+/// 4. Complete - signals end of transfer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "frame_type")]
+pub enum SnapshotFrame {
+    /// Core structure - sent first, unblocks UI immediately
+    Structure {
+        group: Group,
+        workspaces: Vec<Workspace>,
+        boards: Vec<WhiteboardDTO>,
+    },
+    /// All board content combined - single batched transaction
+    Content {
+        elements: Vec<WhiteboardElementDTO>,
+        cells: Vec<NotebookCellDTO>,
+    },
+    /// All metadata - chats, files, integrations, board metadata
+    Metadata {
+        chats: Vec<ChatDTO>,
+        files: Vec<FileDTO>,
+        integrations: Vec<IntegrationBindingDTO>,
+        board_metadata: Vec<BoardMetadataDTO>,
+    },
+    /// Signals transfer complete
+    Complete,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FILE TRANSFER PROTOCOL
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Messages for the file transfer protocol (FILE_TRANSFER_ALPN).
+///
+/// Flow:
+/// 1. Client sends Request with file_id, hash, and optional resume offset
+/// 2. Server responds with Header (or NotFound/Error)
+/// 3. Server streams raw bytes
+/// 4. Server sends Complete when done
+/// 5. Client verifies hash
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "msg_type")]
+pub enum FileTransferMsg {
+    /// Client requests a file
+    Request {
+        file_id: String,
+        hash: String,
+        /// Resume offset for resumable downloads (0 for fresh download)
+        offset: u64,
+    },
+    /// Server responds with file header before streaming bytes
+    Header {
+        file_id: String,
+        file_name: String,
+        total_size: u64,
+        hash: String,
+        byte_offset: u64,
+        /// How many bytes follow in this transfer
+        byte_length: u64,
+    },
+    /// Server sends after file data is complete
+    Complete {
+        file_id: String,
+        hash: String,
+    },
+    /// Server responds that file was not found
+    NotFound { file_id: String },
+    /// Server responds with error
+    Error { file_id: String, message: String },
+}
