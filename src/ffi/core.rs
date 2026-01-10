@@ -301,22 +301,56 @@ pub extern "C" fn cyan_is_ready() -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cyan_poll_events(_component: *const c_char) -> *mut c_char {
+pub extern "C" fn cyan_poll_events(component: *const c_char) -> *mut c_char {
     let Some(cyan) = SYSTEM.get() else {
         return std::ptr::null_mut();
     };
 
-    let event_ffi_buffer = cyan.event_ffi_buffer.clone();
-    let buffer = event_ffi_buffer.lock();
-    match buffer {
-        Ok(mut buff) => match buff.pop_front() {
-            None => std::ptr::null_mut(),
-            Some(event_json) => CString::new(event_json).unwrap().into_raw(),
-        },
-        Err(e) => {
-            tracing::error!("failed to lock due to {e:?}");
-            std::ptr::null_mut()
+    // Get component name from parameter
+    let component_name = unsafe {
+        if component.is_null() {
+            "unknown"
+        } else {
+            match CStr::from_ptr(component).to_str() {
+                Ok(s) => s,
+                Err(_) => "unknown",
+            }
         }
+    };
+
+    // Route to correct buffer based on component name
+    let event_json = match component_name {
+        "file_tree" => {
+            cyan.file_tree_events.lock().ok().and_then(|mut b| b.pop_front())
+        }
+        "chat_panel" => {
+            cyan.chat_panel_events.lock().ok().and_then(|mut b| b.pop_front())
+        }
+        "whiteboard" => {
+            cyan.whiteboard_events.lock().ok().and_then(|mut b| b.pop_front())
+        }
+        "board_grid" => {
+            cyan.board_grid_events.lock().ok().and_then(|mut b| b.pop_front())
+        }
+        "network" | "status" => {
+            cyan.network_status_events.lock().ok().and_then(|mut b| b.pop_front())
+        }
+        _ => {
+            // Unknown component - log warning but don't fail
+            // This helps catch Swift components using wrong names
+            tracing::warn!("cyan_poll_events: unknown component '{}' - no events returned", component_name);
+            None
+        }
+    };
+
+    match event_json {
+        Some(json) => {
+            match CString::new(json) {
+                Ok(cstr) => cstr.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        None => std::ptr::null_mut(),
     }
 }
 

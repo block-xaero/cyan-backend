@@ -86,10 +86,23 @@ pub struct CyanSystem {
     pub command_tx: mpsc::UnboundedSender<CommandMsg>,
     pub event_tx: mpsc::UnboundedSender<SwiftEvent>,
     pub network_tx: mpsc::UnboundedSender<NetworkCommand>,
-    /// Buffer for general events (FileTree, Network, etc.) - polled by cyan_poll_events
-    pub event_ffi_buffer: Arc<Mutex<VecDeque<String>>>,
-    /// Buffer for integration events only - polled by cyan_poll_integration_events
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PER-COMPONENT EVENT BUFFERS - prevents event loss from wrong component polling
+    // ═══════════════════════════════════════════════════════════════════════
+    /// FileTree events (structure: groups, workspaces, boards, files, sync progress)
+    pub file_tree_events: Arc<Mutex<VecDeque<String>>>,
+    /// Chat panel events (messages, DMs, peer updates)
+    pub chat_panel_events: Arc<Mutex<VecDeque<String>>>,
+    /// Whiteboard events (elements, notebook cells)
+    pub whiteboard_events: Arc<Mutex<VecDeque<String>>>,
+    /// Board grid events (board list, metadata)
+    pub board_grid_events: Arc<Mutex<VecDeque<String>>>,
+    /// Network/status events (general network status)
+    pub network_status_events: Arc<Mutex<VecDeque<String>>>,
+    /// Integration events only - polled by cyan_poll_integration_events
     pub integration_event_buffer: Arc<Mutex<VecDeque<String>>>,
+
     pub db: Arc<Mutex<Connection>>,
     /// Peers per group, shared with NetworkActor for FFI queries
     pub peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>>,
@@ -216,12 +229,21 @@ impl CyanSystem {
         let (net_tx, net_rx) = mpsc::unbounded_channel::<NetworkCommand>();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SwiftEvent>();
 
-        // Two separate buffers for different event types
-        let event_ffi_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(Default::default()));
-        let integration_event_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(Default::default()));
+        // Per-component event buffers - prevents event loss from wrong component polling
+        let file_tree_events: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let chat_panel_events: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let whiteboard_events: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let board_grid_events: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let network_status_events: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let integration_event_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         let peers_per_group: Arc<Mutex<HashMap<String, HashSet<PublicKey>>>> = Arc::new(Mutex::new(HashMap::new()));
 
-        let event_ffi_buffer_clone = event_ffi_buffer.clone();
+        // Clones for event router task
+        let file_tree_events_clone = file_tree_events.clone();
+        let chat_panel_events_clone = chat_panel_events.clone();
+        let whiteboard_events_clone = whiteboard_events.clone();
+        let board_grid_events_clone = board_grid_events.clone();
+        let network_status_events_clone = network_status_events.clone();
         let integration_event_buffer_clone = integration_event_buffer.clone();
         let secret_key_clone = secret_key.clone();
         let peers_per_group_clone = peers_per_group.clone();
@@ -250,14 +272,18 @@ impl CyanSystem {
             event_tx: event_tx.clone(),
             command_tx: cmd_tx,
             network_tx: net_tx.clone(),
-            event_ffi_buffer,
+            file_tree_events,
+            chat_panel_events,
+            whiteboard_events,
+            board_grid_events,
+            network_status_events,
             integration_event_buffer,
             db: db_arc.clone(),
             peers_per_group,
             integration_bridge,
             ai_bridge,
         };
-        eprintln!("🔵 Step 4: System struct created");
+        eprintln!("🔵 Step 4: System struct created (per-component event routing)");
 
         // Spawn CommandActor
         let db_clone = system.db.clone();
@@ -292,17 +318,21 @@ impl CyanSystem {
         });
         eprintln!("🔵 Step 6: NetworkActor spawned");
 
-        // Event router: routes events to appropriate buffer based on type
+        // Event router: routes events to appropriate component buffer(s)
         RUNTIME.get().unwrap().spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 match serde_json::to_string(&event) {
                     Ok(event_json) => {
-                        // Route integration events to their dedicated buffer
-                        if event.is_integration_event() {
-                            integration_event_buffer_clone.lock().unwrap().push_back(event_json);
-                        } else {
-                            event_ffi_buffer_clone.lock().unwrap().push_back(event_json);
-                        }
+                        route_event_to_buffers(
+                            &event,
+                            &event_json,
+                            &file_tree_events_clone,
+                            &chat_panel_events_clone,
+                            &whiteboard_events_clone,
+                            &board_grid_events_clone,
+                            &network_status_events_clone,
+                            &integration_event_buffer_clone,
+                        );
                     }
                     Err(e) => {
                         eprintln!("Failed to serialize event: {e:?}");
@@ -1159,6 +1189,161 @@ fn seed_demo_if_empty(db: &Arc<Mutex<Connection>>) {
             "INSERT INTO objects (id, workspace_id, type, name, created_at) VALUES (?1, ?2, 'whiteboard', ?3, ?4)",
             params![board_id, workspace_id, "Demo Board", now],
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EVENT ROUTING - Routes SwiftEvent to appropriate component buffers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Route SwiftEvent to appropriate component buffers based on event type.
+/// Some events go to multiple buffers (e.g., BoardCreated → file_tree + board_grid).
+fn route_event_to_buffers(
+    event: &SwiftEvent,
+    event_json: &str,
+    file_tree: &Arc<Mutex<VecDeque<String>>>,
+    chat_panel: &Arc<Mutex<VecDeque<String>>>,
+    whiteboard: &Arc<Mutex<VecDeque<String>>>,
+    board_grid: &Arc<Mutex<VecDeque<String>>>,
+    network_status: &Arc<Mutex<VecDeque<String>>>,
+    integration: &Arc<Mutex<VecDeque<String>>>,
+) {
+    match event {
+        // ═══════════════════════════════════════════════════════════════════
+        // FILE TREE EVENTS (structure + sync progress)
+        // ═══════════════════════════════════════════════════════════════════
+        SwiftEvent::TreeLoaded(_) |
+        SwiftEvent::GroupDeleted { .. } |
+        SwiftEvent::WorkspaceDeleted { .. } |
+        SwiftEvent::FileDownloadProgress { .. } |
+        SwiftEvent::FileDownloaded { .. } |
+        SwiftEvent::FileDownloadFailed { .. } => {
+            file_tree.lock().unwrap().push_back(event_json.to_string());
+        }
+
+        // Sync events → FileTree + NetworkStatus (for StatusBar)
+        SwiftEvent::SyncStarted { .. } |
+        SwiftEvent::SyncStructureReceived { .. } |
+        SwiftEvent::SyncBoardReady { .. } |
+        SwiftEvent::SyncFilesReceived { .. } |
+        SwiftEvent::SyncComplete { .. } => {
+            file_tree.lock().unwrap().push_back(event_json.to_string());
+            network_status.lock().unwrap().push_back(event_json.to_string());
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // NETWORK EVENTS - Route based on inner event type
+        // ═══════════════════════════════════════════════════════════════════
+        SwiftEvent::Network(net_event) => {
+            match net_event {
+                // Structure changes → FileTree + BoardGrid
+                NetworkEvent::GroupCreated(_) |
+                NetworkEvent::GroupRenamed { .. } |
+                NetworkEvent::GroupDeleted { .. } |
+                NetworkEvent::WorkspaceCreated(_) |
+                NetworkEvent::WorkspaceRenamed { .. } |
+                NetworkEvent::WorkspaceDeleted { .. } => {
+                    file_tree.lock().unwrap().push_back(event_json.to_string());
+                    board_grid.lock().unwrap().push_back(event_json.to_string());
+                }
+
+                // Board changes → FileTree + BoardGrid
+                NetworkEvent::BoardCreated { .. } |
+                NetworkEvent::BoardRenamed { .. } |
+                NetworkEvent::BoardDeleted { .. } => {
+                    file_tree.lock().unwrap().push_back(event_json.to_string());
+                    board_grid.lock().unwrap().push_back(event_json.to_string());
+                }
+
+                // Board metadata/mode → BoardGrid
+                NetworkEvent::BoardModeChanged { .. } |
+                NetworkEvent::BoardMetadataUpdated { .. } |
+                NetworkEvent::BoardLabelsUpdated { .. } |
+                NetworkEvent::BoardRated { .. } => {
+                    board_grid.lock().unwrap().push_back(event_json.to_string());
+                }
+
+                // File changes → FileTree
+                NetworkEvent::FileAvailable { .. } => {
+                    file_tree.lock().unwrap().push_back(event_json.to_string());
+                }
+
+                // Chat events → Chat panel
+                NetworkEvent::ChatSent { .. } |
+                NetworkEvent::ChatDeleted { .. } => {
+                    chat_panel.lock().unwrap().push_back(event_json.to_string());
+                }
+
+                // Whiteboard element events → Whiteboard
+                NetworkEvent::WhiteboardElementAdded { .. } |
+                NetworkEvent::WhiteboardElementUpdated { .. } |
+                NetworkEvent::WhiteboardElementDeleted { .. } |
+                NetworkEvent::WhiteboardCleared { .. } => {
+                    whiteboard.lock().unwrap().push_back(event_json.to_string());
+                }
+
+                // Notebook cell events → Whiteboard (notebook is a board type)
+                NetworkEvent::NotebookCellAdded { .. } |
+                NetworkEvent::NotebookCellUpdated { .. } |
+                NetworkEvent::NotebookCellDeleted { .. } |
+                NetworkEvent::NotebookCellsReordered { .. } => {
+                    whiteboard.lock().unwrap().push_back(event_json.to_string());
+                }
+
+                // Profile updates → Chat (for author display name resolution)
+                NetworkEvent::ProfileUpdated { .. } => {
+                    chat_panel.lock().unwrap().push_back(event_json.to_string());
+                }
+
+                // Snapshot available → NetworkStatus (triggers sync flow)
+                NetworkEvent::GroupSnapshotAvailable { .. } => {
+                    network_status.lock().unwrap().push_back(event_json.to_string());
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // BOARD EVENTS (local deletes, metadata)
+        // ═══════════════════════════════════════════════════════════════════
+        SwiftEvent::BoardDeleted { .. } => {
+            file_tree.lock().unwrap().push_back(event_json.to_string());
+            board_grid.lock().unwrap().push_back(event_json.to_string());
+        }
+
+        SwiftEvent::BoardMetadataUpdated { .. } => {
+            board_grid.lock().unwrap().push_back(event_json.to_string());
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // CHAT-SPECIFIC EVENTS
+        // ═══════════════════════════════════════════════════════════════════
+        SwiftEvent::ChatDeleted { .. } |
+        SwiftEvent::ChatStreamReady { .. } |
+        SwiftEvent::ChatStreamClosed { .. } |
+        SwiftEvent::DirectMessageReceived { .. } |
+        SwiftEvent::PeerJoined { .. } |
+        SwiftEvent::PeerLeft { .. } => {
+            chat_panel.lock().unwrap().push_back(event_json.to_string());
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // STATUS EVENTS
+        // ═══════════════════════════════════════════════════════════════════
+        SwiftEvent::StatusUpdate { .. } |
+        SwiftEvent::AIInsight { .. } => {
+            network_status.lock().unwrap().push_back(event_json.to_string());
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // INTEGRATION EVENTS
+        // ═══════════════════════════════════════════════════════════════════
+        SwiftEvent::IntegrationAdded { .. } |
+        SwiftEvent::IntegrationRemoved { .. } |
+        SwiftEvent::IntegrationEvent { .. } |
+        SwiftEvent::IntegrationStatus { .. } |
+        SwiftEvent::IntegrationGraph { .. } => {
+            integration.lock().unwrap().push_back(event_json.to_string());
+        }
     }
 }
 
