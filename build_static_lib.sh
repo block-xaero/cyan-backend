@@ -256,13 +256,19 @@ if [[ "$BUILD_TESTS" == "true" ]]; then
     RUSTFLAGS="-Awarnings" cargo build --release --bin network_test 2>&1 | tee -a build.log
     echo "✅ network_test built"
 
+    echo ""
+    echo "🔨 Building delta_test..."
+    RUSTFLAGS="-Awarnings" cargo build --release --bin delta_test 2>&1 | tee -a build.log
+    echo "✅ delta_test built"
+
     # Copy to build dir for easy access
     cp target/release/snapshot_test build/ 2>/dev/null || cp target/aarch64-apple-darwin/release/snapshot_test build/
     cp target/release/network_test build/ 2>/dev/null || cp target/aarch64-apple-darwin/release/network_test build/
+    cp target/release/delta_test build/ 2>/dev/null || cp target/aarch64-apple-darwin/release/delta_test build/
 
     echo ""
     echo "📁 Test binaries available at:"
-    ls -lh build/snapshot_test build/network_test
+    ls -lh build/snapshot_test build/network_test build/delta_test
 fi
 
 # =============================================================================
@@ -350,6 +356,9 @@ if [[ "$DO_DEPLOY" == "true" ]]; then
     echo "📤 Copying network_test..."
     scp build/network_test "$REMOTE:$REMOTE_DIR/"
 
+    echo "📤 Copying delta_test..."
+    scp build/delta_test "$REMOTE:$REMOTE_DIR/"
+
     echo "✅ Deployed to $REMOTE:$REMOTE_DIR/"
 
     # List what's there
@@ -397,7 +406,7 @@ if [[ "$RUN_HOST" == "false" && "$RUN_JOIN" == "false" && "$REMOTE_JOIN" == "fal
     if [[ "$BUILD_TESTS" == "true" ]]; then
         echo ""
         echo "🧪 Test binaries:"
-        ls -lh build/snapshot_test build/network_test 2>/dev/null || true
+        ls -lh build/snapshot_test build/network_test build/delta_test 2>/dev/null || true
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "🧪 TEST COMMANDS:"
@@ -415,6 +424,10 @@ if [[ "$RUN_HOST" == "false" && "$RUN_JOIN" == "false" && "$REMOTE_JOIN" == "fal
         echo "  │ Terminal 2 (same machine - runs on Aria's laptop):     │"
         echo "  │   ./build_static_lib.sh --skip-lib --remote-join <ID>  │"
         echo "  └─────────────────────────────────────────────────────────┘"
+        echo ""
+        echo "  Delta sync test:"
+        echo "    Terminal 1: ./build/delta_test host"
+        echo "    Terminal 2: ./build/delta_test join"
         echo ""
         echo "  Deploy only (no auto-run):"
         echo "    ./build_static_lib.sh --skip-lib --deploy"

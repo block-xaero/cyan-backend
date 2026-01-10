@@ -1,0 +1,19 @@
+echo ""
+     echo "🔨 Building network_test..."
+     RUSTFLAGS="-Awarnings" cargo build --release --bin network_test 2>&1 | tee -a build.log
+     echo "✅ network_test built"
+
++    echo ""
++    echo "🔨 Building delta_test..."
++    RUSTFLAGS="-Awarnings" cargo build --release --bin delta_test 2>&1 | tee -a build.log
++    echo "✅ delta_test built"
+
+     # Copy to build dir for easy access
+     cp target/release/snapshot_test build/ 2>/dev/null || cp target/aarch64-apple-darwin/release/snapshot_test build/
+     cp target/release/network_test build/ 2>/dev/null || cp target/aarch64-apple-darwin/release/network_test build/
++    cp target/release/delta_test build/ 2>/dev/null || cp target/aarch64-apple-darwin/release/delta_test build/
+
+     echo ""
+     echo "📁 Test binaries available at:"
+-    ls -lh build/snapshot_test build/network_test
++    ls -lh build/snapshot_test build/network_test build/delta_test

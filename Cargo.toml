@@ -18,6 +18,12 @@ path = "tests/network_actor_test.rs"
 name = "snapshot_test"
 path = "tests/snapshot_protocol_test.rs"
 
+
+[[bin]]
+name = "delta_test"
+path = "tests/delta_sync_test.rs"
+
+
 [dependencies]
 xaeroai = { path = "../xaeroai" }
 xaeroid = { path = "../xaeroid" }
