@@ -1,0 +1,263 @@
+pub use crate::ai_bridge::AIBridge;
+use crate::models::core::{Group, Workspace};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum NetworkEvent {
+    /// A group snapshot available sent as a
+    /// network event from source/peer_id
+    /// the current running peer who receives this ack then
+    /// QUIC connects and receives the snapshot
+    GroupSnapshotAvailable {
+        source: String,
+        group_id: String,
+    },
+    GroupCreated(Group),
+    GroupRenamed {
+        id: String,
+        name: String,
+    },
+    GroupDeleted {
+        id: String,
+    },
+    WorkspaceCreated(Workspace),
+    WorkspaceRenamed {
+        id: String,
+        name: String,
+    },
+    WorkspaceDeleted {
+        id: String,
+    },
+    BoardCreated {
+        id: String,
+        workspace_id: String,
+        name: String,
+        created_at: i64,
+    },
+    BoardRenamed {
+        id: String,
+        name: String,
+    },
+    BoardDeleted {
+        id: String,
+    },
+    FileAvailable {
+        id: String,
+        group_id: Option<String>,
+        workspace_id: Option<String>,
+        board_id: Option<String>,
+        name: String,
+        hash: String,
+        size: u64,
+        source_peer: String,
+        created_at: i64,
+    },
+    // ---- Chat events ----
+    ChatSent {
+        id: String,
+        workspace_id: String,
+        message: String,
+        author: String,
+        parent_id: Option<String>,
+        timestamp: i64,
+    },
+    ChatDeleted {
+        id: String,
+    },
+    // ---- Whiteboard element events ----
+    WhiteboardElementAdded {
+        id: String,
+        board_id: String,
+        element_type: String,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        z_index: i32,
+        style_json: Option<String>,
+        content_json: Option<String>,
+        created_at: i64,
+        updated_at: i64,
+    },
+    WhiteboardElementUpdated {
+        id: String,
+        board_id: String,
+        element_type: String,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        z_index: i32,
+        style_json: Option<String>,
+        content_json: Option<String>,
+        updated_at: i64,
+    },
+    WhiteboardElementDeleted {
+        id: String,
+        board_id: String,
+    },
+    WhiteboardCleared {
+        board_id: String,
+    },
+    // ---- Notebook cell events ----
+    NotebookCellAdded {
+        id: String,
+        board_id: String,
+        cell_type: String,
+        cell_order: i32,
+        content: Option<String>,
+    },
+    NotebookCellUpdated {
+        id: String,
+        board_id: String,
+        cell_type: String,
+        cell_order: i32,
+        content: Option<String>,
+        output: Option<String>,
+        collapsed: bool,
+        height: Option<f64>,
+        metadata_json: Option<String>,
+    },
+    NotebookCellDeleted {
+        id: String,
+        board_id: String,
+    },
+    NotebookCellsReordered {
+        board_id: String,
+        cell_ids: Vec<String>,
+    },
+    BoardModeChanged {
+        board_id: String,
+        mode: String,
+    },
+    // ---- Board metadata events ----
+    BoardMetadataUpdated {
+        board_id: String,
+        labels: Vec<String>,
+        rating: i32,
+        contains_model: Option<String>,
+        contains_skills: Vec<String>,
+    },
+    BoardLabelsUpdated {
+        board_id: String,
+        labels: Vec<String>,
+    },
+    BoardRated {
+        board_id: String,
+        rating: i32,
+    },
+    // ---- User profile events ----
+    ProfileUpdated {
+        node_id: String,
+        display_name: String,
+        avatar_hash: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum SwiftEvent {
+    Network(NetworkEvent),
+    TreeLoaded(String), // The JSON tree
+    GroupDeleted { id: String },
+    WorkspaceDeleted { id: String },
+    BoardDeleted { id: String },
+    ChatDeleted { id: String },
+    /// Direct chat stream established with peer
+    ChatStreamReady { peer_id: String, workspace_id: String },
+    /// Direct chat stream closed
+    ChatStreamClosed { peer_id: String },
+    /// Peer joined a group topic
+    PeerJoined { group_id: String, peer_id: String },
+    /// Peer left a group topic
+    PeerLeft { group_id: String, peer_id: String },
+    /// Status update for UI (syncing, downloading, etc.)
+    StatusUpdate { message: String },
+    /// File download progress (0.0 to 1.0)
+    FileDownloadProgress { file_id: String, progress: f64 },
+    /// File download completed
+    FileDownloaded { file_id: String, local_path: String },
+    /// File download failed
+    FileDownloadFailed { file_id: String, error: String },
+    /// Board metadata was updated
+    BoardMetadataUpdated { board_id: String },
+    /// Integration added
+    IntegrationAdded { id: String },
+    /// Integration removed
+    IntegrationRemoved { id: String },
+    /// Integration event for console display
+    IntegrationEvent {
+        id: String,
+        scope_id: String,
+        source: String,
+        summary: String,
+        context: String,
+        url: Option<String>,
+        ts: u64,
+    },
+    /// Integration status change
+    IntegrationStatus {
+        scope_id: String,
+        integration_type: String,
+        status: String,
+        message: Option<String>,
+    },
+    /// Integration graph for console tree display
+    IntegrationGraph {
+        scope_id: String,
+        graph_json: String,  // Serialized IntegrationGraph from integration_bridge
+    },
+    /// AI proactive insight generated
+    AIInsight {
+        insight_json: String,
+    },
+    /// Direct message received from peer
+    DirectMessageReceived {
+        id: String,
+        peer_id: String,
+        message: String,
+        timestamp: i64,
+        is_incoming: bool,
+    },
+    // ---- Sync Progress Events (for progressive UI updates) ----
+    /// Sync started - shows skeleton UI
+    SyncStarted {
+        group_id: String,
+        group_name: String,
+    },
+    /// Structure received - can show tree outline
+    SyncStructureReceived {
+        group_id: String,
+        workspace_count: u32,
+        board_count: u32,
+    },
+    /// Board content synced - board is now interactive
+    SyncBoardReady {
+        board_id: String,
+        element_count: u32,
+        cell_count: u32,
+    },
+    /// Files metadata received - shows files (possibly still downloading)
+    SyncFilesReceived {
+        group_id: String,
+        file_count: u32,
+    },
+    /// Sync complete
+    SyncComplete {
+        group_id: String,
+    },
+}
+
+impl SwiftEvent {
+    /// Returns true if this is an integration-related event that should go to the integration buffer
+    pub(crate) fn is_integration_event(&self) -> bool {
+        matches!(
+            self,
+            SwiftEvent::IntegrationEvent { .. }
+                | SwiftEvent::AIInsight { .. }
+                | SwiftEvent::IntegrationStatus { .. }
+                | SwiftEvent::IntegrationGraph { .. }
+        )
+    }
+}
