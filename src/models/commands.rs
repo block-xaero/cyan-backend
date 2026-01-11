@@ -23,9 +23,18 @@ pub enum NetworkCommand {
         workspace_id: String,
         path: String,
     },
-    DeleteGroup { id: String },
-    DeleteWorkspace { id: String },
-    DeleteBoard { id: String },
+    /// Owner dissolves group - broadcasts to all peers before leaving
+    DissolveGroup { id: String },
+    /// Non-owner leaves group - local cleanup only, no broadcast
+    LeaveGroup { id: String },
+    /// Owner dissolves workspace
+    DissolveWorkspace { id: String, group_id: String },
+    /// Non-owner leaves workspace
+    LeaveWorkspace { id: String },
+    /// Owner dissolves board
+    DissolveBoard { id: String, group_id: String },
+    /// Non-owner leaves board
+    LeaveBoard { id: String },
     DeleteChat { id: String },
     /// Start a direct QUIC chat stream with a peer
     StartChatStream {
@@ -65,7 +74,12 @@ pub enum CommandMsg {
         id: String,
         name: String,
     },
+    /// Delete group (owner only - will check ownership)
     DeleteGroup {
+        id: String,
+    },
+    /// Leave group (non-owner - local removal only)
+    LeaveGroup {
         id: String,
     },
 
@@ -80,7 +94,12 @@ pub enum CommandMsg {
         id: String,
         name: String,
     },
+    /// Delete workspace (owner only)
     DeleteWorkspace {
+        id: String,
+    },
+    /// Leave workspace (non-owner)
+    LeaveWorkspace {
         id: String,
     },
 
@@ -95,7 +114,12 @@ pub enum CommandMsg {
         id: String,
         name: String,
     },
+    /// Delete board (owner only)
     DeleteBoard {
+        id: String,
+    },
+    /// Leave board (non-owner)
+    LeaveBoard {
         id: String,
     },
 

@@ -3,6 +3,7 @@ use crate::models::commands::*;
 use crate::models::core::*;
 use crate::models::dto::*;
 use crate::models::events::*;
+use crate::storage;
 use serde::{Deserialize, Serialize};
 
 pub use crate::integration_bridge::IntegrationBridge;
@@ -424,6 +425,30 @@ pub extern "C" fn cyan_delete_group(id: *const c_char) {
     let _ = sys.command_tx.send(CommandMsg::DeleteGroup { id });
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_leave_group(id: *const c_char) {
+    let Some(id) = (unsafe { cstr_arg(id) }) else {
+        return;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::LeaveGroup { id });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_is_group_owner(id: *const c_char) -> bool {
+    let Some(id) = (unsafe { cstr_arg(id) }) else {
+        return false;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return false,
+    };
+    storage::group_is_owner(&id, &sys.node_id)
+}
+
 // ---------- FFI: workspaces ----------
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_create_workspace(group_id: *const c_char, name: *const c_char) {
@@ -470,6 +495,30 @@ pub extern "C" fn cyan_delete_workspace(id: *const c_char) {
     let _ = sys.command_tx.send(CommandMsg::DeleteWorkspace { id });
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_leave_workspace(id: *const c_char) {
+    let Some(id) = (unsafe { cstr_arg(id) }) else {
+        return;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::LeaveWorkspace { id });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_is_workspace_owner(id: *const c_char) -> bool {
+    let Some(id) = (unsafe { cstr_arg(id) }) else {
+        return false;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return false,
+    };
+    storage::workspace_is_owner(&id, &sys.node_id)
+}
+
 // ---------- FFI: boards ----------
 #[unsafe(no_mangle)]
 pub extern "C" fn cyan_create_board(workspace_id: *const c_char, name: *const c_char) {
@@ -514,6 +563,30 @@ pub extern "C" fn cyan_delete_board(id: *const c_char) {
         None => return,
     };
     let _ = sys.command_tx.send(CommandMsg::DeleteBoard { id });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_leave_board(id: *const c_char) {
+    let Some(id) = (unsafe { cstr_arg(id) }) else {
+        return;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let _ = sys.command_tx.send(CommandMsg::LeaveBoard { id });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_is_board_owner(id: *const c_char) -> bool {
+    let Some(id) = (unsafe { cstr_arg(id) }) else {
+        return false;
+    };
+    let sys = match SYSTEM.get() {
+        Some(s) => s.clone(),
+        None => return false,
+    };
+    storage::board_is_owner(&id, &sys.node_id)
 }
 
 // ---------- FFI: chats ----------

@@ -210,6 +210,15 @@ impl TopicActor {
             }
         }
 
+        // CRITICAL: Explicitly drop the sender to leave the gossip topic
+        // The gossip network needs time to propagate the leave before we can rejoin
+        eprintln!("🛑 [TOPIC] Leaving gossip topic for {}...", &self.group_id[..16.min(self.group_id.len())]);
+        drop(self.sender);
+
+        // Small delay to let the leave propagate through the network
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        eprintln!("✅ [TOPIC] Gossip topic left for {}...", &self.group_id[..16.min(self.group_id.len())]);
+
         tracing::info!("🛑 [TOPIC] Actor stopped for group {}", &self.group_id[..16.min(self.group_id.len())]);
     }
 
@@ -418,6 +427,35 @@ impl TopicActor {
 
                 self.known_peers.insert(peer);
 
+                // CRITICAL: Re-send snapshot request when peer joins
+                // The initial request may have been sent before mesh was ready
+                if self.need_snapshot {
+                    eprintln!("🗂️ [TOPIC] Peer joined while need_snapshot=true, re-sending request");
+                    let request = NetworkCommand::RequestSnapshot {
+                        from_peer: self.node_id.clone(),
+                    };
+                    if let Ok(data) = serde_json::to_vec(&request) {
+                        if let Err(e) = self.sender.broadcast(Bytes::from(data)).await {
+                            eprintln!("🔴 [TOPIC] Snapshot request broadcast failed: {}", e);
+                        } else {
+                            eprintln!("🗂️ [TOPIC] ✓ Snapshot request re-sent after peer join");
+                        }
+                    }
+                } else {
+                    // We have data - proactively offer snapshot to new peer
+                    // This handles asymmetric mesh where peer can't reach us
+                    eprintln!("🗂️ [TOPIC] Peer joined and we have data - offering snapshot");
+                    let event = NetworkEvent::GroupSnapshotAvailable {
+                        source: self.node_id.clone(),
+                        group_id: self.group_id.clone(),
+                    };
+                    if let Err(e) = self.broadcast_event(&event).await {
+                        eprintln!("⚠️ [TOPIC] Failed to offer snapshot: {}", e);
+                    } else {
+                        eprintln!("🗂️ [TOPIC] ✓ Snapshot offer sent to new peer");
+                    }
+                }
+
                 let _ = self.event_tx.send(SwiftEvent::PeerJoined {
                     group_id: self.group_id.clone(),
                     peer_id: peer_str,
@@ -604,6 +642,10 @@ impl TopicActor {
             NetworkEvent::GroupDeleted { id } => {
                 let _ = storage::group_delete(id);
             }
+            NetworkEvent::GroupDissolved { id } => {
+                // Owner dissolved the group - delete locally
+                let _ = storage::group_delete(id);
+            }
             NetworkEvent::WorkspaceCreated(ws) => {
                 let _ = storage::workspace_insert(ws);
             }
@@ -613,6 +655,10 @@ impl TopicActor {
             NetworkEvent::WorkspaceDeleted { id } => {
                 let _ = storage::workspace_delete(id);
             }
+            NetworkEvent::WorkspaceDissolved { id } => {
+                // Owner dissolved the workspace - delete locally
+                let _ = storage::workspace_delete(id);
+            }
             NetworkEvent::BoardCreated { id, workspace_id, name, created_at } => {
                 let _ = storage::board_insert(id, workspace_id, name, *created_at);
             }
@@ -620,6 +666,10 @@ impl TopicActor {
                 let _ = storage::board_rename(id, name);
             }
             NetworkEvent::BoardDeleted { id } => {
+                let _ = storage::board_delete(id);
+            }
+            NetworkEvent::BoardDissolved { id } => {
+                // Owner dissolved the board - delete locally
                 let _ = storage::board_delete(id);
             }
             NetworkEvent::FileAvailable { id, group_id, workspace_id, board_id, name, hash, size, source_peer, created_at } => {

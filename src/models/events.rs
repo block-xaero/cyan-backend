@@ -21,12 +21,20 @@ pub enum NetworkEvent {
     GroupDeleted {
         id: String,
     },
+    /// Owner dissolved group - all peers must remove it
+    GroupDissolved {
+        id: String,
+    },
     WorkspaceCreated(Workspace),
     WorkspaceRenamed {
         id: String,
         name: String,
     },
     WorkspaceDeleted {
+        id: String,
+    },
+    /// Owner dissolved workspace - all peers must remove it
+    WorkspaceDissolved {
         id: String,
     },
     BoardCreated {
@@ -40,6 +48,10 @@ pub enum NetworkEvent {
         name: String,
     },
     BoardDeleted {
+        id: String,
+    },
+    /// Owner dissolved board - all peers must remove it
+    BoardDissolved {
         id: String,
     },
     FileAvailable {
@@ -161,9 +173,17 @@ pub enum SwiftEvent {
     Network(NetworkEvent),
     TreeLoaded(String), // The JSON tree
     GroupDeleted { id: String },
+    /// Non-owner left group (local removal only)
+    GroupLeft { id: String },
     WorkspaceDeleted { id: String },
+    /// Non-owner left workspace
+    WorkspaceLeft { id: String },
     BoardDeleted { id: String },
+    /// Non-owner left board
+    BoardLeft { id: String },
     ChatDeleted { id: String },
+    /// Error message for UI display
+    Error { message: String },
     /// Direct chat stream established with peer
     ChatStreamReady { peer_id: String, workspace_id: String },
     /// Direct chat stream closed
