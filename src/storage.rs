@@ -877,7 +877,7 @@ pub fn dm_list_by_peer(peer_id: &str, limit: usize) -> Result<Vec<(String, Strin
     let conn = db().lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT id, message, timestamp, is_incoming FROM direct_messages
-         WHERE peer_id = ?1 ORDER BY timestamp DESC LIMIT ?2"
+         WHERE peer_id = ?1 ORDER BY timestamp ASC LIMIT ?2"
     )?;
     let rows = stmt.query_map(params![peer_id, limit as i64], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i32>(3)? != 0))
