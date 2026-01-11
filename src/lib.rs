@@ -375,8 +375,8 @@ impl CommandActor {
                     {
                         let db = self.db.lock().unwrap();
                         let _ = db.execute(
-                            "INSERT INTO groups (id, name, icon, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![g.id, g.name, g.icon, g.color, g.created_at],
+                            "INSERT INTO groups (id, name, icon, color, created_at, owner_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![g.id, g.name, g.icon, g.color, g.created_at, self.node_id],
                         );
                     }
 
@@ -412,17 +412,53 @@ impl CommandActor {
                 }
 
                 CommandMsg::DeleteGroup { id } => {
-                    let ok = {
-                        let db = self.db.lock().unwrap();
-                        let _ = db.execute("DELETE FROM objects WHERE group_id=?1", params![id]);
-                        let _ = db.execute("DELETE FROM workspaces WHERE group_id=?1", params![id]);
-                        db.execute("DELETE FROM groups WHERE id=?1", params![id]).unwrap_or(0) > 0
-                    };
+                    // Check ownership
+                    let is_owner = storage::group_is_owner(&id, &self.node_id);
 
-                    if ok {
+                    if is_owner {
+                        eprintln!("🗑️ [DELETE-GROUP] Owner deleting group: {}...", &id[..16.min(id.len())]);
+
+                        // Owner: broadcast dissolution to all peers FIRST
+                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                            group_id: id.clone(),
+                            event: NetworkEvent::GroupDissolved { id: id.clone() },
+                        });
+
+                        // Then delete locally using storage function
+                        match storage::group_delete(&id) {
+                            Ok(_) => eprintln!("🗑️ [DELETE-GROUP] ✓ Cascade delete complete"),
+                            Err(e) => eprintln!("🗑️ [DELETE-GROUP] ⚠️ Cascade delete failed: {}", e),
+                        }
+
                         let _ = self.event_tx.send(SwiftEvent::GroupDeleted { id: id.clone() });
-                        let _ = self.network_tx.send(NetworkCommand::DeleteGroup { id });
+                        let _ = self.network_tx.send(NetworkCommand::DissolveGroup { id });
+                    } else {
+                        // Not owner - send error
+                        let _ = self.event_tx.send(SwiftEvent::Error {
+                            message: "Only the group owner can delete it. Use Leave instead.".into()
+                        });
                     }
+                }
+
+                CommandMsg::LeaveGroup { id } => {
+                    // Non-owner leaving: local delete only, no broadcast
+                    eprintln!("🚪 [LEAVE-GROUP] Starting cascade delete for group: {}...", &id[..16.min(id.len())]);
+
+                    match storage::group_delete(&id) {
+                        Ok(deleted) => {
+                            if deleted {
+                                eprintln!("🚪 [LEAVE-GROUP] ✓ Cascade delete complete");
+                            } else {
+                                eprintln!("🚪 [LEAVE-GROUP] ⚠️ Group not found in DB");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("🚪 [LEAVE-GROUP] ⚠️ Cascade delete failed: {}", e);
+                        }
+                    }
+
+                    let _ = self.network_tx.send(NetworkCommand::LeaveGroup { id: id.clone() });
+                    let _ = self.event_tx.send(SwiftEvent::GroupLeft { id });
                 }
 
                 CommandMsg::CreateWorkspace { group_id, name } => {
@@ -438,8 +474,8 @@ impl CommandActor {
                     {
                         let db = self.db.lock().unwrap();
                         let _ = db.execute(
-                            "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
-                            params![ws.id, ws.group_id, ws.name, ws.created_at],
+                            "INSERT OR IGNORE INTO workspaces (id, group_id, name, created_at, owner_node_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![ws.id, ws.group_id, ws.name, ws.created_at, self.node_id],
                         );
                     }
 
@@ -473,25 +509,38 @@ impl CommandActor {
                 }
 
                 CommandMsg::DeleteWorkspace { id } => {
-                    let group_id = {
-                        let db = self.db.lock().unwrap();
-                        db.query_row("SELECT group_id FROM workspaces WHERE id=?1", params![id], |r| r.get::<_, String>(0)).ok()
-                    };
+                    let group_id = storage::workspace_get_group_id(&id);
+                    let is_owner = storage::workspace_is_owner(&id, &self.node_id);
 
-                    {
-                        let db = self.db.lock().unwrap();
-                        let _ = db.execute("DELETE FROM objects WHERE workspace_id=?1", params![id]);
-                        let _ = db.execute("DELETE FROM workspaces WHERE id=?1", params![id]);
-                    }
+                    if is_owner {
+                        // Owner: broadcast dissolution
+                        if let Some(ref gid) = group_id {
+                            let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                                group_id: gid.clone(),
+                                event: NetworkEvent::WorkspaceDissolved { id: id.clone() },
+                            });
+                        }
 
-                    if let Some(gid) = group_id {
-                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
-                            group_id: gid,
-                            event: NetworkEvent::WorkspaceDeleted { id: id.clone() },
+                        // Delete locally using storage function
+                        let _ = storage::workspace_delete(&id);
+
+                        if let Some(gid) = group_id {
+                            let _ = self.network_tx.send(NetworkCommand::DissolveWorkspace { id: id.clone(), group_id: gid });
+                        }
+                        let _ = self.event_tx.send(SwiftEvent::WorkspaceDeleted { id });
+                    } else {
+                        let _ = self.event_tx.send(SwiftEvent::Error {
+                            message: "Only the workspace owner can delete it. Use Leave instead.".into()
                         });
                     }
+                }
 
-                    let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::WorkspaceDeleted { id }));
+                CommandMsg::LeaveWorkspace { id } => {
+                    // Non-owner leaving: local delete only
+                    let _ = storage::workspace_delete(&id);
+
+                    let _ = self.network_tx.send(NetworkCommand::LeaveWorkspace { id: id.clone() });
+                    let _ = self.event_tx.send(SwiftEvent::WorkspaceLeft { id });
                 }
 
                 CommandMsg::CreateBoard { workspace_id, name } => {
@@ -506,8 +555,8 @@ impl CommandActor {
                     {
                         let db = self.db.lock().unwrap();
                         let _ = db.execute(
-                            "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at) VALUES (?1, ?2, 'whiteboard', ?3, ?4)",
-                            params![id, workspace_id, name, now],
+                            "INSERT OR IGNORE INTO objects (id, workspace_id, type, name, created_at, owner_node_id) VALUES (?1, ?2, 'whiteboard', ?3, ?4, ?5)",
+                            params![id, workspace_id, name, now, self.node_id],
                         );
                     }
 
@@ -550,24 +599,38 @@ impl CommandActor {
                 }
 
                 CommandMsg::DeleteBoard { id } => {
-                    let group_id = self.get_group_id_for_board(&id);
+                    let group_id = storage::board_get_group_id(&id);
+                    let is_owner = storage::board_is_owner(&id, &self.node_id);
 
-                    {
-                        let db = self.db.lock().unwrap();
-                        let _ = db.execute("DELETE FROM whiteboard_elements WHERE board_id=?1", params![id]);
-                        let _ = db.execute("DELETE FROM notebook_cells WHERE board_id=?1", params![id]);
-                        let _ = db.execute("DELETE FROM board_metadata WHERE board_id=?1", params![id]);
-                        let _ = db.execute("DELETE FROM objects WHERE id=?1 AND type='whiteboard'", params![id]);
-                    }
+                    if is_owner {
+                        // Owner: broadcast dissolution
+                        if let Some(ref gid) = group_id {
+                            let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                                group_id: gid.clone(),
+                                event: NetworkEvent::BoardDissolved { id: id.clone() },
+                            });
+                        }
 
-                    if let Some(gid) = group_id {
-                        let _ = self.network_tx.send(NetworkCommand::Broadcast {
-                            group_id: gid,
-                            event: NetworkEvent::BoardDeleted { id: id.clone() },
+                        // Delete locally using storage function
+                        let _ = storage::board_delete(&id);
+
+                        if let Some(gid) = group_id {
+                            let _ = self.network_tx.send(NetworkCommand::DissolveBoard { id: id.clone(), group_id: gid });
+                        }
+                        let _ = self.event_tx.send(SwiftEvent::BoardDeleted { id });
+                    } else {
+                        let _ = self.event_tx.send(SwiftEvent::Error {
+                            message: "Only the board owner can delete it. Use Leave instead.".into()
                         });
                     }
+                }
 
-                    let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::BoardDeleted { id }));
+                CommandMsg::LeaveBoard { id } => {
+                    // Non-owner leaving: local delete only
+                    let _ = storage::board_delete(&id);
+
+                    let _ = self.network_tx.send(NetworkCommand::LeaveBoard { id: id.clone() });
+                    let _ = self.event_tx.send(SwiftEvent::BoardLeft { id });
                 }
 
                 CommandMsg::SendChat { workspace_id, message, parent_id } => {
@@ -1215,9 +1278,19 @@ fn route_event_to_buffers(
         SwiftEvent::TreeLoaded(_) |
         SwiftEvent::GroupDeleted { .. } |
         SwiftEvent::WorkspaceDeleted { .. } |
+        SwiftEvent::BoardDeleted { .. } |
+        SwiftEvent::GroupLeft { .. } |
+        SwiftEvent::WorkspaceLeft { .. } |
+        SwiftEvent::BoardLeft { .. } |
         SwiftEvent::FileDownloadProgress { .. } |
         SwiftEvent::FileDownloaded { .. } |
         SwiftEvent::FileDownloadFailed { .. } => {
+            file_tree.lock().unwrap().push_back(event_json.to_string());
+            board_grid.lock().unwrap().push_back(event_json.to_string());
+        }
+
+        // Error events → FileTree (for display)
+        SwiftEvent::Error { .. } => {
             file_tree.lock().unwrap().push_back(event_json.to_string());
         }
 
@@ -1240,9 +1313,11 @@ fn route_event_to_buffers(
                 NetworkEvent::GroupCreated(_) |
                 NetworkEvent::GroupRenamed { .. } |
                 NetworkEvent::GroupDeleted { .. } |
+                NetworkEvent::GroupDissolved { .. } |
                 NetworkEvent::WorkspaceCreated(_) |
                 NetworkEvent::WorkspaceRenamed { .. } |
-                NetworkEvent::WorkspaceDeleted { .. } => {
+                NetworkEvent::WorkspaceDeleted { .. } |
+                NetworkEvent::WorkspaceDissolved { .. } => {
                     file_tree.lock().unwrap().push_back(event_json.to_string());
                     board_grid.lock().unwrap().push_back(event_json.to_string());
                 }
@@ -1250,7 +1325,8 @@ fn route_event_to_buffers(
                 // Board changes → FileTree + BoardGrid
                 NetworkEvent::BoardCreated { .. } |
                 NetworkEvent::BoardRenamed { .. } |
-                NetworkEvent::BoardDeleted { .. } => {
+                NetworkEvent::BoardDeleted { .. } |
+                NetworkEvent::BoardDissolved { .. } => {
                     file_tree.lock().unwrap().push_back(event_json.to_string());
                     board_grid.lock().unwrap().push_back(event_json.to_string());
                 }
@@ -1303,13 +1379,8 @@ fn route_event_to_buffers(
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // BOARD EVENTS (local deletes, metadata)
+        // BOARD EVENTS (metadata only - deletes handled above)
         // ═══════════════════════════════════════════════════════════════════
-        SwiftEvent::BoardDeleted { .. } => {
-            file_tree.lock().unwrap().push_back(event_json.to_string());
-            board_grid.lock().unwrap().push_back(event_json.to_string());
-        }
-
         SwiftEvent::BoardMetadataUpdated { .. } => {
             board_grid.lock().unwrap().push_back(event_json.to_string());
         }

@@ -458,7 +458,7 @@ impl NetworkActor {
                         eprintln!("🔗 [NET-JOIN-5] ✓ TopicActor spawned successfully");
                         tracing::info!("🔗 [NET-JOIN-5] TopicActor spawned for {}", &group_id[..16.min(group_id.len())]);
 
-                        // CRITICAL: Immediately trigger snapshot request
+                        // Trigger snapshot request - this also helps establish the gossip mesh
                         eprintln!("🔗 [NET-JOIN-6] Triggering snapshot request...");
                         if let Some(handle) = self.topics.get(&group_id) {
                             eprintln!("🔗 [NET-JOIN-6a] Sending RequestSnapshot to TopicActor");
@@ -601,7 +601,10 @@ impl NetworkActor {
                 }
             }
 
-            NetworkCommand::DeleteGroup { id } => {
+            NetworkCommand::DissolveGroup { id } => {
+                // Owner dissolved group - topic actor already broadcast dissolution
+                // Now clean up local state
+
                 // Remove topic actor
                 if let Some(handle) = self.topics.remove(&id) {
                     let _ = handle.cmd_tx.send(ActorMessage::System(SystemCommand::PoisonPill));
@@ -616,6 +619,45 @@ impl NetworkActor {
                         DiscoveryCommand::LeaveGroup(id)
                     ));
                 }
+            }
+
+            NetworkCommand::LeaveGroup { id } => {
+                // Non-owner left group - local cleanup only, no broadcast needed
+
+                // Remove topic actor
+                if let Some(handle) = self.topics.remove(&id) {
+                    let _ = handle.cmd_tx.send(ActorMessage::System(SystemCommand::PoisonPill));
+                }
+
+                // Remove from snapshot tracking
+                self.groups_needing_snapshot.remove(&id);
+
+                // Tell discovery
+                if let Some(ref handle) = self.discovery_handle {
+                    let _ = handle.cmd_tx.send(ActorMessage::Domain(
+                        DiscoveryCommand::LeaveGroup(id)
+                    ));
+                }
+            }
+
+            NetworkCommand::DissolveWorkspace { id, group_id: _ } => {
+                // Owner dissolved workspace - already broadcast via topic actor
+                // Nothing to do at network level
+            }
+
+            NetworkCommand::LeaveWorkspace { id: _ } => {
+                // Non-owner left workspace - local cleanup only
+                // Nothing to do at network level
+            }
+
+            NetworkCommand::DissolveBoard { id, group_id: _ } => {
+                // Owner dissolved board - already broadcast via topic actor
+                // Nothing to do at network level
+            }
+
+            NetworkCommand::LeaveBoard { id: _ } => {
+                // Non-owner left board - local cleanup only
+                // Nothing to do at network level
             }
 
             NetworkCommand::ResumePendingTransfers => {
@@ -644,8 +686,6 @@ impl NetworkActor {
             // Pass-through commands handled elsewhere
             NetworkCommand::UploadToGroup { .. } |
             NetworkCommand::UploadToWorkspace { .. } |
-            NetworkCommand::DeleteWorkspace { .. } |
-            NetworkCommand::DeleteBoard { .. } |
             NetworkCommand::DeleteChat { .. } => {
                 // These are handled by CommandActor or TopicActor
             }

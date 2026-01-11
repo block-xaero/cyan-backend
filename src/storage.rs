@@ -46,7 +46,89 @@ pub fn group_rename(id: &str, name: &str) -> Result<()> {
 
 pub fn group_delete(id: &str) -> Result<bool> {
     let conn = db().lock().unwrap();
+
+    // Get workspace IDs first
+    let workspace_ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM workspaces WHERE group_id=?1")?;
+        stmt.query_map(params![id], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    // Get board IDs (objects with type='whiteboard' in these workspaces)
+    let board_ids: Vec<String> = if !workspace_ids.is_empty() {
+        let placeholders: String = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id FROM objects WHERE type='whiteboard' AND workspace_id IN ({})", placeholders);
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = workspace_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        stmt.query_map(params.as_slice(), |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Delete integration_bindings for group and its workspaces
+    {
+        let mut all_scope_ids = vec![id.to_string()];
+        all_scope_ids.extend(workspace_ids.clone());
+        if !all_scope_ids.is_empty() {
+            let placeholders: String = all_scope_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("DELETE FROM integration_bindings WHERE scope_id IN ({})", placeholders);
+            let params: Vec<&dyn rusqlite::ToSql> = all_scope_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let _ = conn.execute(&sql, params.as_slice());
+        }
+    }
+
+    // Delete file_transfers for files at any level in this group
+    // Board-level files
+    if !board_ids.is_empty() {
+        let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM file_transfers WHERE file_id IN (SELECT id FROM objects WHERE board_id IN ({}))", placeholders);
+        let params: Vec<&dyn rusqlite::ToSql> = board_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let _ = conn.execute(&sql, params.as_slice());
+    }
+    // Workspace-level files
+    if !workspace_ids.is_empty() {
+        let placeholders: String = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM file_transfers WHERE file_id IN (SELECT id FROM objects WHERE workspace_id IN ({}))", placeholders);
+        let params: Vec<&dyn rusqlite::ToSql> = workspace_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let _ = conn.execute(&sql, params.as_slice());
+    }
+    // Group-level files
+    conn.execute("DELETE FROM file_transfers WHERE file_id IN (SELECT id FROM objects WHERE group_id=?1)", params![id])?;
+
+    // Delete board content (whiteboard_elements, notebook_cells, board_metadata)
+    if !board_ids.is_empty() {
+        let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let params: Vec<&dyn rusqlite::ToSql> = board_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        let sql = format!("DELETE FROM whiteboard_elements WHERE board_id IN ({})", placeholders);
+        let _ = conn.execute(&sql, params.as_slice());
+
+        let sql = format!("DELETE FROM notebook_cells WHERE board_id IN ({})", placeholders);
+        let _ = conn.execute(&sql, params.as_slice());
+
+        let sql = format!("DELETE FROM board_metadata WHERE board_id IN ({})", placeholders);
+        let _ = conn.execute(&sql, params.as_slice());
+
+        // Delete files attached to boards
+        let sql = format!("DELETE FROM objects WHERE board_id IN ({})", placeholders);
+        let _ = conn.execute(&sql, params.as_slice());
+    }
+
+    // Delete objects at workspace level (boards, chats, workspace-level files)
+    if !workspace_ids.is_empty() {
+        let placeholders: String = workspace_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM objects WHERE workspace_id IN ({})", placeholders);
+        let params: Vec<&dyn rusqlite::ToSql> = workspace_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let _ = conn.execute(&sql, params.as_slice());
+    }
+
+    // Delete objects at group level (group-level files)
     conn.execute("DELETE FROM objects WHERE group_id=?1", params![id])?;
+
+    // Delete workspaces and group
     conn.execute("DELETE FROM workspaces WHERE group_id=?1", params![id])?;
     let deleted = conn.execute("DELETE FROM groups WHERE id=?1", params![id])? > 0;
     Ok(deleted)
@@ -61,6 +143,70 @@ pub fn group_list_ids() -> HashSet<String> {
         out.insert(r.get::<_, String>(0).unwrap());
     }
     out
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OWNERSHIP HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Check if node owns this group
+pub fn group_is_owner(group_id: &str, node_id: &str) -> bool {
+    let conn = db().lock().unwrap();
+    conn.query_row(
+        "SELECT owner_node_id FROM groups WHERE id = ?1",
+        params![group_id],
+        |r| r.get::<_, Option<String>>(0)
+    ).ok().flatten().as_deref() == Some(node_id)
+}
+
+/// Check if node owns this workspace
+pub fn workspace_is_owner(workspace_id: &str, node_id: &str) -> bool {
+    let conn = db().lock().unwrap();
+    conn.query_row(
+        "SELECT owner_node_id FROM workspaces WHERE id = ?1",
+        params![workspace_id],
+        |r| r.get::<_, Option<String>>(0)
+    ).ok().flatten().as_deref() == Some(node_id)
+}
+
+/// Check if node owns this board
+pub fn board_is_owner(board_id: &str, node_id: &str) -> bool {
+    let conn = db().lock().unwrap();
+    conn.query_row(
+        "SELECT owner_node_id FROM objects WHERE id = ?1 AND type = 'whiteboard'",
+        params![board_id],
+        |r| r.get::<_, Option<String>>(0)
+    ).ok().flatten().as_deref() == Some(node_id)
+}
+
+/// Get owner_node_id of a group
+pub fn group_get_owner(group_id: &str) -> Option<String> {
+    let conn = db().lock().unwrap();
+    conn.query_row(
+        "SELECT owner_node_id FROM groups WHERE id = ?1",
+        params![group_id],
+        |r| r.get::<_, Option<String>>(0)
+    ).ok().flatten()
+}
+
+/// Get owner_node_id of a workspace
+pub fn workspace_get_owner(workspace_id: &str) -> Option<String> {
+    let conn = db().lock().unwrap();
+    conn.query_row(
+        "SELECT owner_node_id FROM workspaces WHERE id = ?1",
+        params![workspace_id],
+        |r| r.get::<_, Option<String>>(0)
+    ).ok().flatten()
+}
+
+/// Get owner_node_id of a board
+pub fn board_get_owner(board_id: &str) -> Option<String> {
+    let conn = db().lock().unwrap();
+    conn.query_row(
+        "SELECT owner_node_id FROM objects WHERE id = ?1 AND type = 'whiteboard'",
+        params![board_id],
+        |r| r.get::<_, Option<String>>(0)
+    ).ok().flatten()
 }
 
 pub fn group_get(id: &str) -> Result<Option<Group>> {
@@ -114,6 +260,48 @@ pub fn workspace_rename(id: &str, name: &str) -> Result<()> {
 
 pub fn workspace_delete(id: &str) -> Result<()> {
     let conn = db().lock().unwrap();
+
+    // Delete integration_bindings for this workspace
+    conn.execute("DELETE FROM integration_bindings WHERE scope_id=?1", params![id])?;
+
+    // Get board IDs in this workspace
+    let board_ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM objects WHERE type='whiteboard' AND workspace_id=?1")?;
+        stmt.query_map(params![id], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    // Delete file_transfers for files at board level
+    if !board_ids.is_empty() {
+        let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM file_transfers WHERE file_id IN (SELECT id FROM objects WHERE board_id IN ({}))", placeholders);
+        let params: Vec<&dyn rusqlite::ToSql> = board_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let _ = conn.execute(&sql, params.as_slice());
+    }
+    // Delete file_transfers for files at workspace level
+    conn.execute("DELETE FROM file_transfers WHERE file_id IN (SELECT id FROM objects WHERE workspace_id=?1)", params![id])?;
+
+    // Delete board content
+    if !board_ids.is_empty() {
+        let placeholders: String = board_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let params: Vec<&dyn rusqlite::ToSql> = board_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        let sql = format!("DELETE FROM whiteboard_elements WHERE board_id IN ({})", placeholders);
+        let _ = conn.execute(&sql, params.as_slice());
+
+        let sql = format!("DELETE FROM notebook_cells WHERE board_id IN ({})", placeholders);
+        let _ = conn.execute(&sql, params.as_slice());
+
+        let sql = format!("DELETE FROM board_metadata WHERE board_id IN ({})", placeholders);
+        let _ = conn.execute(&sql, params.as_slice());
+
+        // Delete files attached to boards
+        let sql = format!("DELETE FROM objects WHERE board_id IN ({})", placeholders);
+        let _ = conn.execute(&sql, params.as_slice());
+    }
+
+    // Delete objects at workspace level (boards, chats, files)
     conn.execute("DELETE FROM objects WHERE workspace_id=?1", params![id])?;
     conn.execute("DELETE FROM workspaces WHERE id=?1", params![id])?;
     Ok(())
@@ -123,6 +311,18 @@ pub fn workspace_get_group_id(workspace_id: &str) -> Option<String> {
     let conn = db().lock().unwrap();
     let mut stmt = conn.prepare("SELECT group_id FROM workspaces WHERE id=?1 LIMIT 1").ok()?;
     stmt.query_row(params![workspace_id], |r| r.get(0)).optional().ok()?
+}
+
+/// Get group_id for a board (via its workspace)
+pub fn board_get_group_id(board_id: &str) -> Option<String> {
+    let conn = db().lock().unwrap();
+    // Board -> workspace_id -> group_id
+    let mut stmt = conn.prepare(
+        "SELECT w.group_id FROM workspaces w
+         INNER JOIN objects o ON o.workspace_id = w.id
+         WHERE o.id = ?1 AND o.type = 'whiteboard' LIMIT 1"
+    ).ok()?;
+    stmt.query_row(params![board_id], |r| r.get(0)).optional().ok()?
 }
 
 pub fn workspace_list_by_group(group_id: &str) -> Result<Vec<Workspace>> {
@@ -180,8 +380,15 @@ pub fn board_rename(id: &str, name: &str) -> Result<()> {
 
 pub fn board_delete(id: &str) -> Result<()> {
     let conn = db().lock().unwrap();
+    // Delete file_transfers for files attached to this board
+    conn.execute("DELETE FROM file_transfers WHERE file_id IN (SELECT id FROM objects WHERE board_id=?1)", params![id])?;
+    // Delete files attached to this board
+    conn.execute("DELETE FROM objects WHERE board_id=?1", params![id])?;
+    // Delete board content
     conn.execute("DELETE FROM whiteboard_elements WHERE board_id=?1", params![id])?;
     conn.execute("DELETE FROM notebook_cells WHERE board_id=?1", params![id])?;
+    conn.execute("DELETE FROM board_metadata WHERE board_id=?1", params![id])?;
+    // Delete the board itself
     conn.execute("DELETE FROM objects WHERE id=?1 AND type='whiteboard'", params![id])?;
     Ok(())
 }
