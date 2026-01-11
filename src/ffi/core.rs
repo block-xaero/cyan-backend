@@ -1445,10 +1445,17 @@ pub extern "C" fn cyan_upload_file(path: *const c_char, scope_json: *const c_cha
         created_at: now,
     };
 
-    let _ = sys.network_tx.send(NetworkCommand::Broadcast {
-        group_id: gid,
+    eprintln!("📤 [FILE-UPLOAD] Broadcasting FileAvailable:");
+    eprintln!("   file_id: {}...", &file_id[..16.min(file_id.len())]);
+    eprintln!("   group_id (gid): {}...", &gid[..16.min(gid.len())]);
+
+    match sys.network_tx.send(NetworkCommand::Broadcast {
+        group_id: gid.clone(),
         event: evt,
-    });
+    }) {
+        Ok(_) => eprintln!("📤 [FILE-UPLOAD] ✓ Broadcast sent to NetworkActor"),
+        Err(e) => eprintln!("📤 [FILE-UPLOAD] 🔴 Broadcast FAILED: {}", e),
+    }
 
     // Return success
     let result = serde_json::json!({

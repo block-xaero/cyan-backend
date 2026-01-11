@@ -247,8 +247,21 @@ impl TopicActor {
     async fn handle_command(&mut self, cmd: TopicCommand) {
         match cmd {
             TopicCommand::Broadcast(event) => {
-                if let Err(e) = self.broadcast_event(&event).await {
-                    tracing::error!("🔴 [TOPIC] Broadcast failed: {}", e);
+                eprintln!("📤 [TOPIC] Broadcasting event: {:?}", std::mem::discriminant(&event));
+                eprintln!("   group_id: {}...", &self.group_id[..16.min(self.group_id.len())]);
+                eprintln!("   known_peers: {}", self.known_peers.len());
+                for peer in &self.known_peers {
+                    let peer_str = peer.to_string();
+                    eprintln!("     → {}...", &peer_str[..16]);
+                }
+                match self.broadcast_event(&event).await {
+                    Ok(_) => {
+                        eprintln!("📤 [TOPIC] ✓ Broadcast sent successfully");
+                    }
+                    Err(e) => {
+                        eprintln!("📤 [TOPIC] 🔴 Broadcast FAILED: {}", e);
+                        tracing::error!("🔴 [TOPIC] Broadcast failed: {}", e);
+                    }
                 }
             }
 
@@ -565,6 +578,7 @@ impl TopicActor {
         Self::persist_event(&evt);
 
         // Forward to Swift
+        eprintln!("📤 [TOPIC→SWIFT] Forwarding event: {:?}", std::mem::discriminant(&evt));
         let _ = self.event_tx.send(SwiftEvent::Network(evt));
     }
 
@@ -647,7 +661,14 @@ impl TopicActor {
                 let _ = storage::group_delete(id);
             }
             NetworkEvent::WorkspaceCreated(ws) => {
-                let _ = storage::workspace_insert(ws);
+                eprintln!("💾 [PERSIST] WorkspaceCreated:");
+                eprintln!("   workspace_id: {}...", &ws.id[..16.min(ws.id.len())]);
+                eprintln!("   group_id: {}...", &ws.group_id[..16.min(ws.group_id.len())]);
+                eprintln!("   name: {}", ws.name);
+                match storage::workspace_insert(ws) {
+                    Ok(_) => eprintln!("💾 [PERSIST] ✓ Workspace inserted to DB"),
+                    Err(e) => eprintln!("💾 [PERSIST] 🔴 Workspace insert FAILED: {}", e),
+                }
             }
             NetworkEvent::WorkspaceRenamed { id, name } => {
                 let _ = storage::workspace_rename(id, name);
@@ -660,7 +681,14 @@ impl TopicActor {
                 let _ = storage::workspace_delete(id);
             }
             NetworkEvent::BoardCreated { id, workspace_id, name, created_at } => {
-                let _ = storage::board_insert(id, workspace_id, name, *created_at);
+                eprintln!("💾 [PERSIST] BoardCreated:");
+                eprintln!("   board_id: {}...", &id[..16.min(id.len())]);
+                eprintln!("   workspace_id: {}...", &workspace_id[..16.min(workspace_id.len())]);
+                eprintln!("   name: {}", name);
+                match storage::board_insert(id, workspace_id, name, *created_at) {
+                    Ok(_) => eprintln!("💾 [PERSIST] ✓ Board inserted to DB"),
+                    Err(e) => eprintln!("💾 [PERSIST] 🔴 Board insert FAILED: {}", e),
+                }
             }
             NetworkEvent::BoardRenamed { id, name } => {
                 let _ = storage::board_rename(id, name);
@@ -673,7 +701,12 @@ impl TopicActor {
                 let _ = storage::board_delete(id);
             }
             NetworkEvent::FileAvailable { id, group_id, workspace_id, board_id, name, hash, size, source_peer, created_at } => {
-                let _ = storage::file_insert(
+                eprintln!("💾 [PERSIST] FileAvailable:");
+                eprintln!("   file_id: {}...", &id[..16.min(id.len())]);
+                eprintln!("   name: {}", name);
+                eprintln!("   group_id: {:?}", group_id.as_ref().map(|g| &g[..16.min(g.len())]));
+                eprintln!("   workspace_id: {:?}", workspace_id.as_ref().map(|w| &w[..16.min(w.len())]));
+                match storage::file_insert(
                     id,
                     group_id.as_deref(),
                     workspace_id.as_deref(),
@@ -683,10 +716,20 @@ impl TopicActor {
                     *size,
                     source_peer,
                     *created_at,
-                );
+                ) {
+                    Ok(_) => eprintln!("💾 [PERSIST] ✓ File inserted to DB"),
+                    Err(e) => eprintln!("💾 [PERSIST] 🔴 File insert FAILED: {}", e),
+                }
             }
             NetworkEvent::ChatSent { id, workspace_id, message, author, parent_id, timestamp } => {
-                let _ = storage::chat_insert(id, workspace_id, message, author, parent_id.as_deref(), *timestamp);
+                eprintln!("💾 [PERSIST] ChatSent:");
+                eprintln!("   chat_id: {}...", &id[..16.min(id.len())]);
+                eprintln!("   workspace_id: {}...", &workspace_id[..16.min(workspace_id.len())]);
+                eprintln!("   author: {}...", &author[..16.min(author.len())]);
+                match storage::chat_insert(id, workspace_id, message, author, parent_id.as_deref(), *timestamp) {
+                    Ok(_) => eprintln!("💾 [PERSIST] ✓ Chat inserted to DB"),
+                    Err(e) => eprintln!("💾 [PERSIST] 🔴 Chat insert FAILED: {}", e),
+                }
             }
             NetworkEvent::ChatDeleted { id } => {
                 let _ = storage::chat_delete(id);

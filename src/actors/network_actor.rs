@@ -411,6 +411,9 @@ impl NetworkActor {
     // ═══════════════════════════════════════════════════════════════════════
 
     async fn handle_network_command(&mut self, cmd: NetworkCommand) {
+        // Log every command received
+        eprintln!("📥 [NET] handle_network_command: {:?}", std::mem::discriminant(&cmd));
+
         match cmd {
             NetworkCommand::JoinGroup { group_id, bootstrap_peer } => {
                 // SIGNPOST: JoinGroup received from FFI
@@ -492,11 +495,16 @@ impl NetworkActor {
             }
 
             NetworkCommand::Broadcast { group_id, event } => {
+                eprintln!("📤 [NET] Broadcast command received:");
+                eprintln!("   group_id: {}...", &group_id[..16.min(group_id.len())]);
+                eprintln!("   event: {:?}", std::mem::discriminant(&event));
                 if let Some(handle) = self.topics.get(&group_id) {
+                    eprintln!("📤 [NET] ✓ TopicActor found, forwarding...");
                     let _ = handle.cmd_tx.send(ActorMessage::Domain(
                         TopicCommand::Broadcast(event)
                     ));
                 } else {
+                    eprintln!("📤 [NET] ⚠️ No TopicActor for group {}...", &group_id[..16.min(group_id.len())]);
                     tracing::warn!(
                         "⚠️ [NET] No TopicActor for group {}",
                         &group_id[..16.min(group_id.len())]

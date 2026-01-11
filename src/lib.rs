@@ -479,10 +479,17 @@ impl CommandActor {
                         );
                     }
 
-                    let _ = self.network_tx.send(NetworkCommand::Broadcast {
+                    eprintln!("📤 [CMD] Broadcasting WorkspaceCreated:");
+                    eprintln!("   workspace_id: {}...", &ws.id[..16.min(ws.id.len())]);
+                    eprintln!("   group_id: {}...", &group_id[..16.min(group_id.len())]);
+
+                    match self.network_tx.send(NetworkCommand::Broadcast {
                         group_id: group_id.clone(),
                         event: NetworkEvent::WorkspaceCreated(ws.clone()),
-                    });
+                    }) {
+                        Ok(_) => eprintln!("📤 [CMD] ✓ Broadcast sent to NetworkActor"),
+                        Err(e) => eprintln!("📤 [CMD] 🔴 Broadcast FAILED: {}", e),
+                    }
 
                     let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::WorkspaceCreated(ws)));
                 }
