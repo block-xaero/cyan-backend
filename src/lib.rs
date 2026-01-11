@@ -645,20 +645,23 @@ impl CommandActor {
                     let now = chrono::Utc::now().timestamp();
                     let author = self.node_id.clone();
 
-                    let group_id = {
-                        let db = self.db.lock().unwrap();
-                        db.query_row("SELECT group_id FROM workspaces WHERE id=?1", params![workspace_id], |r| r.get::<_, String>(0)).ok()
-                    };
+                    eprintln!("💬 [CHAT] SendChat command received:");
+                    eprintln!("   workspace_id: {}...", &workspace_id[..16.min(workspace_id.len())]);
+                    eprintln!("   author: {}...", &author[..16.min(author.len())]);
 
-                    {
-                        let db = self.db.lock().unwrap();
-                        let _ = db.execute(
-                            "INSERT INTO objects (id, workspace_id, type, name, hash, data, created_at) VALUES (?1, ?2, 'chat', ?3, ?4, ?5, ?6)",
-                            params![id, workspace_id, message, author, parent_id.as_ref().map(|s| s.as_bytes().to_vec()), now],
-                        );
+                    // Use storage module for consistent DB access
+                    let group_id = storage::workspace_get_group_id(&workspace_id);
+
+                    eprintln!("   group_id: {:?}", group_id.as_ref().map(|g| &g[..16.min(g.len())]));
+
+                    // Use storage module for consistency with LoadChatHistory
+                    match storage::chat_insert(&id, &workspace_id, &message, &author, parent_id.as_deref(), now) {
+                        Ok(_) => eprintln!("💬 [CHAT] ✓ Chat inserted to DB via storage module"),
+                        Err(e) => eprintln!("💬 [CHAT] 🔴 DB INSERT FAILED: {}", e),
                     }
 
                     if let Some(gid) = group_id {
+                        eprintln!("💬 [CHAT] Broadcasting ChatSent to group {}...", &gid[..16.min(gid.len())]);
                         let _ = self.network_tx.send(NetworkCommand::Broadcast {
                             group_id: gid,
                             event: NetworkEvent::ChatSent {
@@ -670,6 +673,8 @@ impl CommandActor {
                                 timestamp: now,
                             },
                         });
+                    } else {
+                        eprintln!("💬 [CHAT] ⚠️ No group_id found for workspace, skipping broadcast");
                     }
 
                     let _ = self.event_tx.send(SwiftEvent::Network(NetworkEvent::ChatSent {
@@ -683,20 +688,12 @@ impl CommandActor {
                 }
 
                 CommandMsg::DeleteChat { id } => {
-                    let ws_id = {
-                        let db = self.db.lock().unwrap();
-                        db.query_row("SELECT workspace_id FROM objects WHERE id=?1 AND type='chat'", params![id], |r| r.get::<_, String>(0)).ok()
-                    };
+                    // Use storage module for consistent DB access
+                    let ws_id = storage::chat_get_workspace_id(&id);
+                    let group_id = ws_id.as_ref().and_then(|ws| storage::workspace_get_group_id(ws));
 
-                    let group_id = ws_id.as_ref().and_then(|ws| {
-                        let db = self.db.lock().unwrap();
-                        db.query_row("SELECT group_id FROM workspaces WHERE id=?1", params![ws], |r| r.get::<_, String>(0)).ok()
-                    });
-
-                    {
-                        let db = self.db.lock().unwrap();
-                        let _ = db.execute("DELETE FROM objects WHERE id=?1 AND type='chat'", params![id]);
-                    }
+                    // Delete using storage module
+                    let _ = storage::chat_delete(&id);
 
                     if let Some(gid) = group_id {
                         let _ = self.network_tx.send(NetworkCommand::Broadcast {
@@ -1032,8 +1029,30 @@ impl CommandActor {
 
                 // ---- Chat History ----
                 CommandMsg::LoadChatHistory { workspace_id } => {
-                    // Chat history is loaded via TreeLoaded event, this is a no-op trigger
-                    tracing::debug!("LoadChatHistory requested for workspace {}", workspace_id);
+                    eprintln!("💬 [CHAT] LoadChatHistory for workspace {}...", &workspace_id[..16.min(workspace_id.len())]);
+
+                    // Query chats from DB
+                    match storage::chat_list_by_workspace(&workspace_id) {
+                        Ok(chats) => {
+                            eprintln!("💬 [CHAT] Found {} chats in DB", chats.len());
+
+                            // Emit each chat as a ChatSent event to the chat_panel buffer
+                            for chat in chats {
+                                let event = SwiftEvent::Network(NetworkEvent::ChatSent {
+                                    id: chat.id,
+                                    workspace_id: chat.workspace_id,
+                                    message: chat.message,
+                                    author: chat.author,
+                                    parent_id: chat.parent_id,
+                                    timestamp: chat.timestamp,
+                                });
+                                let _ = self.event_tx.send(event);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("💬 [CHAT] 🔴 Failed to load chat history: {}", e);
+                        }
+                    }
                 }
 
                 // ---- Direct Message Commands (handled by NetworkActor) ----
@@ -1054,8 +1073,30 @@ impl CommandActor {
                 }
 
                 CommandMsg::LoadDirectMessageHistory { peer_id } => {
-                    // DM history loaded from storage, trigger refresh
-                    tracing::debug!("LoadDirectMessageHistory requested for peer {}", peer_id);
+                    eprintln!("💬 [DM] LoadDirectMessageHistory for peer {}...", &peer_id[..16.min(peer_id.len())]);
+
+                    // Query DMs from DB
+                    match storage::dm_list_by_peer(&peer_id, 100) {
+                        Ok(dms) => {
+                            eprintln!("💬 [DM] Found {} DMs in DB", dms.len());
+
+                            // Emit each DM as a DirectMessageReceived event
+                            // Note: dm_list_by_peer returns (id, message, timestamp, is_incoming)
+                            for (id, message, timestamp, is_incoming) in dms {
+                                let event = SwiftEvent::DirectMessageReceived {
+                                    id,
+                                    peer_id: peer_id.clone(),
+                                    message,
+                                    timestamp,
+                                    is_incoming,
+                                };
+                                let _ = self.event_tx.send(event);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("💬 [DM] 🔴 Failed to load DM history: {}", e);
+                        }
+                    }
                 }
 
                 // ---- System Commands ----
@@ -1352,7 +1393,12 @@ fn route_event_to_buffers(
                 }
 
                 // Chat events → Chat panel
-                NetworkEvent::ChatSent { .. } |
+                NetworkEvent::ChatSent {  id,  workspace_id, .. } => {
+                    eprintln!("📨 [ROUTE] ChatSent → chat_panel buffer");
+                    eprintln!("   chat_id: {}...", &id[..16.min(id.len())]);
+                    eprintln!("   workspace_id: {}...", &workspace_id[..16.min(workspace_id.len())]);
+                    chat_panel.lock().unwrap().push_back(event_json.to_string());
+                }
                 NetworkEvent::ChatDeleted { .. } => {
                     chat_panel.lock().unwrap().push_back(event_json.to_string());
                 }
@@ -1397,8 +1443,16 @@ fn route_event_to_buffers(
         // ═══════════════════════════════════════════════════════════════════
         SwiftEvent::ChatDeleted { .. } |
         SwiftEvent::ChatStreamReady { .. } |
-        SwiftEvent::ChatStreamClosed { .. } |
-        SwiftEvent::DirectMessageReceived { .. } |
+        SwiftEvent::ChatStreamClosed { .. } => {
+            chat_panel.lock().unwrap().push_back(event_json.to_string());
+        }
+        SwiftEvent::DirectMessageReceived {  id,  peer_id,  message, .. } => {
+            eprintln!("📨 [ROUTE] DirectMessageReceived → chat_panel buffer");
+            eprintln!("   dm_id: {}...", &id[..16.min(id.len())]);
+            eprintln!("   peer_id: {}...", &peer_id[..16.min(peer_id.len())]);
+            eprintln!("   message: {}...", &message[..50.min(message.len())]);
+            chat_panel.lock().unwrap().push_back(event_json.to_string());
+        }
         SwiftEvent::PeerJoined { .. } |
         SwiftEvent::PeerLeft { .. } => {
             chat_panel.lock().unwrap().push_back(event_json.to_string());

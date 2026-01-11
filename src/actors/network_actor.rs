@@ -567,6 +567,9 @@ impl NetworkActor {
             }
 
             NetworkCommand::SendDirectChat { peer_id, workspace_id, message, parent_id } => {
+                eprintln!("💬 [NET] SendDirectChat:");
+                eprintln!("   peer_id: {}...", &peer_id[..16.min(peer_id.len())]);
+                eprintln!("   message: {}...", &message[..50.min(message.len())]);
                 tracing::info!("💬 [NET] SendDirectChat to {}", &peer_id[..16]);
 
                 let dm = DirectMessage {
@@ -580,11 +583,16 @@ impl NetworkActor {
                     attachment: None,
                 };
 
+                eprintln!("💬 [NET] Created DM id: {}...", &dm.id[..16]);
+
                 match self.ensure_dm_stream(&peer_id).await {
                     Ok(sender) => {
+                        eprintln!("💬 [NET] ✓ DM stream established, sending...");
                         if let Err(e) = sender.send(dm.clone()) {
+                            eprintln!("💬 [NET] 🔴 Failed to send DM to channel: {}", e);
                             tracing::error!("🔴 [NET] Failed to send DM: {}", e);
                         } else {
+                            eprintln!("💬 [NET] ✓ DM sent to channel");
                             // Store locally and emit event
                             let _ = storage::dm_insert(
                                 &dm.id,
@@ -601,9 +609,11 @@ impl NetworkActor {
                                 timestamp: dm.timestamp,
                                 is_incoming: false,
                             });
+                            eprintln!("💬 [NET] ✓ DM stored and event emitted");
                         }
                     }
                     Err(e) => {
+                        eprintln!("💬 [NET] 🔴 Failed to establish DM stream: {}", e);
                         tracing::error!("🔴 [NET] Failed to establish DM stream: {}", e);
                     }
                 }
@@ -818,13 +828,18 @@ impl NetworkActor {
 
     /// Ensure we have a DM stream with a peer, creating one if needed
     async fn ensure_dm_stream(&mut self, peer_id: &str) -> Result<UnboundedSender<DirectMessage>> {
+        eprintln!("💬 [DM] ensure_dm_stream for peer {}...", &peer_id[..16.min(peer_id.len())]);
+
         // Check existing
         {
             let senders = self.dm_senders.lock().unwrap();
             if let Some(sender) = senders.get(peer_id) {
+                eprintln!("💬 [DM] ✓ Reusing existing stream");
                 return Ok(sender.clone());
             }
         }
+
+        eprintln!("💬 [DM] No existing stream, opening new connection...");
 
         // Open new connection
         let pk = PublicKey::from_str(peer_id)?;
@@ -838,7 +853,11 @@ impl NetworkActor {
             .map_err(|_| anyhow!("DM connection timeout"))?
             .map_err(|e| anyhow!("DM connect failed: {}", e))?;
 
+        eprintln!("💬 [DM] ✓ QUIC connection established, opening bi-stream...");
+
         let (send_stream, recv_stream) = conn.open_bi().await?;
+
+        eprintln!("💬 [DM] ✓ Bi-stream opened");
 
         // Create channel for outbound messages
         let (tx, rx) = mpsc::unbounded_channel();
@@ -858,6 +877,8 @@ impl NetworkActor {
         });
 
         self.dm_senders.lock().unwrap().insert(peer_id.to_string(), tx.clone());
+
+        eprintln!("💬 [DM] ✓ DM stream handler spawned and registered");
 
         Ok(tx)
     }

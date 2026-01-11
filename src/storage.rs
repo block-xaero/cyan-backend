@@ -479,6 +479,30 @@ pub fn chat_list_by_workspaces(workspace_ids: &[String]) -> Result<Vec<ChatDTO>>
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// Get chats for a single workspace
+pub fn chat_list_by_workspace(workspace_id: &str) -> Result<Vec<ChatDTO>> {
+    let conn = db().lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, workspace_id, name, hash, data, created_at
+         FROM objects WHERE type = 'chat' AND workspace_id = ?1 ORDER BY created_at"
+    )?;
+
+    let rows = stmt.query_map(params![workspace_id], |r| {
+        let parent_bytes: Option<Vec<u8>> = r.get(4)?;
+        let parent_id = parent_bytes.and_then(|b| String::from_utf8(b).ok());
+        Ok(ChatDTO {
+            id: r.get(0)?,
+            workspace_id: r.get(1)?,
+            message: r.get(2)?,
+            author: r.get(3)?,
+            parent_id,
+            timestamp: r.get(5)?,
+        })
+    })?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // FILES
 // ═══════════════════════════════════════════════════════════════════════════
