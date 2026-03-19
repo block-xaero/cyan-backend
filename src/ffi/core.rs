@@ -3362,3 +3362,546 @@ fn json_result_ptr(success: bool, group_id: Option<&str>, group_name: Option<&st
     };
     CString::new(result.to_string()).unwrap().into_raw()
 }
+// ============================================================================
+// Lens Commands FFI
+// ============================================================================
+
+/// Parse a lens command string and resolve paths to IDs.
+/// Input: raw command string like "/summarize g\Sales\Workspace 1"
+/// Returns: JSON with parsed command and resolved IDs, or error.
+///
+/// Response format:
+/// {
+///   "type": "summarize",
+///   "resolved": { "group_id": "...", "workspace_id": "...", ... },
+///   "error": null
+/// }
+/// or for natural language:
+/// { "type": "natural_language", "text": "what happened..." }
+/// or for help:
+/// { "type": "help", "text": "..." }
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_parse_lens_command(input: *const c_char) -> *mut c_char {
+    let input_str = match unsafe { CStr::from_ptr(input) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    let command = crate::lens_commands::parse_command(input_str);
+    
+    let result = match &command {
+        crate::lens_commands::LensCommand::Help => {
+            serde_json::json!({
+                "type": "help",
+                "text": crate::lens_commands::help_text()
+            })
+        }
+        crate::lens_commands::LensCommand::Import { source, target, path } => {
+            let resolved = path.as_ref().and_then(|p| crate::lens_commands::resolve_path(p).ok());
+            serde_json::json!({
+                "type": "import",
+                "source": source,
+                "target": target,
+                "resolved": resolved
+            })
+        }
+        crate::lens_commands::LensCommand::NaturalLanguage { text } => {
+            serde_json::json!({
+                "type": "natural_language",
+                "text": text
+            })
+        }
+        crate::lens_commands::LensCommand::Pin => {
+            serde_json::json!({
+                "type": "pin"
+            })
+        }
+        crate::lens_commands::LensCommand::Summarize { path } => {
+            match crate::lens_commands::resolve_path(path) {
+                Ok(resolved) => serde_json::json!({
+                    "type": "summarize",
+                    "resolved": resolved,
+                    "error": null
+                }),
+                Err(e) => serde_json::json!({
+                    "type": "summarize",
+                    "resolved": null,
+                    "error": e.to_string()
+                }),
+            }
+        }
+        crate::lens_commands::LensCommand::SummarizeFile { path } => {
+            match crate::lens_commands::resolve_path(path) {
+                Ok(resolved) => {
+                    // Also extract text if we can find the file
+                    let text = if let crate::lens_commands::ResolvedPath::File { file_path: Some(ref fp), .. } = resolved {
+                        match crate::lens_commands::extract_text_from_file(fp) {
+                            Ok(t) => Some(crate::lens_commands::truncate_to_token_budget(&t, 4000)),
+                            Err(e) => {
+                                return CString::new(serde_json::json!({
+                                    "type": "summarize_file",
+                                    "resolved": resolved,
+                                    "extracted_text": null,
+                                    "error": format!("Text extraction failed: {}", e)
+                                }).to_string()).unwrap_or_default().into_raw();
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    
+                    serde_json::json!({
+                        "type": "summarize_file",
+                        "resolved": resolved,
+                        "extracted_text": text,
+                        "error": null
+                    })
+                }
+                Err(e) => serde_json::json!({
+                    "type": "summarize_file",
+                    "resolved": null,
+                    "extracted_text": null,
+                    "error": e.to_string()
+                }),
+            }
+        }
+        crate::lens_commands::LensCommand::Grep { term, path } => {
+            match crate::lens_commands::resolve_path(path) {
+                Ok(resolved) => serde_json::json!({
+                    "type": "grep",
+                    "term": term,
+                    "resolved": resolved,
+                    "error": null
+                }),
+                Err(e) => serde_json::json!({
+                    "type": "grep",
+                    "term": term,
+                    "resolved": null,
+                    "error": e.to_string()
+                }),
+            }
+        }
+        crate::lens_commands::LensCommand::Status { path } => {
+            let resolved = path.as_ref().and_then(|p| crate::lens_commands::resolve_path(p).ok());
+            serde_json::json!({
+                "type": "status",
+                "resolved": resolved
+            })
+        }
+        crate::lens_commands::LensCommand::Pulse { path } => {
+            let resolved = path.as_ref().and_then(|p| crate::lens_commands::resolve_path(p).ok());
+            serde_json::json!({
+                "type": "pulse",
+                "resolved": resolved
+            })
+        }
+    };
+    
+    match CString::new(result.to_string()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Extract text from a file at the given path.
+/// Returns the extracted text, or null on failure.
+/// Supports: PDF, TXT, MD, CSV, JSON, code files.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_extract_file_text(path: *const c_char) -> *mut c_char {
+    let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    match crate::lens_commands::extract_text_from_file(path_str) {
+        Ok(text) => {
+            let truncated = crate::lens_commands::truncate_to_token_budget(&text, 4000);
+            match CString::new(truncated) {
+                Ok(s) => s.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Create a board with a markdown cell containing the given content.
+/// Returns the board ID as a hex string, or null on failure.
+/// Uses the command channel so the board gets broadcast to peers via gossip.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pin_summary_as_board(
+    workspace_id: *const c_char,
+    board_name: *const c_char,
+    markdown_content: *const c_char,
+) -> *mut c_char {
+    let ws_id = match unsafe { CStr::from_ptr(workspace_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let name = match unsafe { CStr::from_ptr(board_name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let content = match unsafe { CStr::from_ptr(markdown_content) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+    
+    // Compute the board ID the same way lib.rs does (deterministic)
+    let board_id = blake3::hash(format!("board:{}-{}", ws_id, name).as_bytes()).to_hex().to_string();
+    
+    // Send CreateBoard through command channel — this handles:
+    // 1. SQLite insert
+    // 2. Gossip broadcast to peers
+    // 3. SwiftEvent for local UI
+    let _ = sys.command_tx.send(crate::models::commands::CommandMsg::CreateBoard {
+        workspace_id: ws_id.to_string(),
+        name: name.to_string(),
+    });
+    
+    // Send AddNotebookCell through command channel — same benefits
+    let _ = sys.command_tx.send(crate::models::commands::CommandMsg::AddNotebookCell {
+        board_id: board_id.clone(),
+        cell_type: "markdown".to_string(),
+        cell_order: 0,
+        content: Some(content.to_string()),
+    });
+    
+    match CString::new(board_id) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Execute an import command asynchronously.
+/// Input: JSON from cyan_parse_lens_command with type "import"
+/// The import runs on the tokio runtime and sends progress via event_tx.
+/// Returns immediately with "started" or error.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_import(
+    source: *const c_char,
+    target: *const c_char,
+    workspace_id: *const c_char,
+    token: *const c_char,
+) -> *mut c_char {
+    let source_str = match unsafe { CStr::from_ptr(source) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let target_str = if target.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(target) }.to_str().ok().map(|s| s.to_string())
+    };
+    let ws_id = match unsafe { CStr::from_ptr(workspace_id) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let token_str = match unsafe { CStr::from_ptr(token) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    let Some(sys) = SYSTEM.get() else {
+        return json_cstring(r#"{"success":false,"error":"System not initialized"}"#);
+    };
+    
+    let Some(rt) = RUNTIME.get() else {
+        return json_cstring(r#"{"success":false,"error":"Runtime not available"}"#);
+    };
+    
+    let command_tx = sys.command_tx.clone();
+    let event_tx = sys.event_tx.clone();
+    
+    // If no target, list available projects/spaces
+    if target_str.is_none() || target_str.as_deref() == Some("") {
+        let result = rt.block_on(async {
+            match source_str.as_str() {
+                "jira" => {
+                    match crate::import_orchestrator::list_jira_projects(&token_str, &event_tx).await {
+                        Ok(projects) => serde_json::json!({
+                            "success": true,
+                            "action": "list",
+                            "source": "jira",
+                            "projects": projects
+                        }),
+                        Err(e) => serde_json::json!({
+                            "success": false,
+                            "error": e.to_string()
+                        }),
+                    }
+                }
+                "confluence" => {
+                    match crate::import_orchestrator::list_confluence_spaces(&token_str, &event_tx).await {
+                        Ok(spaces) => serde_json::json!({
+                            "success": true,
+                            "action": "list",
+                            "source": "confluence",
+                            "projects": spaces
+                        }),
+                        Err(e) => serde_json::json!({
+                            "success": false,
+                            "error": e.to_string()
+                        }),
+                    }
+                }
+                "gdocs" | "googledocs" => {
+                    match crate::import_orchestrator::list_google_docs(&token_str, &event_tx).await {
+                        Ok(docs) => serde_json::json!({
+                            "success": true,
+                            "action": "list",
+                            "source": "googledocs",
+                            "projects": docs
+                        }),
+                        Err(e) => serde_json::json!({
+                            "success": false,
+                            "error": e.to_string()
+                        }),
+                    }
+                }
+                _ => serde_json::json!({
+                    "success": false,
+                    "error": format!("Unknown import source: {}. Use: jira, confluence, gdocs", source_str)
+                }),
+            }
+        });
+        
+        return json_cstring(&result.to_string());
+    }
+    
+    // Has target — spawn the import async
+    let target = target_str.unwrap();
+    
+    let source_for_json = source_str.clone();
+    rt.spawn(async move {
+        let result = match source_str.as_str() {
+            "jira" => {
+                if target.to_lowercase() == "all" {
+                    crate::import_orchestrator::import_all_jira(&ws_id, &token_str, &command_tx, &event_tx).await
+                } else {
+                    crate::import_orchestrator::import_jira_project(&target, &ws_id, &token_str, &command_tx, &event_tx).await
+                }
+            }
+            "confluence" => {
+                if target.to_lowercase() == "all" {
+                    crate::import_orchestrator::import_all_confluence(&ws_id, &token_str, &command_tx, &event_tx).await
+                } else {
+                    crate::import_orchestrator::import_confluence_space(&target, &ws_id, &token_str, &command_tx, &event_tx).await
+                }
+            }
+            "gdocs" | "googledocs" => {
+                if target.to_lowercase() == "all" {
+                    crate::import_orchestrator::import_all_google_docs(&ws_id, &token_str, &command_tx, &event_tx).await
+                } else {
+                    crate::import_orchestrator::import_google_doc(&target, &ws_id, &token_str, &command_tx, &event_tx).await
+                }
+            }
+            _ => Err(anyhow::anyhow!("Unknown source: {}", source_str)),
+        };
+        
+        match result {
+            Ok(r) => {
+                tracing::info!("Import complete: {} boards, {} items from {}", r.boards_created, r.items_imported, r.source);
+            }
+            Err(e) => {
+                tracing::error!("Import failed: {}", e);
+            }
+        }
+    });
+    
+    json_cstring(&serde_json::json!({
+        "success": true,
+        "action": "started",
+        "source": source_for_json
+    }).to_string())
+}
+
+fn json_cstring(s: &str) -> *mut c_char {
+    match CString::new(s) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+// Add to ffi/core.rs — path autocomplete for g\ prefix
+
+/// Autocomplete a partial path like "g\", "g\Sales\", "g\Sales\Work"
+/// Returns JSON array of [{name, path}] suggestions.
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_autocomplete_path(
+    partial: *const c_char,
+) -> *mut c_char {
+    let partial_str = match unsafe { CStr::from_ptr(partial) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    let conn = match crate::storage::db().lock() {
+        Ok(c) => c,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    // Strip g\ or g/ prefix
+    let cleaned = partial_str
+        .trim_start_matches("g\\")
+        .trim_start_matches("g/");
+    
+    let parts: Vec<&str> = cleaned.split('\\').collect();
+    
+    let result: Vec<serde_json::Value> = match parts.len() {
+        // g\ → list all groups
+        0 | 1 if cleaned.is_empty() || !cleaned.contains('\\') => {
+            let filter = if cleaned.is_empty() { "" } else { parts[0] };
+            let mut stmt = conn.prepare(
+                "SELECT name FROM groups WHERE name LIKE ?1 ORDER BY name LIMIT 10"
+            ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
+            
+            let pattern = format!("{}%", filter);
+            stmt.query_map(rusqlite::params![pattern], |row| {
+                let name: String = row.get(0)?;
+                Ok(name)
+            })
+            .ok()
+            .map(|rows| {
+                rows.filter_map(|r| r.ok())
+                    .map(|name| {
+                        serde_json::json!({
+                            "name": name,
+                            "path": format!("g\\{}", name)
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+        }
+        
+        // g\GroupName\ → list workspaces in group
+        2 if cleaned.ends_with('\\') || parts[1].is_empty() => {
+            let group_name = parts[0];
+            let gid: Option<String> = conn.query_row(
+                "SELECT id FROM groups WHERE name = ?1 COLLATE NOCASE",
+                rusqlite::params![group_name],
+                |r| r.get(0),
+            ).ok();
+            
+            if let Some(gid) = gid {
+                let mut stmt = conn.prepare(
+                    "SELECT name FROM workspaces WHERE group_id = ?1 ORDER BY name LIMIT 10"
+                ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
+                
+                stmt.query_map(rusqlite::params![gid], |row| {
+                    let name: String = row.get(0)?;
+                    Ok(name)
+                })
+                .ok()
+                .map(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .map(|name| {
+                            serde_json::json!({
+                                "name": name,
+                                "path": format!("g\\{}\\{}", group_name, name)
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+            } else {
+                vec![]
+            }
+        }
+        
+        // g\GroupName\Partial → filter workspaces
+        2 => {
+            let group_name = parts[0];
+            let ws_filter = parts[1];
+            let gid: Option<String> = conn.query_row(
+                "SELECT id FROM groups WHERE name = ?1 COLLATE NOCASE",
+                rusqlite::params![group_name],
+                |r| r.get(0),
+            ).ok();
+            
+            if let Some(gid) = gid {
+                let pattern = format!("{}%", ws_filter);
+                let mut stmt = conn.prepare(
+                    "SELECT name FROM workspaces WHERE group_id = ?1 AND name LIKE ?2 COLLATE NOCASE ORDER BY name LIMIT 10"
+                ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
+                
+                stmt.query_map(rusqlite::params![gid, pattern], |row| {
+                    let name: String = row.get(0)?;
+                    Ok(name)
+                })
+                .ok()
+                .map(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .map(|name| {
+                            serde_json::json!({
+                                "name": name,
+                                "path": format!("g\\{}\\{}", group_name, name)
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+            } else {
+                vec![]
+            }
+        }
+        
+        // g\Group\Workspace\ → list boards
+        3 if cleaned.ends_with('\\') || parts[2].is_empty() => {
+            let group_name = parts[0];
+            let ws_name = parts[1];
+            let gid: Option<String> = conn.query_row(
+                "SELECT id FROM groups WHERE name = ?1 COLLATE NOCASE",
+                rusqlite::params![group_name],
+                |r| r.get(0),
+            ).ok();
+            
+            if let Some(gid) = gid {
+                let wid: Option<String> = conn.query_row(
+                    "SELECT id FROM workspaces WHERE group_id = ?1 AND name = ?2 COLLATE NOCASE",
+                    rusqlite::params![gid, ws_name],
+                    |r| r.get(0),
+                ).ok();
+                
+                if let Some(wid) = wid {
+                    let mut stmt = conn.prepare(
+                        "SELECT name FROM objects WHERE workspace_id = ?1 AND type = 'whiteboard' ORDER BY name LIMIT 10"
+                    ).unwrap_or_else(|_| conn.prepare("SELECT '' LIMIT 0").unwrap());
+                    
+                    stmt.query_map(rusqlite::params![wid], |row| {
+                        let name: String = row.get(0)?;
+                        Ok(name)
+                    })
+                    .ok()
+                    .map(|rows| {
+                        rows.filter_map(|r| r.ok())
+                            .map(|name| {
+                                serde_json::json!({
+                                    "name": name,
+                                    "path": format!("g\\{}\\{}\\{}", group_name, ws_name, name)
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        }
+        
+        _ => vec![],
+    };
+    
+    let json = serde_json::to_string(&result).unwrap_or_else(|_| "[]".to_string());
+    match CString::new(json) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}

@@ -17,11 +17,17 @@ pub use xaero_ffi::*;
 mod integration_bridge;
 pub use integration_bridge::IntegrationBridge;
 
+mod lens_bridge;
+pub use lens_bridge::{LensBridge, RawEvent, XfEvent};
+
 mod ai_bridge;
+pub mod cyan_lens_client;
 pub mod models;
 mod ffi;
 pub mod actors;
 pub mod storage;
+pub mod lens_commands;
+pub mod import_orchestrator;
 
 use crate::models::commands::{CommandMsg, NetworkCommand};
 use crate::models::core::{Group, Workspace};
@@ -249,9 +255,16 @@ impl CyanSystem {
         let peers_per_group_clone = peers_per_group.clone();
 
         let db_arc = Arc::new(Mutex::new(db));
-        let integration_bridge = Arc::new(IntegrationBridge::new(
+        
+        // Get discovery_key as default group_id for Lens broadcasts
+        let lens_group_id = DISCOVERY_KEY.get().cloned();
+        
+        let integration_bridge = Arc::new(IntegrationBridge::new_with_lens(
             db_arc.clone(),
             event_tx.clone(),
+            None,  // xaeroflux_tx - not using LensBridge channel approach
+            lens_group_id,
+            Some(net_tx.clone()),  // network_tx for gossip broadcast
         ));
 
         // Create AI bridge
@@ -1357,6 +1370,15 @@ fn route_event_to_buffers(
         // ═══════════════════════════════════════════════════════════════════
         SwiftEvent::Network(net_event) => {
             match net_event {
+                NetworkEvent::IntegrationLensEvent { source_kind, payload } => {
+                    // Received integration event via gossip from another peer.
+                    // The originating peer already forwarded to Lens via AIBridge HTTP path.
+                    // TODO: For multi-peer lens, forward payload to local CyanLensClient.send_event()
+                    tracing::debug!(
+                    "📩 Received IntegrationLensEvent via gossip: source={}",
+                    source_kind
+                 );
+                }
                 // Structure changes → FileTree + BoardGrid
                 NetworkEvent::GroupCreated(_) |
                 NetworkEvent::GroupRenamed { .. } |

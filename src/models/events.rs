@@ -165,6 +165,15 @@ pub enum NetworkEvent {
         display_name: String,
         avatar_hash: Option<String>,
     },
+    // ---- Integration events for Cyan Lens ----
+    /// Integration event forwarded to Cyan Lens via Bootstrap → Iggy
+    /// This is the raw event payload that Lens will enrich (extract asks, decisions, etc.)
+    IntegrationLensEvent {
+        /// Source integration type: "slack", "github", "jira", "confluence", "googledocs"
+        source_kind: String,
+        /// RawEvent JSON payload (see lens_bridge.rs for structure)
+        payload: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

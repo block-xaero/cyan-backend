@@ -26,6 +26,9 @@ use cyan_backend_integrations::{
     NodeStatus as CrateNodeStatus,
 };
 
+use crate::lens_bridge::{ContentKind, LensBridge, RawEvent, SourceKind, XfEvent};
+use crate::models::commands::NetworkCommand;
+use crate::models::events::NetworkEvent;
 use crate::SwiftEvent;
 
 // ============================================================================
@@ -259,6 +262,12 @@ pub struct IntegrationBridge {
     focus_nodes: RwLock<HashMap<String, String>>,
     /// Broadcast queue for Cyan Lens (future QUIC)
     broadcast_queue: RwLock<Vec<BroadcastEvent>>,
+    /// LensBridge for forwarding nodes to Cyan Lens via XaeroFlux
+    lens_bridge: Option<Arc<LensBridge>>,
+    /// Network command sender for gossip broadcast to Lens
+    network_tx: Option<mpsc::UnboundedSender<NetworkCommand>>,
+    /// Group ID for broadcasts (each group has its own gossip topic)
+    lens_group_id: Option<String>,
 }
 
 struct RunningIntegration {
@@ -268,11 +277,41 @@ struct RunningIntegration {
 }
 
 impl IntegrationBridge {
+    /// Create IntegrationBridge without LensBridge (backward compatible)
     pub fn new(
         db: Arc<Mutex<Connection>>,
         event_tx: mpsc::UnboundedSender<SwiftEvent>,
     ) -> Self {
+        Self::new_with_lens(db, event_tx, None, None, None)
+    }
+
+    /// Create IntegrationBridge with optional LensBridge for Cyan Lens forwarding
+    /// and optional network_tx for gossip broadcast
+    pub fn new_with_lens(
+        db: Arc<Mutex<Connection>>,
+        event_tx: mpsc::UnboundedSender<SwiftEvent>,
+        xaeroflux_tx: Option<mpsc::UnboundedSender<XfEvent>>,
+        group_id: Option<String>,
+        network_tx: Option<mpsc::UnboundedSender<NetworkCommand>>,
+    ) -> Self {
         Self::ensure_schema(&db);
+
+        // Create LensBridge if XaeroFlux channel is provided
+        let lens_bridge = match (xaeroflux_tx, group_id.clone()) {
+            (Some(tx), Some(gid)) => {
+                tracing::info!("🌉 IntegrationBridge: LensBridge enabled for group {}", gid);
+                Some(Arc::new(LensBridge::new(gid, tx)))
+            }
+            _ => {
+                tracing::info!("🌉 IntegrationBridge: LensBridge disabled (no XaeroFlux)");
+                None
+            }
+        };
+
+        // Log network_tx status
+        if network_tx.is_some() && group_id.is_some() {
+            tracing::info!("🌉 IntegrationBridge: Gossip broadcast enabled for group {:?}", group_id);
+        }
 
         Self {
             db,
@@ -283,6 +322,9 @@ impl IntegrationBridge {
             last_graph_hash: RwLock::new(HashMap::new()),
             focus_nodes: RwLock::new(HashMap::new()),
             broadcast_queue: RwLock::new(Vec::new()),
+            lens_bridge,
+            network_tx,
+            lens_group_id: group_id,
         }
     }
 
@@ -310,6 +352,30 @@ impl IntegrationBridge {
         for (_key, info) in running.iter() {
             let events = self.manager.get_all_events(&info.scope_id).await;
             let nodes = self.manager.get_all_nodes(&info.scope_id).await;
+
+            // === Forward nodes to Cyan Lens via LensBridge ===
+            if let Some(ref bridge) = self.lens_bridge {
+                let forwarded = bridge.forward_nodes(&nodes);
+                if forwarded > 0 {
+                    tracing::debug!(
+                        "📤 Forwarded {} nodes to Cyan Lens for scope {}",
+                        forwarded,
+                        info.scope_id
+                    );
+                }
+            }
+
+            // === Forward nodes to Cyan Lens via Gossip (new approach) ===
+            if let (Some(network_tx), Some(group_id)) = (&self.network_tx, &self.lens_group_id) {
+                let forwarded = self.broadcast_nodes_to_lens(&nodes, network_tx, group_id);
+                if forwarded > 0 {
+                    tracing::info!(
+                        "📤 Broadcast {} nodes to Lens via gossip for group {}",
+                        forwarded,
+                        &group_id[..16.min(group_id.len())]
+                    );
+                }
+            }
 
             // Build force graph (new format)
             let graph = self.build_force_graph(&events, &nodes, &info.scope_type, &info.scope_id).await;
@@ -358,6 +424,119 @@ impl IntegrationBridge {
             }) {
                 tracing::error!("❌ Failed to send graph: {}", e);
             }
+        }
+    }
+
+    /// Broadcast nodes to Cyan Lens via gossip network
+    /// Returns count of successfully broadcast nodes
+    fn broadcast_nodes_to_lens(
+        &self,
+        nodes: &[Node],
+        network_tx: &mpsc::UnboundedSender<NetworkCommand>,
+        group_id: &str,
+    ) -> usize {
+        let mut count = 0;
+        
+        for node in nodes {
+            // Skip ephemeral nodes - they have no content yet
+            if node.status == CrateNodeStatus::Ephemeral {
+                continue;
+            }
+            
+            // Skip empty content
+            if node.content.trim().is_empty() {
+                continue;
+            }
+            
+            // Convert node to RawEvent JSON
+            let raw_event = self.node_to_raw_event(node, group_id);
+            let payload = match serde_json::to_string(&raw_event) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("Failed to serialize node {}: {}", node.external_id, e);
+                    continue;
+                }
+            };
+            
+            // Get source kind string
+            let source_kind = Self::node_kind_to_source_string(&node.kind);
+            
+            // Broadcast via gossip
+            let event = NetworkEvent::IntegrationLensEvent {
+                source_kind,
+                payload,
+            };
+            
+            if let Err(e) = network_tx.send(NetworkCommand::Broadcast {
+                group_id: group_id.to_string(),
+                event,
+            }) {
+                tracing::warn!("Failed to broadcast node {}: {}", node.external_id, e);
+                continue;
+            }
+            
+            count += 1;
+        }
+        
+        count
+    }
+    
+    /// Convert a Node to RawEvent for Lens consumption
+    fn node_to_raw_event(&self, node: &Node, group_id: &str) -> RawEvent {
+        let (source, content_kind) = Self::map_node_kind(&node.kind);
+        
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        
+        RawEvent {
+            id: node.id.clone(),
+            group_id: group_id.to_string(),
+            workspace_id: node.workspace_id.clone(),
+            source,
+            content_kind,
+            external_id: node.external_id.clone(),
+            content: node.content.clone(),
+            author_id: node.metadata.author.clone(),
+            author_name: node.metadata.author.clone(),
+            url: node.metadata.url.clone(),
+            title: node.metadata.title.clone(),
+            thread_id: None,
+            parent_id: None,
+            ts: node.ts,
+            captured_at: now,
+        }
+    }
+    
+    /// Map NodeKind to (SourceKind, ContentKind)
+    fn map_node_kind(kind: &NodeKind) -> (SourceKind, ContentKind) {
+        match kind {
+            NodeKind::SlackMessage => (SourceKind::Slack, ContentKind::SlackMessage),
+            NodeKind::SlackThread => (SourceKind::Slack, ContentKind::SlackThread),
+            NodeKind::JiraTicket => (SourceKind::Jira, ContentKind::JiraTicket),
+            NodeKind::JiraComment => (SourceKind::Jira, ContentKind::JiraComment),
+            NodeKind::GitHubPR => (SourceKind::GitHub, ContentKind::GithubPr),
+            NodeKind::GitHubIssue => (SourceKind::GitHub, ContentKind::GithubIssue),
+            NodeKind::GitHubCommit => (SourceKind::GitHub, ContentKind::GithubCommit),
+            NodeKind::GitHubRepo => (SourceKind::GitHub, ContentKind::GithubIssue),
+            NodeKind::ConfluencePage => (SourceKind::Confluence, ContentKind::ConfluencePage),
+            NodeKind::GoogleDoc => (SourceKind::GoogleDocs, ContentKind::GoogleDoc),
+            NodeKind::GoogleSheet => (SourceKind::GoogleDocs, ContentKind::GoogleSheet),
+            NodeKind::GoogleSlide => (SourceKind::GoogleDocs, ContentKind::GoogleSlide),
+            NodeKind::GenericUrl => (SourceKind::Slack, ContentKind::SlackMessage),
+        }
+    }
+    
+    /// Get source kind string from NodeKind
+    fn node_kind_to_source_string(kind: &NodeKind) -> String {
+        match kind {
+            NodeKind::SlackMessage | NodeKind::SlackThread => "slack".to_string(),
+            NodeKind::JiraTicket | NodeKind::JiraComment => "jira".to_string(),
+            NodeKind::GitHubPR | NodeKind::GitHubIssue | NodeKind::GitHubCommit | NodeKind::GitHubRepo => "github".to_string(),
+            NodeKind::ConfluencePage => "confluence".to_string(),
+            NodeKind::GoogleDoc | NodeKind::GoogleSheet | NodeKind::GoogleSlide => "googledocs".to_string(),
+            NodeKind::GenericUrl => "generic".to_string(),
         }
     }
 
