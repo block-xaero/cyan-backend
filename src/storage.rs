@@ -1170,6 +1170,26 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_board_pinned ON board_metadata(is_pinned DESC)",
         [],
     );
+
+    // In run_migrations() function:
+
+    // Migration: Add owner_node_id to groups table
+    if conn.prepare("SELECT owner_node_id FROM groups LIMIT 1").is_err() {
+        tracing::info!("Migration: adding owner_node_id column to groups");
+        let _ = conn.execute("ALTER TABLE groups ADD COLUMN owner_node_id TEXT", []);
+    }
+
+    // Migration: Add owner_node_id to workspaces table
+    if conn.prepare("SELECT owner_node_id FROM workspaces LIMIT 1").is_err() {
+        tracing::info!("Migration: adding owner_node_id column to workspaces");
+        let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN owner_node_id TEXT", []);
+    }
+
+    // Migration: Add owner_node_id to objects table
+    if conn.prepare("SELECT owner_node_id FROM objects LIMIT 1").is_err() {
+        tracing::info!("Migration: adding owner_node_id column to objects");
+        let _ = conn.execute("ALTER TABLE objects ADD COLUMN owner_node_id TEXT", []);
+    }
     Ok(())
 }
 

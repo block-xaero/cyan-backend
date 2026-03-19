@@ -15,6 +15,7 @@
 #   --skip-lib        Skip library build (only build/run tests)
 #   --deploy          SCP test binary to Aria's laptop
 #   --remote-join <NODE_ID>  Deploy + run join on Aria's laptop
+#   --flutter         Build dylib for Flutter and copy to ~/cyan_flutter
 
 set -e
 setopt +o nomatch
@@ -22,6 +23,9 @@ export IPHONEOS_DEPLOYMENT_TARGET=18.0
 
 # CORRECT PATH - matches what Xcode expects
 XCODE_PATH="$HOME/cyan-iOS/Cyan/Libraries"
+
+# Flutter project path
+FLUTTER_PATH="$HOME/cyan_flutter"
 
 # Remote machine (Aria's laptop)
 REMOTE="mymomsaccount@Aria-Vyas-MacBook-Pro.local"
@@ -40,6 +44,7 @@ SKIP_LIB=false
 DO_DEPLOY=false
 REMOTE_JOIN=false
 REMOTE_JOIN_NODE_ID=""
+BUILD_FLUTTER=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -84,6 +89,10 @@ while [[ $# -gt 0 ]]; do
             REMOTE_JOIN_NODE_ID="$2"
             shift 2
             ;;
+        --flutter)
+            BUILD_FLUTTER=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             echo ""
@@ -98,9 +107,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-lib               Skip library, only build tests"
             echo "  --deploy                 SCP test binary to Aria's laptop"
             echo "  --remote-join <NODE_ID>  Deploy + run join on Aria's laptop"
+            echo "  --flutter                Build dylib for Flutter macOS app"
             echo ""
             echo "Examples:"
-            echo "  ./build_static_lib.sh                           # Just build library"
+            echo "  ./build_static_lib.sh                           # Just build static library"
+            echo "  ./build_static_lib.sh --flutter                 # Build dylib for Flutter"
             echo "  ./build_static_lib.sh --test                    # Build library + tests"
             echo "  ./build_static_lib.sh --unit                    # Build + run unit tests"
             echo "  ./build_static_lib.sh --skip-lib --host         # Run as host"
@@ -119,8 +130,12 @@ done
 # =============================================================================
 trap 'echo "🔧 Re-linking Homebrew LLVM..."; brew link llvm 2>/dev/null || true' EXIT
 
-echo "🦀 Building Cyan Backend XCFramework (Apple Clang)..."
-echo "📁 Target: $XCODE_PATH"
+echo "🦀 Building Cyan Backend (Apple Clang)..."
+if [[ "$BUILD_FLUTTER" == "true" ]]; then
+    echo "🦋 Flutter mode: Building dynamic library"
+else
+    echo "📁 Target: $XCODE_PATH (static library)"
+fi
 
 # =============================================================================
 # Unlink Homebrew LLVM to avoid ABI conflicts
@@ -185,52 +200,173 @@ if [[ "$SKIP_LIB" == "false" ]]; then
     echo ""
     echo "🔨 Building for macOS (Apple Silicon)..."
 
-    RUSTFLAGS="-Awarnings" cargo build --release --target "aarch64-apple-darwin" 2>&1 | tee -a build.log
+    if [[ "$BUILD_FLUTTER" == "true" ]]; then
+        # =============================================================================
+        # FLUTTER BUILD: Dynamic library (dylib)
+        # =============================================================================
+        echo "🦋 Building DYNAMIC library for Flutter..."
+        
+        # Modify Cargo.toml temporarily to build cdylib
+        # Or use cargo build with --lib flag
+        RUSTFLAGS="-Awarnings" cargo build --release --target "aarch64-apple-darwin" 2>&1 | tee -a build.log
 
-    if [[ ${pipestatus[1]} -ne 0 ]]; then
-        echo "❌ Build FAILED - check build.log"
-        exit 1
+        if [[ ${pipestatus[1]} -ne 0 ]]; then
+            echo "❌ Build FAILED - check build.log"
+            exit 1
+        fi
+
+        echo "✅ macOS build succeeded"
+
+        # =============================================================================
+        # Create dylib from static lib (if dylib doesn't exist)
+        # =============================================================================
+        
+        STATIC_LIB="target/aarch64-apple-darwin/release/libcyan_backend.a"
+        DYLIB_OUTPUT="build/libcyan_core.dylib"
+        
+        # Check if cargo built a dylib directly
+        if [[ -f "target/aarch64-apple-darwin/release/libcyan_backend.dylib" ]]; then
+            echo "📦 Using cargo-built dylib..."
+            cp "target/aarch64-apple-darwin/release/libcyan_backend.dylib" "$DYLIB_OUTPUT"
+        else
+            echo "📦 Creating dylib from static library..."
+            # Create dylib from static lib
+            # Note: This requires all symbols to be properly exported
+            $CC -dynamiclib -all_load \
+                -o "$DYLIB_OUTPUT" \
+                "$STATIC_LIB" \
+                -framework Security \
+                -framework SystemConfiguration \
+                -framework CoreFoundation \
+                -lSystem \
+                -lresolv \
+                -arch arm64 \
+                -install_name @rpath/libcyan_core.dylib \
+                2>&1 || {
+                    echo "⚠️ Direct dylib creation failed, trying alternative..."
+                    # Alternative: just copy the .a and let Flutter handle it
+                    cp "$STATIC_LIB" "build/libcyan_core.a"
+                    echo "📦 Copied static library instead"
+                }
+        fi
+
+        # =============================================================================
+        # Copy to Flutter project
+        # =============================================================================
+        
+        if [[ -d "$FLUTTER_PATH" ]]; then
+            echo "📋 Copying to Flutter project: $FLUTTER_PATH"
+            
+            # Create macos/Libraries directory if needed
+            mkdir -p "$FLUTTER_PATH/macos/Libraries"
+            
+            if [[ -f "$DYLIB_OUTPUT" ]]; then
+                cp "$DYLIB_OUTPUT" "$FLUTTER_PATH/macos/Libraries/"
+                echo "✅ Copied libcyan_core.dylib to Flutter"
+                
+                # Also copy to Runner.app if it exists (for hot reload)
+                if [[ -d "$FLUTTER_PATH/build/macos/Build/Products/Debug/cyan_flutter.app" ]]; then
+                    mkdir -p "$FLUTTER_PATH/build/macos/Build/Products/Debug/cyan_flutter.app/Contents/Frameworks"
+                    cp "$DYLIB_OUTPUT" "$FLUTTER_PATH/build/macos/Build/Products/Debug/cyan_flutter.app/Contents/Frameworks/"
+                    echo "✅ Copied to Debug build"
+                fi
+            fi
+            
+            # Create/update Podfile to link the library
+            echo "📝 Updating Flutter macOS configuration..."
+            
+            # Check if we need to update macos/Runner/Info.plist for dylib loading
+            # This is handled by Flutter's FFI, but we may need to add to RPATH
+            
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🦋 FLUTTER SETUP INSTRUCTIONS"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "Add to macos/Runner.xcodeproj (Build Settings > Runpath Search Paths):"
+            echo "  @executable_path/../Frameworks"
+            echo "  @loader_path/../Frameworks"
+            echo ""
+            echo "Or add to your Podfile in macos/:"
+            echo "  post_install do |installer|"
+            echo "    installer.pods_project.targets.each do |target|"
+            echo "      target.build_configurations.each do |config|"
+            echo "        config.build_settings['LD_RUNPATH_SEARCH_PATHS'] = ["
+            echo "          '\$(inherited)',"
+            echo "          '@executable_path/../Frameworks',"
+            echo "          '@loader_path/../Frameworks'"
+            echo "        ]"
+            echo "      end"
+            echo "    end"
+            echo "  end"
+            echo ""
+        else
+            echo "⚠️ Flutter project not found at: $FLUTTER_PATH"
+            echo "   dylib saved to: $DYLIB_OUTPUT"
+        fi
+
+    else
+        # =============================================================================
+        # XCODE BUILD: Static library (XCFramework) - Original behavior
+        # =============================================================================
+        
+        RUSTFLAGS="-Awarnings" cargo build --release --target "aarch64-apple-darwin" 2>&1 | tee -a build.log
+
+        if [[ ${pipestatus[1]} -ne 0 ]]; then
+            echo "❌ Build FAILED - check build.log"
+            exit 1
+        fi
+
+        echo "✅ macOS build succeeded"
+
+        # =============================================================================
+        # Create XCFramework
+        # =============================================================================
+
+        echo ""
+        echo "📦 Creating XCFramework..."
+
+        cp target/aarch64-apple-darwin/release/libcyan_backend.a build/libcyan_backend_macos.a
+        rm -rf build/CyanBackend.xcframework
+
+        xcodebuild -create-xcframework \
+            -library build/libcyan_backend_macos.a \
+            -output build/CyanBackend.xcframework
+
+        echo "✅ XCFramework created"
+
+        # =============================================================================
+        # Copy to Xcode project (CORRECT LOCATION)
+        # =============================================================================
+
+        echo "📋 Copying to: $XCODE_PATH"
+        mkdir -p "$XCODE_PATH"
+        rm -rf "$XCODE_PATH/CyanBackend.xcframework"
+        cp -R build/CyanBackend.xcframework "$XCODE_PATH/"
+        echo "✅ Copied to Xcode project"
     fi
 
-    echo "✅ macOS build succeeded"
-
     # =============================================================================
-    # Create XCFramework
-    # =============================================================================
-
-    echo ""
-    echo "📦 Creating XCFramework..."
-
-    cp target/aarch64-apple-darwin/release/libcyan_backend.a build/libcyan_backend_macos.a
-    rm -rf build/CyanBackend.xcframework
-
-    xcodebuild -create-xcframework \
-        -library build/libcyan_backend_macos.a \
-        -output build/CyanBackend.xcframework
-
-    echo "✅ XCFramework created"
-
-    # =============================================================================
-    # Copy to Xcode project (CORRECT LOCATION)
-    # =============================================================================
-
-    echo "📋 Copying to: $XCODE_PATH"
-    mkdir -p "$XCODE_PATH"
-    rm -rf "$XCODE_PATH/CyanBackend.xcframework"
-    cp -R build/CyanBackend.xcframework "$XCODE_PATH/"
-    echo "✅ Copied to Xcode project"
-
-    # =============================================================================
-    # Verify
+    # Verify symbols
     # =============================================================================
 
     echo ""
     echo "🔍 Verifying symbols..."
-    if strings "$XCODE_PATH/CyanBackend.xcframework/macos-arm64/libcyan_backend_macos.a" | grep -q "cyan_init"; then
-        echo "✅ Build contains cyan_init symbol"
+    if [[ "$BUILD_FLUTTER" == "true" ]]; then
+        if [[ -f "build/libcyan_core.dylib" ]]; then
+            if nm -gU build/libcyan_core.dylib | grep -q "cyan_send_command"; then
+                echo "✅ dylib contains cyan_send_command symbol"
+            else
+                echo "⚠️ cyan_send_command not found in dylib"
+            fi
+        fi
     else
-        echo "❌ ERROR: cyan_init not found!"
-        exit 1
+        if nm build/libcyan_backend_macos.a 2>/dev/null | grep -q "cyan_init"; then
+            echo "✅ Build contains cyan_init symbol"
+        else
+            echo "❌ ERROR: cyan_init not found!"
+            exit 1
+        fi
     fi
 else
     echo "⭕ Skipping library build (--skip-lib)"
@@ -399,8 +535,15 @@ if [[ "$RUN_HOST" == "false" && "$RUN_JOIN" == "false" && "$REMOTE_JOIN" == "fal
 
     if [[ "$SKIP_LIB" == "false" ]]; then
         echo ""
-        echo "📁 XCFramework: $XCODE_PATH/CyanBackend.xcframework"
-        find "$XCODE_PATH/CyanBackend.xcframework" -name "*.a" -exec ls -lh {} \;
+        if [[ "$BUILD_FLUTTER" == "true" ]]; then
+            echo "🦋 Flutter dylib: $FLUTTER_PATH/macos/Libraries/libcyan_core.dylib"
+            if [[ -f "build/libcyan_core.dylib" ]]; then
+                ls -lh build/libcyan_core.dylib
+            fi
+        else
+            echo "📁 XCFramework: $XCODE_PATH/CyanBackend.xcframework"
+            find "$XCODE_PATH/CyanBackend.xcframework" -name "*.a" -exec ls -lh {} \;
+        fi
     fi
 
     if [[ "$BUILD_TESTS" == "true" ]]; then
@@ -439,10 +582,17 @@ if [[ "$RUN_HOST" == "false" && "$RUN_JOIN" == "false" && "$REMOTE_JOIN" == "fal
 
     if [[ "$SKIP_LIB" == "false" ]]; then
         echo ""
-        echo "📌 XCODE NEXT STEPS:"
-        echo "   1. In Xcode: Cmd+Shift+K (Clean Build Folder)"
-        echo "   2. Cmd+B (Build) with Release scheme"
-        echo "   3. ./package_cyan.sh"
+        if [[ "$BUILD_FLUTTER" == "true" ]]; then
+            echo "📌 FLUTTER NEXT STEPS:"
+            echo "   1. cd ~/cyan_flutter"
+            echo "   2. flutter clean"
+            echo "   3. flutter run -d macos"
+        else
+            echo "📌 XCODE NEXT STEPS:"
+            echo "   1. In Xcode: Cmd+Shift+K (Clean Build Folder)"
+            echo "   2. Cmd+B (Build) with Release scheme"
+            echo "   3. ./package_cyan.sh"
+        fi
     fi
 
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
