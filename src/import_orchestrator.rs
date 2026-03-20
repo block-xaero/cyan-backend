@@ -19,6 +19,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use cyan_backend_integrations::clients::jira::JiraClient;
 use cyan_backend_integrations::clients::confluence::ConfluenceClient;
 use cyan_backend_integrations::clients::googledocs::GoogleDocsClient;
+use cyan_backend_integrations::clients::github::GitHubClient;
 
 use crate::models::commands::CommandMsg;
 use crate::models::events::SwiftEvent;
@@ -52,8 +53,9 @@ struct IntegrationConfig {
     domain: String,
     email: String,
     token: String,
-    projects: Vec<String>,   // Jira projects or Confluence spaces
+    projects: Vec<String>,     // Jira projects or Confluence spaces
     document_ids: Vec<String>, // Google Docs IDs
+    repos: Vec<(String, String)>, // GitHub repos (owner, repo)
 }
 
 fn load_integration_config(scope_id: &str, integration_type: &str) -> Result<IntegrationConfig> {
@@ -79,6 +81,14 @@ fn load_integration_config(scope_id: &str, integration_type: &str) -> Result<Int
             .or_else(|| parse_string_or_array(&config["spaces"]))
             .unwrap_or_default(),
         document_ids: parse_string_or_array(&config["document_ids"])
+            .unwrap_or_default(),
+        repos: config["repos"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| {
+                let owner = v["owner"].as_str()?;
+                let repo = v["repo"].as_str()?;
+                Some((owner.to_string(), repo.to_string()))
+            }).collect())
             .unwrap_or_default(),
     })
 }
@@ -363,26 +373,9 @@ pub async fn import_confluence_space(
     
     for page in &pages {
         let board_name = format!("📄 {}", page.title);
-        
-        // Convert HTML body to markdown (simple strip for now)
         let markdown = confluence_page_to_markdown(page);
         
-        let _ = command_tx.send(CommandMsg::CreateBoard {
-            workspace_id: workspace_id.to_string(),
-            name: board_name.clone(),
-        });
-        
-        let board_id = blake3::hash(format!("board:{}-{}", workspace_id, board_name).as_bytes()).to_hex().to_string();
-        
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        
-        let _ = command_tx.send(CommandMsg::AddNotebookCell {
-            board_id,
-            cell_type: "markdown".to_string(),
-            cell_order: 0,
-            content: Some(markdown),
-        });
-        
+        create_notebook_board(workspace_id, &board_name, &markdown, command_tx).await?;
         boards_created += 1;
     }
     
@@ -397,42 +390,201 @@ pub async fn import_confluence_space(
 fn confluence_page_to_markdown(page: &cyan_backend_integrations::clients::confluence::ConfluencePage) -> String {
     let mut md = format!("# {}\n\n", page.title);
     
-    // Simple HTML to markdown conversion
-    let body_text = page.body.as_ref().map(|b| b.storage.value.clone()).unwrap_or_default();
-    let stripped = body_text
-        .replace("<p>", "\n")
-        .replace("</p>", "\n")
-        .replace("<br>", "\n")
-        .replace("<br/>", "\n")
-        .replace("<strong>", "**")
-        .replace("</strong>", "**")
-        .replace("<em>", "_")
-        .replace("</em>", "_")
-        .replace("<h1>", "# ")
-        .replace("</h1>", "\n")
-        .replace("<h2>", "## ")
-        .replace("</h2>", "\n")
-        .replace("<h3>", "### ")
-        .replace("</h3>", "\n")
-        .replace("<li>", "- ")
-        .replace("</li>", "\n")
-        .replace("<ul>", "")
-        .replace("</ul>", "\n")
-        .replace("<ol>", "")
-        .replace("</ol>", "\n")
-        .replace("<code>", "`")
-        .replace("</code>", "`");
-    
-    // Strip remaining HTML tags
-    let mut result = String::new();
-    let mut in_tag = false;
-    for ch in stripped.chars() {
-        if ch == '<' { in_tag = true; continue; }
-        if ch == '>' { in_tag = false; continue; }
-        if !in_tag { result.push(ch); }
+    let body_html = page.body.as_ref().map(|b| b.storage.value.clone()).unwrap_or_default();
+    if body_html.is_empty() {
+        md.push_str("_No content_\n");
+        return md;
     }
     
-    md.push_str(result.trim());
+    // Extract the base URL for images from page links
+    let base_url = page.links.as_ref()
+        .map(|l| {
+            // Extract domain from self_link: https://domain.atlassian.net/wiki/rest/api/...
+            if let Some(pos) = l.self_link.find("/wiki/") {
+                l.self_link[..pos].to_string()
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default();
+    
+    let result = convert_confluence_html(&body_html, &base_url, &page.id);
+    md.push_str(&result);
+    md.push('\n');
+    md
+}
+
+fn convert_confluence_html(html: &str, base_url: &str, page_id: &str) -> String {
+    let mut result = html.to_string();
+    
+    // 1. Handle Confluence image attachments BEFORE stripping tags
+    // Pattern: <ac:image ...><ri:attachment ri:filename="name.png"/></ac:image>
+    let img_re = regex::Regex::new(r#"<ac:image[^>]*>.*?<ri:attachment ri:filename="([^"]+)"[^/]*/?>.*?</ac:image>"#).ok();
+    if let Some(re) = &img_re {
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            let filename = &caps[1];
+            if base_url.is_empty() {
+                format!("![{}](attachment:{})", filename, filename)
+            } else {
+                format!("![{}]({}/wiki/rest/api/content/{}/child/attachment?filename={})", 
+                    filename, base_url, page_id, filename)
+            }
+        }).to_string();
+    }
+    
+    // 2. Handle standalone img tags
+    let img_tag_re = regex::Regex::new(r#"<img[^>]+src="([^"]+)"[^>]*/?"#).ok();
+    if let Some(re) = &img_tag_re {
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            format!("![image]({})", &caps[1])
+        }).to_string();
+    }
+    
+    // 3. Handle code blocks: <ac:structured-macro ac:name="code">...<ac:plain-text-body><![CDATA[...]]></ac:plain-text-body>
+    let code_re = regex::Regex::new(r#"<ac:structured-macro[^>]*ac:name="code"[^>]*>.*?<!\[CDATA\[(.*?)\]\]>.*?</ac:structured-macro>"#).ok();
+    if let Some(re) = &code_re {
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            format!("\n```\n{}\n```\n", &caps[1])
+        }).to_string();
+    }
+    
+    // 4. Handle tables → markdown tables
+    let table_re = regex::Regex::new(r#"<table[^>]*>(.*?)</table>"#).ok();
+    if let Some(re) = &table_re {
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            convert_html_table(&caps[1])
+        }).to_string();
+    }
+    
+    // 5. Handle links: <a href="url">text</a>
+    let link_re = regex::Regex::new(r#"<a[^>]+href="([^"]+)"[^>]*>([^<]*)</a>"#).ok();
+    if let Some(re) = &link_re {
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            format!("[{}]({})", &caps[2], &caps[1])
+        }).to_string();
+    }
+    
+    // 6. Handle inline styles for colored text
+    let color_re = regex::Regex::new(r#"<span[^>]*style="color:[^"]*"[^>]*>(.*?)</span>"#).ok();
+    if let Some(re) = &color_re {
+        result = re.replace_all(&result, "$1").to_string();
+    }
+    
+    // 7. Strip Confluence-specific macros (inline comments, status, etc)
+    let macro_re = regex::Regex::new(r#"<ac:[^>]*>|</ac:[^>]*>|<ri:[^>]*/?>|</ri:[^>]*>"#).ok();
+    if let Some(re) = &macro_re {
+        result = re.replace_all(&result, "").to_string();
+    }
+    
+    // 8. Standard HTML → markdown conversions
+    // Headings
+    result = result.replace("<h1>", "\n# ").replace("</h1>", "\n");
+    result = result.replace("<h2>", "\n## ").replace("</h2>", "\n");
+    result = result.replace("<h3>", "\n### ").replace("</h3>", "\n");
+    result = result.replace("<h4>", "\n#### ").replace("</h4>", "\n");
+    
+    // Formatting
+    result = result.replace("<strong>", "**").replace("</strong>", "**");
+    result = result.replace("<em>", "_").replace("</em>", "_");
+    result = result.replace("<code>", "`").replace("</code>", "`");
+    
+    // Paragraphs and breaks
+    result = result.replace("<p>", "\n").replace("</p>", "\n");
+    result = result.replace("<p />", "\n").replace("<p/>", "\n");
+    result = result.replace("<br>", "\n").replace("<br/>", "\n");
+    
+    // Lists
+    result = result.replace("<ul>", "").replace("</ul>", "\n");
+    result = result.replace("<ol>", "").replace("</ol>", "\n");
+    
+    // Handle list items with proper bullet/number detection
+    // For now, use bullets for all (ordered list numbering is lost in this simple approach)
+    let li_re = regex::Regex::new(r#"<li[^>]*>"#).ok();
+    if let Some(re) = &li_re {
+        result = re.replace_all(&result, "- ").to_string();
+    }
+    result = result.replace("</li>", "\n");
+    
+    // Horizontal rules
+    result = result.replace("<hr>", "\n---\n").replace("<hr/>", "\n---\n");
+    
+    // 9. Strip ALL remaining HTML tags
+    let tag_re = regex::Regex::new(r#"<[^>]+>"#).ok();
+    if let Some(re) = &tag_re {
+        result = re.replace_all(&result, "").to_string();
+    }
+    
+    // 10. Clean up HTML entities
+    result = result.replace("&amp;", "&");
+    result = result.replace("&lt;", "<");
+    result = result.replace("&gt;", ">");
+    result = result.replace("&quot;", "\"");
+    result = result.replace("&rsquo;", "'");
+    result = result.replace("&lsquo;", "'");
+    result = result.replace("&rdquo;", "\"");
+    result = result.replace("&ldquo;", "\"");
+    result = result.replace("&ndash;", "–");
+    result = result.replace("&mdash;", "—");
+    result = result.replace("&nbsp;", " ");
+    
+    // 11. Clean up excessive blank lines
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+    
+    result.trim().to_string()
+}
+
+fn convert_html_table(table_html: &str) -> String {
+    let mut md = String::from("\n");
+    
+    // Extract rows
+    let row_re = regex::Regex::new(r#"<tr[^>]*>(.*?)</tr>"#).ok();
+    let cell_re = regex::Regex::new(r#"<t[hd][^>]*>(.*?)</t[hd]>"#).ok();
+    
+    let (Some(row_regex), Some(cell_regex)) = (row_re, cell_re) else {
+        return table_html.to_string();
+    };
+    
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut is_first_row = true;
+    
+    for row_cap in row_regex.captures_iter(table_html) {
+        let row_html = &row_cap[1];
+        let cells: Vec<String> = cell_regex.captures_iter(row_html)
+            .map(|c| {
+                // Strip any remaining HTML from cell content
+                let content = &c[1];
+                let tag_strip = regex::Regex::new(r#"<[^>]+>"#).unwrap();
+                tag_strip.replace_all(content, "").trim().to_string()
+            })
+            .collect();
+        
+        if !cells.is_empty() {
+            rows.push(cells);
+        }
+    }
+    
+    if rows.is_empty() {
+        return String::new();
+    }
+    
+    // Build markdown table
+    for (i, row) in rows.iter().enumerate() {
+        md.push_str("| ");
+        md.push_str(&row.join(" | "));
+        md.push_str(" |\n");
+        
+        // Add header separator after first row
+        if i == 0 {
+            md.push_str("|");
+            for _ in row {
+                md.push_str(" --- |");
+            }
+            md.push('\n');
+        }
+    }
+    
     md.push('\n');
     md
 }
@@ -608,4 +760,325 @@ fn extract_gdoc_text(doc: &cyan_backend_integrations::clients::googledocs::Googl
                 .join("\n")
         })
         .unwrap_or_default()
+}
+
+// ============================================================================
+// GitHub Import
+// ============================================================================
+
+pub async fn list_github_repos(
+    token: &str,
+    _event_tx: &UnboundedSender<SwiftEvent>,
+) -> Result<Vec<ImportableProject>> {
+    let client = GitHubClient::new(token.to_string());
+    
+    // Try config first
+    let configured_repos = if let Ok((scope_id, _)) = find_integration_scope("github") {
+        if let Ok(config) = load_integration_config(&scope_id, "github") {
+            parse_github_repos_config(&config)
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+    
+    if !configured_repos.is_empty() {
+        // Use configured repos
+        let mut result = Vec::new();
+        for (owner, repo) in &configured_repos {
+            let full_name = format!("{}/{}", owner, repo);
+            result.push(ImportableProject {
+                key: full_name.clone(),
+                name: full_name,
+                item_count: None,
+            });
+        }
+        return Ok(result);
+    }
+    
+    // Auto-discover: list user's repos from GitHub API
+    let url = "https://api.github.com/user/repos?per_page=20&sort=pushed&affiliation=owner,organization_member";
+    let response = reqwest::Client::new()
+        .get(url)
+        .header("Authorization", format!("token {}", token))
+        .header("User-Agent", "cyan-integrations")
+        .header("Accept", "application/vnd.github.v3+json")
+        .send()
+        .await
+        .map_err(|e| anyhow!("GitHub API error: {}", e))?
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .map_err(|e| anyhow!("GitHub parse error: {}", e))?;
+    
+    let result: Vec<ImportableProject> = response.iter().filter_map(|repo| {
+        let full_name = repo["full_name"].as_str()?.to_string();
+        let description = repo["description"].as_str().unwrap_or("").to_string();
+        let name = if description.is_empty() {
+            full_name.clone()
+        } else {
+            format!("{} — {}", full_name, &description[..description.len().min(50)])
+        };
+        Some(ImportableProject {
+            key: full_name,
+            name,
+            item_count: None,
+        })
+    }).collect();
+    
+    Ok(result)
+}
+
+pub async fn import_github_repo(
+    repo_full_name: &str,
+    workspace_id: &str,
+    token: &str,
+    command_tx: &UnboundedSender<CommandMsg>,
+    _event_tx: &UnboundedSender<SwiftEvent>,
+) -> Result<ImportResult> {
+    let parts: Vec<&str> = repo_full_name.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(anyhow!("Invalid repo format. Use: owner/repo"));
+    }
+    let (owner, repo) = (parts[0], parts[1]);
+    
+    let client = GitHubClient::new(token.to_string());
+    
+    let mut boards_created = 0;
+    let mut total_items = 0;
+    
+    // 1. Recent commits → changelog board
+    let commits = client.list_commits(owner, repo, None).await
+        .map_err(|e| anyhow!("GitHub commits error: {}", e))?;
+    
+    if !commits.is_empty() {
+        let board_name = format!("🔀 {}/{} — Commits", owner, repo);
+        let markdown = github_commits_to_markdown(owner, repo, &commits);
+        create_notebook_board(workspace_id, &board_name, &markdown, command_tx).await?;
+        boards_created += 1;
+        total_items += commits.len();
+    }
+    
+    // 2. Open PRs → review board
+    let prs = client.list_pull_requests(owner, repo, Some("all")).await
+        .map_err(|e| anyhow!("GitHub PRs error: {}", e))?;
+    
+    if !prs.is_empty() {
+        let board_name = format!("🔀 {}/{} — Pull Requests", owner, repo);
+        let markdown = github_prs_to_markdown(owner, repo, &prs);
+        create_notebook_board(workspace_id, &board_name, &markdown, command_tx).await?;
+        boards_created += 1;
+        total_items += prs.len();
+    }
+    
+    // 3. Issues → tracking board
+    let issues = client.list_issues(owner, repo, Some("all")).await
+        .map_err(|e| anyhow!("GitHub issues error: {}", e))?;
+    
+    // Filter out PRs (GitHub API returns PRs as issues too)
+    let real_issues: Vec<_> = issues.iter()
+        .filter(|i| !i.html_url.contains("/pull/"))
+        .collect();
+    
+    if !real_issues.is_empty() {
+        let board_name = format!("🔀 {}/{} — Issues", owner, repo);
+        let markdown = github_issues_to_markdown(owner, repo, &real_issues);
+        create_notebook_board(workspace_id, &board_name, &markdown, command_tx).await?;
+        boards_created += 1;
+        total_items += real_issues.len();
+    }
+    
+    Ok(ImportResult {
+        source: "github".to_string(),
+        boards_created,
+        items_imported: total_items,
+        errors: vec![],
+    })
+}
+
+/// Helper to create a board in notebook mode with a markdown cell
+async fn create_notebook_board(
+    workspace_id: &str,
+    board_name: &str,
+    markdown: &str,
+    command_tx: &UnboundedSender<CommandMsg>,
+) -> Result<String> {
+    let _ = command_tx.send(CommandMsg::CreateBoard {
+        workspace_id: workspace_id.to_string(),
+        name: board_name.to_string(),
+    });
+    
+    let board_id = blake3::hash(format!("board:{}-{}", workspace_id, board_name).as_bytes()).to_hex().to_string();
+    
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    
+    let _ = command_tx.send(CommandMsg::AddNotebookCell {
+        board_id: board_id.clone(),
+        cell_type: "markdown".to_string(),
+        cell_order: 0,
+        content: Some(markdown.to_string()),
+    });
+    
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    
+    // Set notebook mode
+    {
+        let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+        let _ = conn.execute(
+            "UPDATE objects SET board_mode = 'notebook' WHERE id = ?1",
+            rusqlite::params![board_id],
+        );
+    }
+    
+    Ok(board_id)
+}
+
+fn github_commits_to_markdown(owner: &str, repo: &str, commits: &[cyan_backend_integrations::clients::github::GitHubCommit]) -> String {
+    let mut md = format!("# {}/{} — Recent Commits\n\n", owner, repo);
+    md.push_str(&format!("**{}** commits\n\n", commits.len()));
+    
+    for commit in commits {
+        let msg = commit.commit.message.lines().next().unwrap_or("");
+        let author = &commit.commit.author.name;
+        let date = &commit.commit.author.date;
+        let short_sha = &commit.sha[..7.min(commit.sha.len())];
+        
+        // Detect issue/PR references in commit message
+        let has_ref = msg.contains('#') || msg.to_lowercase().contains("fix") || 
+                      msg.to_lowercase().contains("resolve") || msg.to_lowercase().contains("close");
+        let marker = if has_ref { "🔗" } else { "•" };
+        
+        md.push_str(&format!("{} `{}` **{}** — {}\n", marker, short_sha, msg, author));
+        
+        // Show date on separate line
+        if let Some(date_part) = date.split('T').next() {
+            md.push_str(&format!("  _{}_\n", date_part));
+        }
+    }
+    
+    md
+}
+
+fn github_prs_to_markdown(owner: &str, repo: &str, prs: &[cyan_backend_integrations::clients::github::GitHubPullRequest]) -> String {
+    let mut md = format!("# {}/{} — Pull Requests\n\n", owner, repo);
+    
+    let open: Vec<_> = prs.iter().filter(|p| p.state == "open").collect();
+    let merged: Vec<_> = prs.iter().filter(|p| p.state == "closed").collect();
+    
+    let total = prs.len();
+    let open_count = open.len();
+    let merged_count = merged.len();
+    md.push_str(&format!("**{}** PRs ({} open, {} closed)\n\n", total, open_count, merged_count));
+    
+    if !open.is_empty() {
+        md.push_str("## 🟢 Open\n\n");
+        for pr in &open {
+            let assignee = pr.user.login.as_str();
+            md.push_str(&format!("- [ ] **#{}**: {} → @{}\n", pr.number, pr.title, assignee));
+            if let Some(body) = &pr.body {
+                let first = body.lines().next().unwrap_or("");
+                if !first.is_empty() && first.len() < 100 {
+                    md.push_str(&format!("  > {}\n", first));
+                }
+            }
+        }
+        md.push('\n');
+    }
+    
+    if !merged.is_empty() {
+        md.push_str("## ✅ Closed/Merged\n\n");
+        for pr in merged.iter().take(15) {
+            md.push_str(&format!("- [x] **#{}**: {} → @{}\n", pr.number, pr.title, pr.user.login));
+        }
+        if merged_count > 15 {
+            md.push_str(&format!("\n_...and {} more_\n", merged_count - 15));
+        }
+        md.push('\n');
+    }
+    
+    md
+}
+
+fn github_issues_to_markdown(owner: &str, repo: &str, issues: &[&cyan_backend_integrations::clients::github::GitHubIssue]) -> String {
+    let mut md = format!("# {}/{} — Issues\n\n", owner, repo);
+    
+    let open: Vec<_> = issues.iter().filter(|i| i.state == "open").collect();
+    let closed: Vec<_> = issues.iter().filter(|i| i.state == "closed").collect();
+    
+    let open_count = open.len();
+    let closed_count = closed.len();
+    let total = issues.len();
+    let progress = if total > 0 { (closed_count * 100) / total } else { 0 };
+    
+    let filled = progress / 5;
+    let empty = 20 - filled;
+    let bar: String = "█".repeat(filled) + &"░".repeat(empty);
+    md.push_str(&format!("**Progress:** {} {}/{} ({}%)\n\n", bar, closed_count, total, progress));
+    md.push_str("---\n\n");
+    
+    if !open.is_empty() {
+        md.push_str(&format!("## 📋 Open ({})\n\n", open_count));
+        for issue in &open {
+            let labels = issue.labels.iter().map(|l| format!("`{}`", l.name)).collect::<Vec<_>>().join(" ");
+            let assignee = issue.assignee.as_ref().map(|a| format!(" → @{}", a.login)).unwrap_or_default();
+            md.push_str(&format!("- [ ] **#{}**: {}{} {}\n", issue.number, issue.title, assignee, labels));
+        }
+        md.push('\n');
+    }
+    
+    if !closed.is_empty() {
+        md.push_str(&format!("## ✅ Closed ({})\n\n", closed_count));
+        for issue in closed.iter().take(15) {
+            md.push_str(&format!("- [x] **#{}**: {}\n", issue.number, issue.title));
+        }
+        if closed_count > 15 {
+            md.push_str(&format!("\n_...and {} more_\n", closed_count - 15));
+        }
+    }
+    
+    md
+}
+
+fn parse_github_repos_config(config: &IntegrationConfig) -> Vec<(String, String)> {
+    if !config.repos.is_empty() {
+        return config.repos.clone();
+    }
+    // Fallback: try projects field as "owner/repo" strings
+    config.projects.iter().filter_map(|entry| {
+        let parts: Vec<&str> = entry.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            Some((parts[0].to_string(), parts[1].to_string()))
+        } else {
+            None
+        }
+    }).collect()
+}
+
+pub async fn import_all_github(
+    workspace_id: &str,
+    token: &str,
+    command_tx: &UnboundedSender<CommandMsg>,
+    event_tx: &UnboundedSender<SwiftEvent>,
+) -> Result<ImportResult> {
+    let repos = list_github_repos(token, event_tx).await?;
+    let mut total_boards = 0;
+    let mut total_items = 0;
+    let mut errors = Vec::new();
+    
+    for repo in &repos {
+        match import_github_repo(&repo.key, workspace_id, token, command_tx, event_tx).await {
+            Ok(r) => {
+                total_boards += r.boards_created;
+                total_items += r.items_imported;
+            }
+            Err(e) => errors.push(format!("{}: {}", repo.key, e)),
+        }
+    }
+    
+    Ok(ImportResult {
+        source: "github".to_string(),
+        boards_created: total_boards,
+        items_imported: total_items,
+        errors,
+    })
 }

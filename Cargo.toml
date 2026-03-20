@@ -25,6 +25,7 @@ path = "tests/delta_sync_test.rs"
 
 
 [dependencies]
+regex = "1"
 reqwest = { version = "0.12", features = ["json"] }
 urlencoding = "2.1"
 thiserror = "1.0"

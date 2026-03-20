@@ -3663,6 +3663,20 @@ pub extern "C" fn cyan_import(
                         }),
                     }
                 }
+                "github" => {
+                    match crate::import_orchestrator::list_github_repos(&token_str, &event_tx).await {
+                        Ok(repos) => serde_json::json!({
+                            "success": true,
+                            "action": "list",
+                            "source": "github",
+                            "projects": repos
+                        }),
+                        Err(e) => serde_json::json!({
+                            "success": false,
+                            "error": e.to_string()
+                        }),
+                    }
+                }
                 _ => serde_json::json!({
                     "success": false,
                     "error": format!("Unknown import source: {}. Use: jira, confluence, gdocs", source_str)
@@ -3673,12 +3687,12 @@ pub extern "C" fn cyan_import(
         return json_cstring(&result.to_string());
     }
     
-    // Has target — spawn the import async
+    // Has target — run the import synchronously so errors are returned
     let target = target_str.unwrap();
     
     let source_for_json = source_str.clone();
-    rt.spawn(async move {
-        let result = match source_str.as_str() {
+    let import_result = rt.block_on(async {
+        match source_str.as_str() {
             "jira" => {
                 if target.to_lowercase() == "all" {
                     crate::import_orchestrator::import_all_jira(&ws_id, &token_str, &command_tx, &event_tx).await
@@ -3700,24 +3714,35 @@ pub extern "C" fn cyan_import(
                     crate::import_orchestrator::import_google_doc(&target, &ws_id, &token_str, &command_tx, &event_tx).await
                 }
             }
+            "github" => {
+                if target.to_lowercase() == "all" {
+                    crate::import_orchestrator::import_all_github(&ws_id, &token_str, &command_tx, &event_tx).await
+                } else {
+                    crate::import_orchestrator::import_github_repo(&target, &ws_id, &token_str, &command_tx, &event_tx).await
+                }
+            }
             _ => Err(anyhow::anyhow!("Unknown source: {}", source_str)),
-        };
-        
-        match result {
-            Ok(r) => {
-                tracing::info!("Import complete: {} boards, {} items from {}", r.boards_created, r.items_imported, r.source);
-            }
-            Err(e) => {
-                tracing::error!("Import failed: {}", e);
-            }
         }
     });
     
-    json_cstring(&serde_json::json!({
-        "success": true,
-        "action": "started",
-        "source": source_for_json
-    }).to_string())
+    match import_result {
+        Ok(r) => {
+            json_cstring(&serde_json::json!({
+                "success": true,
+                "action": "completed",
+                "source": source_for_json,
+                "boards_created": r.boards_created,
+                "items_imported": r.items_imported,
+                "errors": r.errors
+            }).to_string())
+        }
+        Err(e) => {
+            json_cstring(&serde_json::json!({
+                "success": false,
+                "error": e.to_string()
+            }).to_string())
+        }
+    }
 }
 
 fn json_cstring(s: &str) -> *mut c_char {

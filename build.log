@@ -294,3 +294,137 @@ warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` 
   * `integration-test` target `snapshot_protocol_test`
    Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
     Finished `release` profile [optimized] target(s) in 25.45s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend-integrations v0.0.1 (/Users/anirudhvyas/cyan-backend-integrations)
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 26.49s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 23.43s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 25.34s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 25.97s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 29.52s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+   Compiling bindgen v0.72.1
+   Compiling cyan-backend-integrations v0.0.1 (/Users/anirudhvyas/cyan-backend-integrations)
+   Compiling xaeroid v1.0.1 (/Users/anirudhvyas/xaeroid)
+   Compiling llama-cpp-sys-2 v0.1.130
+   Compiling xaeroai v0.1.0 (/Users/anirudhvyas/xaeroai)
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+error[E0425]: cannot find function `list_github_repos` in module `crate::import_orchestrator`
+    --> src/ffi/core.rs:3667:55
+     |
+3667 |                     match crate::import_orchestrator::list_github_repos(&token_str, &event_tx).await {
+     |                                                       ^^^^^^^^^^^^^^^^^ not found in `crate::import_orchestrator`
+
+error[E0425]: cannot find function `import_all_github` in module `crate::import_orchestrator`
+    --> src/ffi/core.rs:3719:49
+     |
+3719 |                       crate::import_orchestrator::import_all_github(&ws_id, &token_str, &command_tx, &event_tx).await
+     |                                                   ^^^^^^^^^^^^^^^^^ help: a function with a similar name exists: `import_all_jira`
+     |
+    ::: src/import_orchestrator.rs:471:1
+     |
+471  | / pub async fn import_all_jira(
+472  | |     workspace_id: &str,
+473  | |     token: &str,
+474  | |     command_tx: &UnboundedSender<CommandMsg>,
+...    |
+497  | |     })
+498  | | }
+     | |_- similarly named function `import_all_jira` defined here
+
+error[E0425]: cannot find function `import_github_repo` in module `crate::import_orchestrator`
+    --> src/ffi/core.rs:3721:49
+     |
+3721 |                     crate::import_orchestrator::import_github_repo(&target, &ws_id, &token_str, &command_tx, &event_tx).await
+     |                                                 ^^^^^^^^^^^^^^^^^^ not found in `crate::import_orchestrator`
+
+error[E0599]: no method named `lines` found for reference `&serde_json::Value` in the current scope
+   --> src/import_orchestrator.rs:237:35
+    |
+237 |             let first_line = desc.lines().next().unwrap_or("");
+    |                                   ^^^^^ method not found in `&serde_json::Value`
+
+Some errors have detailed explanations: E0425, E0599.
+For more information about an error, try `rustc --explain E0425`.
+error: could not compile `cyan-backend` (lib) due to 4 previous errors
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling llama-cpp-sys-2 v0.1.130
+   Compiling llama-cpp-2 v0.1.130
+   Compiling xaeroai v0.1.0 (/Users/anirudhvyas/xaeroai)
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 33.23s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 26.93s
