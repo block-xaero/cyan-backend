@@ -283,3 +283,14 @@ warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found t
   * `bin` target `delta_test`
   * `integration-test` target `delta_sync_test`
     Finished `release` profile [optimized] target(s) in 1.03s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 25.45s

@@ -75,15 +75,31 @@ fn load_integration_config(scope_id: &str, integration_type: &str) -> Result<Int
             .or_else(|| config["api_token"].as_str())
             .or_else(|| config["access_token"].as_str())
             .unwrap_or("").to_string(),
-        projects: config["projects"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        projects: parse_string_or_array(&config["projects"])
+            .or_else(|| parse_string_or_array(&config["spaces"]))
             .unwrap_or_default(),
-        document_ids: config["document_ids"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        document_ids: parse_string_or_array(&config["document_ids"])
             .unwrap_or_default(),
     })
+}
+
+/// Parse a JSON value that is either a proper array or a string-encoded array like "[\"AD\"]"
+fn parse_string_or_array(val: &serde_json::Value) -> Option<Vec<String>> {
+    // Try as a proper JSON array first
+    if let Some(arr) = val.as_array() {
+        return Some(arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+    }
+    // Try as a string-encoded JSON array
+    if let Some(s) = val.as_str() {
+        if let Ok(parsed) = serde_json::from_str::<Vec<String>>(s) {
+            return Some(parsed);
+        }
+        // Single value, not an array
+        if !s.is_empty() {
+            return Some(vec![s.to_string()]);
+        }
+    }
+    None
 }
 
 /// Find the first workspace in a group that has this integration configured
@@ -199,7 +215,8 @@ pub async fn import_jira_project(
     
     let board_id = blake3::hash(format!("board:{}-{}", workspace_id, board_name).as_bytes()).to_hex().to_string();
     
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Wait for board creation to process through command channel
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     
     let _ = command_tx.send(CommandMsg::AddNotebookCell {
         board_id: board_id.clone(),
@@ -207,6 +224,19 @@ pub async fn import_jira_project(
         cell_order: 0,
         content: Some(markdown),
     });
+    
+    // Wait for cell to be created, then set board mode to notebook
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    
+    // Set board mode to notebook so it opens in rendered preview
+    {
+        let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE objects SET board_mode = 'notebook' WHERE id = ?1",
+            rusqlite::params![board_id],
+        ).unwrap_or(0);
+        tracing::info!("Set board mode to notebook for {}: {} rows affected", board_id, rows);
+    }
     
     Ok(ImportResult {
         source: "jira".to_string(),
