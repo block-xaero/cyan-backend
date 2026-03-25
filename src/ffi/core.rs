@@ -3405,6 +3405,112 @@ pub extern "C" fn cyan_parse_lens_command(input: *const c_char) -> *mut c_char {
                 "resolved": resolved
             })
         }
+        crate::lens_commands::LensCommand::Pipeline { action, step_id, path } => {
+            let resolved = path.as_ref().and_then(|p| crate::lens_commands::resolve_path(p).ok());
+            
+            // Extract board_id from ResolvedPath enum
+            let board_id: Option<String> = resolved.as_ref().and_then(|r| {
+                match r {
+                    crate::lens_commands::ResolvedPath::Board { board_id, .. } => Some(board_id.clone()),
+                    crate::lens_commands::ResolvedPath::File { board_id, .. } => Some(board_id.clone()),
+                    _ => None,
+                }
+            });
+            
+            match action.as_str() {
+                "compile" => {
+                    if let Some(ref bid) = board_id {
+                        // compile_pipeline returns the prompt structure
+                        // compile_via_llm actually calls vLLM and applies configs
+                        serde_json::json!({
+                            "type": "pipeline",
+                            "action": "compile",
+                            "board_id": bid,
+                            "needs_llm": true
+                        })
+                    } else {
+                        serde_json::json!({
+                            "type": "pipeline",
+                            "action": "compile",
+                            "success": false,
+                            "error": "No board specified. Use: /pipeline compile g\\Group\\Workspace\\Board"
+                        })
+                    }
+                }
+                "status" => {
+                    if let Some(ref bid) = board_id {
+                        match crate::pipeline::pipeline_status(bid) {
+                            Ok(data) => serde_json::json!({
+                                "type": "pipeline",
+                                "action": "status",
+                                "success": true,
+                                "data": data
+                            }),
+                            Err(e) => serde_json::json!({
+                                "type": "pipeline",
+                                "action": "status",
+                                "success": false,
+                                "error": e.to_string()
+                            }),
+                        }
+                    } else {
+                        serde_json::json!({
+                            "type": "pipeline",
+                            "action": "status",
+                            "success": false,
+                            "error": "No board specified. Use: /pipeline status g\\Group\\Workspace\\Board"
+                        })
+                    }
+                }
+                "export" => {
+                    if let Some(ref bid) = board_id {
+                        match crate::pipeline::export_airflow_dag(bid, None) {
+                            Ok(dag) => serde_json::json!({
+                                "type": "pipeline",
+                                "action": "export",
+                                "success": true,
+                                "dag": dag
+                            }),
+                            Err(e) => serde_json::json!({
+                                "type": "pipeline",
+                                "action": "export",
+                                "success": false,
+                                "error": e.to_string()
+                            }),
+                        }
+                    } else {
+                        serde_json::json!({
+                            "type": "pipeline",
+                            "action": "export",
+                            "success": false,
+                            "error": "No board specified."
+                        })
+                    }
+                }
+                "run" => {
+                    serde_json::json!({
+                        "type": "pipeline",
+                        "action": "run",
+                        "board_id": board_id
+                    })
+                }
+                "approve" | "reject" | "retry" => {
+                    serde_json::json!({
+                        "type": "pipeline",
+                        "action": action,
+                        "step_id": step_id,
+                        "board_id": board_id
+                    })
+                }
+                _ => {
+                    serde_json::json!({
+                        "type": "pipeline",
+                        "action": "help",
+                        "text": "Pipeline commands: compile, run, status, approve, export"
+                    })
+                }
+            }
+        }
         crate::lens_commands::LensCommand::NaturalLanguage { text } => {
             serde_json::json!({
                 "type": "natural_language",
@@ -3749,6 +3855,121 @@ fn json_cstring(s: &str) -> *mut c_char {
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+// ============================================================================
+// Pipeline FFI Functions
+// ============================================================================
+
+/// Compile pipeline via vLLM — reads cells, sends to AI, writes configs back
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_compile(
+    board_id: *const c_char,
+) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return json_cstring(&r#"{"error":"System not initialized"}"#),
+    };
+    
+    match crate::pipeline::compile_pipeline_sync(&board_id_str, &system.command_tx) {
+        Ok(data) => json_cstring(&data.to_string()),
+        Err(e) => json_cstring(&serde_json::json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// Run pipeline DAG
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_run_pipeline(
+    board_id: *const c_char,
+) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return json_cstring(&r#"{"error":"System not initialized"}"#),
+    };
+    
+    match crate::pipeline::run_pipeline_sync(&board_id_str, &system.command_tx, &system.event_tx) {
+        Ok(data) => json_cstring(&data.to_string()),
+        Err(e) => json_cstring(&serde_json::json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// Approve a pipeline step
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_approve(
+    board_id: *const c_char,
+    step_id: *const c_char,
+) -> bool {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let step_id_str = match unsafe { CStr::from_ptr(step_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return false,
+    };
+    
+    crate::pipeline::approve_step(board_id_str, step_id_str, None, &system.command_tx).is_ok()
+}
+
+// ============================================================================
+// Timecoded Notes FFI
+// ============================================================================
+
+/// Save a timecoded note
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_save_timecode_note(
+    note_json: *const c_char,
+) -> bool {
+    let json_str = match unsafe { CStr::from_ptr(note_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    crate::timecode_notes::save_note_ffi(json_str).is_ok()
+}
+
+/// Load timecoded notes for a board
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_load_timecode_notes(
+    board_id: *const c_char,
+) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match crate::timecode_notes::load_notes_ffi(board_id_str) {
+        Ok(json) => json_cstring(&json),
+        Err(e) => json_cstring(&serde_json::json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// Act on a timecoded note — sends to AI with pipeline context
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_act_on_timecode_note(
+    note_json: *const c_char,
+) -> *mut c_char {
+    let json_str = match unsafe { CStr::from_ptr(note_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match crate::timecode_notes::act_on_note_ffi(json_str) {
+        Ok(result) => json_cstring(&serde_json::json!({"success": true, "result": result}).to_string()),
+        Err(e) => json_cstring(&serde_json::json!({"error": e.to_string()}).to_string()),
     }
 }
 // Add to ffi/core.rs — path autocomplete for g\ prefix

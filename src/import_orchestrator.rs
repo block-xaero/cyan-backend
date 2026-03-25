@@ -847,45 +847,37 @@ pub async fn import_github_repo(
     let mut boards_created = 0;
     let mut total_items = 0;
     
-    // 1. Recent commits → changelog board
-    let commits = client.list_commits(owner, repo, None).await
+    // 1. Fetch detailed commits (files for last 10, basic for rest)
+    let commits = client.list_commits_detailed(owner, repo, 10).await
         .map_err(|e| anyhow!("GitHub commits error: {}", e))?;
     
+    // 2. Fetch PRs
+    let prs = client.list_pull_requests(owner, repo, Some("all")).await
+        .map_err(|e| anyhow!("GitHub PRs error: {}", e))?;
+    
+    // 3. Fetch issues (filter out PRs)
+    let issues = client.list_issues(owner, repo, Some("all")).await
+        .map_err(|e| anyhow!("GitHub issues error: {}", e))?;
+    let real_issues: Vec<_> = issues.iter()
+        .filter(|i| !i.html_url.contains("/pull/"))
+        .collect();
+    
+    // Board 1: Activity Dashboard
     if !commits.is_empty() {
-        let board_name = format!("🔀 {}/{} — Commits", owner, repo);
-        let markdown = github_commits_to_markdown(owner, repo, &commits);
+        let board_name = format!("🔀 {}/{} — Activity", owner, repo);
+        let markdown = github_activity_dashboard(owner, repo, &commits, &prs, &real_issues);
         create_notebook_board(workspace_id, &board_name, &markdown, command_tx).await?;
         boards_created += 1;
         total_items += commits.len();
     }
     
-    // 2. Open PRs → review board
-    let prs = client.list_pull_requests(owner, repo, Some("all")).await
-        .map_err(|e| anyhow!("GitHub PRs error: {}", e))?;
-    
+    // Board 2: Pull Requests (enriched)
     if !prs.is_empty() {
         let board_name = format!("🔀 {}/{} — Pull Requests", owner, repo);
-        let markdown = github_prs_to_markdown(owner, repo, &prs);
+        let markdown = github_prs_enriched(owner, repo, &prs);
         create_notebook_board(workspace_id, &board_name, &markdown, command_tx).await?;
         boards_created += 1;
         total_items += prs.len();
-    }
-    
-    // 3. Issues → tracking board
-    let issues = client.list_issues(owner, repo, Some("all")).await
-        .map_err(|e| anyhow!("GitHub issues error: {}", e))?;
-    
-    // Filter out PRs (GitHub API returns PRs as issues too)
-    let real_issues: Vec<_> = issues.iter()
-        .filter(|i| !i.html_url.contains("/pull/"))
-        .collect();
-    
-    if !real_issues.is_empty() {
-        let board_name = format!("🔀 {}/{} — Issues", owner, repo);
-        let markdown = github_issues_to_markdown(owner, repo, &real_issues);
-        create_notebook_board(workspace_id, &board_name, &markdown, command_tx).await?;
-        boards_created += 1;
-        total_items += real_issues.len();
     }
     
     Ok(ImportResult {
@@ -933,51 +925,141 @@ async fn create_notebook_board(
     Ok(board_id)
 }
 
-fn github_commits_to_markdown(owner: &str, repo: &str, commits: &[cyan_backend_integrations::clients::github::GitHubCommit]) -> String {
-    let mut md = format!("# {}/{} — Recent Commits\n\n", owner, repo);
-    md.push_str(&format!("**{}** commits\n\n", commits.len()));
+fn github_activity_dashboard(
+    owner: &str,
+    repo: &str,
+    commits: &[cyan_backend_integrations::clients::github::GitHubCommit],
+    prs: &[cyan_backend_integrations::clients::github::GitHubPullRequest],
+    issues: &[&cyan_backend_integrations::clients::github::GitHubIssue],
+) -> String {
+    let mut md = format!("# {}/{} — Activity Dashboard\n\n", owner, repo);
     
+    // Summary stats
+    let open_prs = prs.iter().filter(|p| p.state == "open").count();
+    let merged_prs = prs.iter().filter(|p| p.state == "closed").count();
+    let open_issues = issues.iter().filter(|i| i.state == "open").count();
+    
+    md.push_str(&format!("**{}** commits | **{}** PRs ({} open, {} merged) | **{}** issues ({} open)\n\n",
+        commits.len(), prs.len(), open_prs, merged_prs, issues.len(), open_issues));
+    md.push_str("---\n\n");
+    
+    // Contributor stats
+    let mut contributor_map: std::collections::BTreeMap<String, ContributorStats> = std::collections::BTreeMap::new();
     for commit in commits {
+        let author = commit.commit.author.name.clone();
+        let entry = contributor_map.entry(author).or_insert(ContributorStats::default());
+        entry.commits += 1;
+        entry.additions += commit.stats.as_ref().map(|s| s.additions).unwrap_or(0);
+        entry.deletions += commit.stats.as_ref().map(|s| s.deletions).unwrap_or(0);
+        entry.files_changed += commit.files.len() as u32;
+        if entry.last_date.is_empty() || commit.commit.author.date > entry.last_date {
+            entry.last_date = commit.commit.author.date.clone();
+        }
+    }
+    
+    // Sort by commit count desc
+    let mut contributors: Vec<_> = contributor_map.into_iter().collect();
+    contributors.sort_by(|a, b| b.1.commits.cmp(&a.1.commits));
+    
+    md.push_str("## Contributors\n\n");
+    md.push_str("| Author | Commits | Lines (+/-) | Files | Last active |\n");
+    md.push_str("| --- | --- | --- | --- | --- |\n");
+    for (name, stats) in &contributors {
+        let last_active = format_relative_date(&stats.last_date);
+        md.push_str(&format!("| {} | {} | +{}/-{} | {} | {} |\n",
+            name, stats.commits, stats.additions, stats.deletions, stats.files_changed, last_active));
+    }
+    md.push_str("\n---\n\n");
+    
+    // Hot files (most changed across all commits with file data)
+    let mut file_counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for commit in commits {
+        for file in &commit.files {
+            *file_counts.entry(file.filename.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut hot_files: Vec<_> = file_counts.into_iter().collect();
+    hot_files.sort_by(|a, b| b.1.cmp(&a.1));
+    
+    if !hot_files.is_empty() {
+        md.push_str("## Hot Files (most changed)\n\n");
+        for (file, count) in hot_files.iter().take(10) {
+            md.push_str(&format!("- `{}` — {} changes\n", file, count));
+        }
+        md.push_str("\n---\n\n");
+    }
+    
+    // Recent commits with file details
+    md.push_str("## Recent Commits\n\n");
+    for commit in commits.iter().take(15) {
         let msg = commit.commit.message.lines().next().unwrap_or("");
         let author = &commit.commit.author.name;
-        let date = &commit.commit.author.date;
         let short_sha = &commit.sha[..7.min(commit.sha.len())];
+        let date = format_relative_date(&commit.commit.author.date);
         
-        // Detect issue/PR references in commit message
+        // Detect issue references
         let has_ref = msg.contains('#') || msg.to_lowercase().contains("fix") || 
                       msg.to_lowercase().contains("resolve") || msg.to_lowercase().contains("close");
         let marker = if has_ref { "🔗" } else { "•" };
         
-        md.push_str(&format!("{} `{}` **{}** — {}\n", marker, short_sha, msg, author));
+        md.push_str(&format!("{} `{}` **{}** → {} _{}_\n", marker, short_sha, msg, author, date));
         
-        // Show date on separate line
-        if let Some(date_part) = date.split('T').next() {
-            md.push_str(&format!("  _{}_\n", date_part));
+        // Show file changes for detailed commits
+        if !commit.files.is_empty() {
+            let file_summary: Vec<String> = commit.files.iter().take(5).map(|f| {
+                let short_name = f.filename.rsplit('/').next().unwrap_or(&f.filename);
+                format!("`{}` (+{}/-{})", short_name, f.additions, f.deletions)
+            }).collect();
+            md.push_str(&format!("  Files: {}", file_summary.join(", ")));
+            if commit.files.len() > 5 {
+                md.push_str(&format!(" +{} more", commit.files.len() - 5));
+            }
+            md.push('\n');
         }
+    }
+    
+    if commits.len() > 15 {
+        md.push_str(&format!("\n_...and {} more commits_\n", commits.len() - 15));
     }
     
     md
 }
 
-fn github_prs_to_markdown(owner: &str, repo: &str, prs: &[cyan_backend_integrations::clients::github::GitHubPullRequest]) -> String {
+fn github_prs_enriched(
+    owner: &str,
+    repo: &str,
+    prs: &[cyan_backend_integrations::clients::github::GitHubPullRequest],
+) -> String {
     let mut md = format!("# {}/{} — Pull Requests\n\n", owner, repo);
     
     let open: Vec<_> = prs.iter().filter(|p| p.state == "open").collect();
-    let merged: Vec<_> = prs.iter().filter(|p| p.state == "closed").collect();
+    let closed: Vec<_> = prs.iter().filter(|p| p.state == "closed").collect();
     
     let total = prs.len();
-    let open_count = open.len();
-    let merged_count = merged.len();
-    md.push_str(&format!("**{}** PRs ({} open, {} closed)\n\n", total, open_count, merged_count));
+    let merged_count = closed.len();
+    let progress_pct = if total > 0 { (merged_count * 100) / total } else { 0 };
+    let filled = progress_pct / 5;
+    let empty = 20 - filled;
+    let bar: String = "█".repeat(filled) + &"░".repeat(empty);
+    md.push_str(&format!("**Progress:** {} {}/{} ({}%)\n\n", bar, merged_count, total, progress_pct));
+    md.push_str("---\n\n");
     
     if !open.is_empty() {
-        md.push_str("## 🟢 Open\n\n");
+        md.push_str(&format!("## Open ({})\n\n", open.len()));
         for pr in &open {
-            let assignee = pr.user.login.as_str();
-            md.push_str(&format!("- [ ] **#{}**: {} → @{}\n", pr.number, pr.title, assignee));
+            let branch = pr.head.as_ref().map(|h| h.ref_name.as_str()).unwrap_or("?");
+            let target = pr.base.as_ref().map(|b| b.ref_name.as_str()).unwrap_or("main");
+            let date = format_relative_date(&pr.created_at);
+            
+            md.push_str(&format!("- [ ] **#{}**: {} → @{}\n", pr.number, pr.title, pr.user.login));
+            md.push_str(&format!("  `{}` → `{}` | opened {}\n", branch, target, date));
+            
             if let Some(body) = &pr.body {
-                let first = body.lines().next().unwrap_or("");
-                if !first.is_empty() && first.len() < 100 {
+                let first = body.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .next()
+                    .unwrap_or("");
+                if !first.is_empty() && first.len() < 120 {
                     md.push_str(&format!("  > {}\n", first));
                 }
             }
@@ -985,58 +1067,67 @@ fn github_prs_to_markdown(owner: &str, repo: &str, prs: &[cyan_backend_integrati
         md.push('\n');
     }
     
-    if !merged.is_empty() {
-        md.push_str("## ✅ Closed/Merged\n\n");
-        for pr in merged.iter().take(15) {
-            md.push_str(&format!("- [x] **#{}**: {} → @{}\n", pr.number, pr.title, pr.user.login));
+    if !closed.is_empty() {
+        md.push_str(&format!("## Merged/Closed ({})\n\n", closed.len()));
+        for pr in closed.iter().take(20) {
+            let date = format_relative_date(&pr.updated_at);
+            md.push_str(&format!("- [x] **#{}**: {} → @{} _{}_\n", pr.number, pr.title, pr.user.login, date));
         }
-        if merged_count > 15 {
-            md.push_str(&format!("\n_...and {} more_\n", merged_count - 15));
+        if closed.len() > 20 {
+            md.push_str(&format!("\n_...and {} more_\n", closed.len() - 20));
         }
-        md.push('\n');
     }
     
     md
 }
 
-fn github_issues_to_markdown(owner: &str, repo: &str, issues: &[&cyan_backend_integrations::clients::github::GitHubIssue]) -> String {
-    let mut md = format!("# {}/{} — Issues\n\n", owner, repo);
+#[derive(Default)]
+struct ContributorStats {
+    commits: u32,
+    additions: u32,
+    deletions: u32,
+    files_changed: u32,
+    last_date: String,
+}
+
+fn format_relative_date(iso_date: &str) -> String {
+    // Parse ISO date and return relative time
+    // Input: "2025-03-19T14:30:00Z" or similar
+    let date_part = iso_date.split('T').next().unwrap_or(iso_date);
     
-    let open: Vec<_> = issues.iter().filter(|i| i.state == "open").collect();
-    let closed: Vec<_> = issues.iter().filter(|i| i.state == "closed").collect();
-    
-    let open_count = open.len();
-    let closed_count = closed.len();
-    let total = issues.len();
-    let progress = if total > 0 { (closed_count * 100) / total } else { 0 };
-    
-    let filled = progress / 5;
-    let empty = 20 - filled;
-    let bar: String = "█".repeat(filled) + &"░".repeat(empty);
-    md.push_str(&format!("**Progress:** {} {}/{} ({}%)\n\n", bar, closed_count, total, progress));
-    md.push_str("---\n\n");
-    
-    if !open.is_empty() {
-        md.push_str(&format!("## 📋 Open ({})\n\n", open_count));
-        for issue in &open {
-            let labels = issue.labels.iter().map(|l| format!("`{}`", l.name)).collect::<Vec<_>>().join(" ");
-            let assignee = issue.assignee.as_ref().map(|a| format!(" → @{}", a.login)).unwrap_or_default();
-            md.push_str(&format!("- [ ] **#{}**: {}{} {}\n", issue.number, issue.title, assignee, labels));
-        }
-        md.push('\n');
+    // Try to parse as date
+    let parts: Vec<&str> = date_part.split('-').collect();
+    if parts.len() != 3 {
+        return date_part.to_string();
     }
     
-    if !closed.is_empty() {
-        md.push_str(&format!("## ✅ Closed ({})\n\n", closed_count));
-        for issue in closed.iter().take(15) {
-            md.push_str(&format!("- [x] **#{}**: {}\n", issue.number, issue.title));
-        }
-        if closed_count > 15 {
-            md.push_str(&format!("\n_...and {} more_\n", closed_count - 15));
-        }
-    }
+    let year: i32 = parts[0].parse().unwrap_or(2025);
+    let month: u32 = parts[1].parse().unwrap_or(1);
+    let day: u32 = parts[2].parse().unwrap_or(1);
     
-    md
+    // Rough relative time (good enough for display)
+    // Current date approximation — this is display only
+    let now_year = 2026;
+    let now_month = 3;
+    let now_day = 20;
+    
+    let days_ago = (now_year - year) * 365 + (now_month as i32 - month as i32) * 30 + (now_day as i32 - day as i32);
+    
+    if days_ago < 0 {
+        return date_part.to_string();
+    } else if days_ago == 0 {
+        return "today".to_string();
+    } else if days_ago == 1 {
+        return "yesterday".to_string();
+    } else if days_ago < 7 {
+        return format!("{}d ago", days_ago);
+    } else if days_ago < 30 {
+        return format!("{}w ago", days_ago / 7);
+    } else if days_ago < 365 {
+        return format!("{}mo ago", days_ago / 30);
+    } else {
+        return format!("{}y ago", days_ago / 365);
+    }
 }
 
 fn parse_github_repos_config(config: &IntegrationConfig) -> Vec<(String, String)> {
