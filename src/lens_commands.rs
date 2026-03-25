@@ -68,6 +68,14 @@ pub enum LensCommand {
     /// /import jira all g\Sales\Workspace 1        → import all into workspace
     Import { source: String, target: Option<String>, path: Option<CyanPath> },
     
+    /// Pipeline commands:
+    /// /pipeline compile g\Sales\Workspace 1\Board  → compile English steps to configs
+    /// /pipeline run g\Sales\Workspace 1\Board      → execute pipeline DAG
+    /// /pipeline status g\Sales\Workspace 1\Board   → query pipeline state
+    /// /pipeline approve step_id g\...\Board        → human approves a step
+    /// /pipeline export g\Sales\Workspace 1\Board   → export as Airflow DAG
+    Pipeline { action: String, step_id: Option<String>, path: Option<CyanPath> },
+    
     /// Natural language (not a command): forward to query/summarize intent
     NaturalLanguage { text: String },
 }
@@ -186,6 +194,45 @@ pub fn parse_command(input: &str) -> LensCommand {
         }
         
         "/help" | "/h" | "/?" => LensCommand::Help,
+        
+        "/pipeline" | "/pipe" | "/pl" => {
+            
+            if args.is_empty() {
+                return LensCommand::Pipeline { action: "help".to_string(), step_id: None, path: None };
+            }
+            
+            let parts: Vec<&str> = args.splitn(3, ' ').collect();
+            let action = parts[0].to_lowercase();
+            
+            match action.as_str() {
+                "compile" | "run" | "status" | "export" => {
+                    // /pipeline compile g\...\Board
+                    let path = if parts.len() > 1 {
+                        parse_path(parts[1..].join(" ").trim()).ok()
+                    } else {
+                        None
+                    };
+                    LensCommand::Pipeline { action, step_id: None, path }
+                }
+                "approve" | "reject" | "retry" => {
+                    // /pipeline approve step_id g\...\Board
+                    let step_id = parts.get(1).map(|s| s.to_string());
+                    let path = if parts.len() > 2 {
+                        parse_path(parts[2]).ok()
+                    } else {
+                        None
+                    };
+                    LensCommand::Pipeline { action, step_id, path }
+                }
+                _ => {
+                    // Treat as path: /pipeline g\...\Board → status
+                    match parse_path(args) {
+                        Ok(path) => LensCommand::Pipeline { action: "status".to_string(), step_id: None, path: Some(path) },
+                        Err(_) => LensCommand::Pipeline { action: "help".to_string(), step_id: None, path: None },
+                    }
+                }
+            }
+        }
         
         _ => LensCommand::NaturalLanguage { text: trimmed.to_string() },
     }
@@ -485,10 +532,15 @@ pub fn help_text() -> String {
   /import confluence ENG                Import Confluence space as boards
   /import gdocs                         List Google Docs
   /import gdocs all                     Import all docs as boards
+  /pipeline compile g\...\Board          Compile steps to pipeline config
+  /pipeline run g\...\Board              Execute pipeline DAG
+  /pipeline status g\...\Board           Show pipeline state
+  /pipeline approve step_id             Approve a pipeline step
+  /pipeline export g\...\Board           Export as Airflow DAG
   /help                                 Show this help
 
 Path format: g\GroupName\WorkspaceName\BoardName\file.ext
-Shortcuts: /s = /summarize, /st = /status, /pl = /pulse, /p = /pin, /i = /import"#
+Shortcuts: /s = /summarize, /st = /status, /pl = /pulse, /p = /pin, /i = /import, /pipe = /pipeline"#
         .to_string()
 }
 
