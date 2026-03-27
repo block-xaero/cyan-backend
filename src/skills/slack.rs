@@ -151,42 +151,67 @@ struct SlackMessage {
     url: String,
 }
 
-fn load_recent_slack_messages(scope_id: &str, hours: u64) -> Result<Vec<SlackMessage>> {
+/// Load Slack data from imported boards in the same workspace.
+/// Integration data lives in notebook_cells as markdown content.
+fn load_recent_slack_messages(scope_id: &str, _hours: u64) -> Result<Vec<SlackMessage>> {
     let conn = crate::storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
-    let cutoff = chrono::Utc::now().timestamp() as u64 - (hours * 3600);
     
-    // Query nodes table for Slack messages (imported via integration)
-    let mut stmt = match conn.prepare(
-        "SELECT n.external_id, n.workspace_id, n.content, n.ts, \
-                json_extract(n.metadata, '$.author') as author, \
-                json_extract(n.metadata, '$.url') as url, \
-                json_extract(n.metadata, '$.title') as channel \
-         FROM nodes n \
-         WHERE n.scope_id = ?1 AND n.kind IN ('slack_message', 'SlackMessage') AND n.ts > ?2 \
-         ORDER BY n.ts DESC \
-         LIMIT 200"
-    ) {
-        Ok(s) => s,
-        Err(_) => {
-            // Fallback: try notebook_cells with slack content
-            conn.prepare(
-                "SELECT id, board_id, content, 0, 'unknown', '', 'slack' \
-                 FROM notebook_cells WHERE content LIKE '%slack%' LIMIT 50"
-            )?
-        }
-    };
+    // Find the workspace_id from integration_bindings for this scope
+    let workspace_id: Option<String> = conn.query_row(
+        "SELECT scope_id FROM integration_bindings WHERE integration_type = 'slack' LIMIT 1",
+        [],
+        |row| row.get(0),
+    ).ok();
     
-    let messages = stmt.query_map(rusqlite::params![scope_id, cutoff], |row| {
+    let ws_id = workspace_id.as_deref().unwrap_or(scope_id);
+    
+    // Load content from boards in this workspace that have Slack-imported data
+    // Slack imports create boards named "Engineering Board N" or similar
+    let mut stmt = conn.prepare(
+        "SELECT nc.content, o.name, nc.updated_at \
+         FROM notebook_cells nc \
+         JOIN objects o ON nc.board_id = o.id \
+         WHERE o.workspace_id = ?1 \
+           AND (o.name LIKE '%Engineering%' OR o.name LIKE '%Slack%' OR o.name LIKE '%general%' OR o.name LIKE '%engineering%') \
+         ORDER BY nc.updated_at DESC \
+         LIMIT 50"
+    )?;
+    
+    let messages: Vec<SlackMessage> = stmt.query_map(rusqlite::params![ws_id], |row| {
+        let content: String = row.get(0)?;
+        let board_name: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+        let ts: i64 = row.get(2)?;
+        
         Ok(SlackMessage {
-            channel: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "general".into()),
-            author: row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "unknown".into()),
-            content: row.get::<_, String>(2)?,
-            ts: row.get::<_, u64>(3)?,
-            url: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            channel: board_name,
+            author: "team".into(),
+            content,
+            ts: ts as u64,
+            url: String::new(),
         })
-    })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default();
+    })?.filter_map(|r| r.ok()).collect();
+    
+    // If no Slack-specific boards, load from all boards in workspace
+    if messages.is_empty() {
+        let mut stmt2 = conn.prepare(
+            "SELECT nc.content, o.name, nc.updated_at \
+             FROM notebook_cells nc \
+             JOIN objects o ON nc.board_id = o.id \
+             WHERE o.workspace_id = ?1 AND nc.content IS NOT NULL AND length(nc.content) > 20 \
+             ORDER BY nc.updated_at DESC \
+             LIMIT 30"
+        )?;
+        
+        return Ok(stmt2.query_map(rusqlite::params![ws_id], |row| {
+            Ok(SlackMessage {
+                channel: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                author: "team".into(),
+                content: row.get(0)?,
+                ts: row.get::<_, i64>(2)? as u64,
+                url: String::new(),
+            })
+        })?.filter_map(|r| r.ok()).collect());
+    }
     
     Ok(messages)
 }

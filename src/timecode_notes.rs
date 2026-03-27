@@ -26,7 +26,13 @@ pub struct TimecodeNote {
     pub content: String,
     pub note_type: String,          // comment, qc_issue, revision, approved, action
     pub author: String,
-    pub created_at: i64,
+    pub created_at: f64,
+    
+    // Threading
+    #[serde(default)]
+    pub reply_to: Option<String>,          // parent note ID (nil = root)
+    #[serde(default)]
+    pub thread_count: u32,                 // number of replies (cached)
     
     // Pipeline context
     #[serde(default)]
@@ -89,6 +95,26 @@ pub fn save_note(
     // Cell order: use timecode * 1000 to sort notes chronologically
     let cell_order = (note.timecode_seconds * 1000.0) as i32;
     
+    // Direct INSERT into DB (UpdateNotebookCell only updates existing rows)
+    {
+        let conn = crate::storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR REPLACE INTO notebook_cells (id, board_id, cell_type, cell_order, content, output, collapsed, height, metadata_json, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, NULL, ?6, ?7, ?7)",
+            rusqlite::params![
+                note.id,
+                note.board_id,
+                "timecode_note",
+                cell_order,
+                note.content,
+                metadata.to_string(),
+                now,
+            ],
+        ).map_err(|e| anyhow!("DB insert failed: {}", e))?;
+    }
+    
+    // Broadcast via gossip for P2P sync
     let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
         id: note.id.clone(),
         board_id: note.board_id.clone(),
@@ -139,7 +165,7 @@ pub fn load_notes(board_id: &str) -> Result<Vec<TimecodeNote>> {
             content,
             note_type: meta["note_type"].as_str().unwrap_or("comment").to_string(),
             author: meta["author"].as_str().unwrap_or("unknown").to_string(),
-            created_at: meta["created_at"].as_i64().unwrap_or(0),
+            created_at: meta["created_at"].as_f64().unwrap_or(0.0),
             pipeline_step_id: meta["pipeline_step_id"].as_str().map(String::from),
             pipeline_phase: meta["pipeline_phase"].as_str().map(String::from),
             ai_reviewed: meta["ai_reviewed"].as_bool().unwrap_or(false),
@@ -151,6 +177,8 @@ pub fn load_notes(board_id: &str) -> Result<Vec<TimecodeNote>> {
             ai_flags_nearby: serde_json::from_value(
                 meta["ai_flags_nearby"].clone()
             ).unwrap_or_default(),
+            reply_to: meta.get("reply_to").and_then(|v| v.as_str()).map(String::from),
+            thread_count: meta.get("thread_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         })
     })?
     .filter_map(|r| r.ok())
@@ -269,8 +297,17 @@ pub fn get_ai_flags_near_timecode(
 
 /// Save a note — called from FFI (blocking)
 pub fn save_note_ffi(json_str: &str) -> Result<()> {
-    let note: TimecodeNote = serde_json::from_str(json_str)
-        .map_err(|e| anyhow!("Invalid note JSON: {}", e))?;
+    tracing::info!("📝 save_note_ffi called, json len={}", json_str.len());
+    tracing::debug!("📝 save_note_ffi JSON: {}", &json_str[..json_str.len().min(300)]);
+    
+    let note: TimecodeNote = match serde_json::from_str(json_str) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("📝 Failed to parse note JSON: {}", e);
+            tracing::error!("📝 JSON was: {}", &json_str[..json_str.len().min(500)]);
+            return Err(anyhow!("Invalid note JSON: {}", e));
+        }
+    };
     
     let system = crate::SYSTEM.get().ok_or_else(|| anyhow!("System not initialized"))?;
     save_note(&note, &system.command_tx)
@@ -291,4 +328,144 @@ pub fn act_on_note_ffi(note_json: &str) -> Result<String> {
     let rt = crate::RUNTIME.get().ok_or_else(|| anyhow!("Runtime not available"))?;
     
     rt.block_on(act_on_note(&note, &system.command_tx))
+}
+
+// ============================================================================
+// Export notes as markdown
+// ============================================================================
+
+/// Export all notes for a board as markdown timeline
+pub fn export_notes_markdown(board_id: &str) -> Result<String> {
+    let notes = load_notes(board_id)?;
+    
+    // Separate root notes from replies
+    let roots: Vec<&TimecodeNote> = notes.iter().filter(|n| n.reply_to.is_none()).collect();
+    let replies: Vec<&TimecodeNote> = notes.iter().filter(|n| n.reply_to.is_some()).collect();
+    
+    let mut md = String::new();
+    md.push_str("# Review Notes Timeline\n\n");
+    md.push_str(&format!("**Board:** `{}`\n", board_id));
+    md.push_str(&format!("**Total notes:** {} ({} threads, {} replies)\n\n", 
+        notes.len(), roots.len(), replies.len()));
+    md.push_str("---\n\n");
+    
+    // Group by pipeline step if available
+    let mut by_step: std::collections::BTreeMap<String, Vec<&TimecodeNote>> = std::collections::BTreeMap::new();
+    for note in &roots {
+        let step = note.pipeline_step_id.clone().unwrap_or_else(|| "general".to_string());
+        by_step.entry(step).or_default().push(note);
+    }
+    
+    for (step, step_notes) in &by_step {
+        md.push_str(&format!("## {}\n\n", step));
+        
+        for note in step_notes {
+            let tc = format_timecode(note.timecode_seconds);
+            let icon = match note.note_type.as_str() {
+                "qc_issue" => "⚠️",
+                "revision" => "✏️",
+                "approved" => "✅",
+                "comment" => "💬",
+                _ => "📝",
+            };
+            let status = if note.human_approved { " ✅" } else { "" };
+            
+            md.push_str(&format!("**{}** {} **{}**: {}{}\n\n",
+                tc, icon, note.author, note.content, status));
+            
+            // Show AI action result
+            if let Some(ref result) = note.action_result {
+                // Try to parse JSON for clean display
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(result) {
+                    if let Some(analysis) = json.get("analysis").and_then(|v| v.as_str()) {
+                        md.push_str(&format!("> 🤖 **AI:** {}\n", analysis));
+                    }
+                    if let Some(action) = json.get("recommended_action").and_then(|v| v.as_str()) {
+                        md.push_str(&format!("> → {}\n", action));
+                    }
+                } else {
+                    md.push_str(&format!("> 🤖 {}\n", &result[..result.len().min(200)]));
+                }
+                md.push_str("\n");
+            }
+            
+            // Show thread replies
+            let thread_replies: Vec<&&TimecodeNote> = replies.iter()
+                .filter(|r| r.reply_to.as_deref() == Some(&note.id))
+                .collect();
+            
+            for reply in thread_replies {
+                md.push_str(&format!("> **{}**: {}\n", reply.author, reply.content));
+                if let Some(ref result) = reply.action_result {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(result) {
+                        if let Some(analysis) = json.get("analysis").and_then(|v| v.as_str()) {
+                            md.push_str(&format!("> > 🤖 {}\n", analysis));
+                        }
+                    }
+                }
+            }
+            
+            md.push_str("\n");
+        }
+    }
+    
+    Ok(md)
+}
+
+/// Format seconds as HH:MM:SS
+fn format_timecode(seconds: f64) -> String {
+    let total = seconds as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
+
+/// FFI: export notes as markdown string
+pub fn export_notes_markdown_ffi(board_id: &str) -> Result<String> {
+    export_notes_markdown(board_id)
+}
+
+// ============================================================================
+// Reply to a note (threading)
+// ============================================================================
+
+/// Add a reply to an existing note
+pub fn reply_to_note(
+    parent_id: &str,
+    board_id: &str,
+    content: &str,
+    author: &str,
+    command_tx: &tokio::sync::mpsc::UnboundedSender<crate::models::commands::CommandMsg>,
+) -> Result<TimecodeNote> {
+    // Load parent to get timecode
+    let notes = load_notes(board_id)?;
+    let parent = notes.iter()
+        .find(|n| n.id == parent_id)
+        .ok_or_else(|| anyhow!("Parent note {} not found", parent_id))?;
+    
+    let reply = TimecodeNote {
+        id: uuid::Uuid::new_v4().to_string(),
+        board_id: board_id.to_string(),
+        timecode_seconds: parent.timecode_seconds,
+        content: content.to_string(),
+        note_type: "comment".to_string(),
+        author: author.to_string(),
+        created_at: chrono::Utc::now().timestamp() as f64,
+        reply_to: Some(parent_id.to_string()),
+        thread_count: 0,
+        pipeline_step_id: parent.pipeline_step_id.clone(),
+        pipeline_phase: Some("review".to_string()),
+        ai_reviewed: false,
+        human_approved: false,
+        action_skill: None,
+        action_status: None,
+        action_result: None,
+        action_model: None,
+        ai_flags_nearby: vec![],
+    };
+    
+    save_note(&reply, command_tx)?;
+    
+    Ok(reply)
 }

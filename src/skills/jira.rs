@@ -38,28 +38,48 @@ impl SkillExecutor for MyBoard {
         tracing::info!("🔧 [jira_my_board] Executing");
         let scope_id = ctx.scope_id.as_deref().unwrap_or("").to_string();
         
-        // Scope DB access to drop MutexGuard before .await
+        // Load Jira data from imported Kanban/Scrum boards
         let tickets: Vec<serde_json::Value> = {
             let conn = crate::storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
             let mut stmt = conn.prepare(
-                "SELECT n.external_id, n.content, n.ts, \
-                        json_extract(n.metadata, '$.author') as author, \
-                        json_extract(n.metadata, '$.status') as status, \
-                        json_extract(n.metadata, '$.title') as title, \
-                        json_extract(n.metadata, '$.url') as url \
-                 FROM nodes n \
-                 WHERE n.scope_id = ?1 AND n.kind IN ('jira_ticket', 'JiraTicket') \
-                 ORDER BY n.ts DESC LIMIT 50"
+                "SELECT nc.content, o.name \
+                 FROM notebook_cells nc \
+                 JOIN objects o ON nc.board_id = o.id \
+                 WHERE (o.name LIKE '%Kanban%' OR o.name LIKE '%Scrum%' OR o.name LIKE '%Jira%' OR o.name LIKE '%AD %') \
+                 ORDER BY nc.cell_order LIMIT 10"
             )?;
             
-            stmt.query_map(rusqlite::params![scope_id], |row| {
-                Ok(json!({
-                    "key": row.get::<_, String>(0)?,
-                    "title": row.get::<_, Option<String>>(5)?,
-                    "status": row.get::<_, Option<String>>(4)?,
-                    "content": row.get::<_, String>(1)?,
-                }))
-            })?.filter_map(|r| r.ok()).collect()
+            let rows: Vec<(String, String)> = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?.filter_map(|r| r.ok()).collect();
+            
+            let mut tickets = Vec::new();
+            for (content, board_name) in &rows {
+                // Parse Jira markdown: "- [ ] **AD-149**: Title → Assignee `Priority`"
+                for line in content.lines() {
+                    if line.contains("**AD-") || line.contains("**PROJ-") {
+                        let is_done = line.contains("[x]");
+                        let key = line.split("**").nth(1).unwrap_or("?").to_string();
+                        let title = line.split("**: ").nth(1)
+                            .and_then(|s| s.split(" → ").next())
+                            .unwrap_or("").to_string();
+                        let assignee = line.split(" → ").nth(1)
+                            .and_then(|s| s.split(" `").next())
+                            .unwrap_or("unassigned").to_string();
+                        let priority = line.split('`').nth(1).unwrap_or("Medium").to_string();
+                        
+                        tickets.push(json!({
+                            "key": key,
+                            "title": title,
+                            "status": if is_done { "Done" } else { "To Do" },
+                            "assignee": assignee,
+                            "priority": priority,
+                            "board": board_name,
+                        }));
+                    }
+                }
+            }
+            tickets
         }; // conn dropped here
         
         let ticket_text: Vec<String> = tickets.iter()

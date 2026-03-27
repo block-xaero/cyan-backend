@@ -164,67 +164,98 @@ struct GithubCommit {
     ts: u64,
 }
 
+/// Load GitHub PR data from imported PR boards
 fn load_github_prs(scope_id: &str) -> Result<Vec<GithubPr>> {
     let conn = crate::storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
     
+    // Find PR board content — imported boards have names like "org/repo — Pull Requests"
     let mut stmt = conn.prepare(
-        "SELECT n.external_id, n.content, n.ts, \
-                json_extract(n.metadata, '$.author') as author, \
-                json_extract(n.metadata, '$.url') as url, \
-                json_extract(n.metadata, '$.title') as title, \
-                json_extract(n.metadata, '$.status') as status \
-         FROM nodes n \
-         WHERE n.scope_id = ?1 AND n.kind IN ('github_pr', 'GitHubPR') \
-         ORDER BY n.ts DESC LIMIT 50"
+        "SELECT nc.content, o.name \
+         FROM notebook_cells nc \
+         JOIN objects o ON nc.board_id = o.id \
+         WHERE (o.name LIKE '%Pull Request%' OR o.name LIKE '%PR%') \
+         ORDER BY nc.cell_order LIMIT 5"
     )?;
     
-    let now = chrono::Utc::now().timestamp() as u64;
+    let mut prs = Vec::new();
+    let rows: Vec<(String, String)> = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?.filter_map(|r| r.ok()).collect();
     
-    let prs = stmt.query_map(rusqlite::params![scope_id], |row| {
-        let ts: u64 = row.get(2)?;
-        let days_open = ((now - ts) / 86400) as u32;
-        
-        Ok(GithubPr {
-            number: row.get::<_, String>(0)?.parse().unwrap_or(0),
-            title: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-            author: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-            created_at: chrono::DateTime::from_timestamp(ts as i64, 0)
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .unwrap_or_default(),
-            reviewers: "pending".into(), // TODO: extract from metadata
-            status: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "open".into()),
-            days_open,
-            url: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-        })
-    })?
-    .filter_map(|r| r.ok())
-    .collect();
+    for (content, _board_name) in &rows {
+        // Parse PR markdown: "- [x] **#12**: title → @Author _Nmo ago_"
+        for line in content.lines() {
+            if line.contains("**#") {
+                let is_merged = line.contains("[x]");
+                let number = line.split("**#").nth(1)
+                    .and_then(|s| s.split("**").next())
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let title = line.split("**: ").nth(1)
+                    .and_then(|s| s.split(" → ").next())
+                    .unwrap_or("").to_string();
+                let author = line.split("@").nth(1)
+                    .and_then(|s| s.split_whitespace().next())
+                    .unwrap_or("unknown").to_string();
+                let age = line.split("_").nth(1).unwrap_or("").to_string();
+                
+                prs.push(GithubPr {
+                    number,
+                    title,
+                    author,
+                    created_at: age.clone(),
+                    reviewers: if is_merged { "merged".into() } else { "pending".into() },
+                    status: if is_merged { "merged".into() } else { "open".into() },
+                    days_open: if age.contains("mo") { 60 } else if age.contains("d") { 
+                        age.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0)
+                    } else { 0 },
+                    url: format!("https://github.com/block-xaero/cyan-backend/pull/{}", number),
+                });
+            }
+        }
+    }
     
     Ok(prs)
 }
 
-fn load_github_commits(scope_id: &str, hours: u64) -> Result<Vec<GithubCommit>> {
+/// Load GitHub commit data from imported Activity Dashboard boards
+fn load_github_commits(scope_id: &str, _hours: u64) -> Result<Vec<GithubCommit>> {
     let conn = crate::storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
-    let cutoff = chrono::Utc::now().timestamp() as u64 - (hours * 3600);
     
     let mut stmt = conn.prepare(
-        "SELECT n.external_id, n.content, n.ts, \
-                json_extract(n.metadata, '$.author') as author \
-         FROM nodes n \
-         WHERE n.scope_id = ?1 AND n.kind IN ('github_commit', 'GitHubCommit') AND n.ts > ?2 \
-         ORDER BY n.ts DESC LIMIT 100"
+        "SELECT nc.content \
+         FROM notebook_cells nc \
+         JOIN objects o ON nc.board_id = o.id \
+         WHERE o.name LIKE '%Activity Dashboard%' \
+         ORDER BY nc.cell_order LIMIT 5"
     )?;
     
-    let commits = stmt.query_map(rusqlite::params![scope_id, cutoff], |row| {
-        Ok(GithubCommit {
-            sha: row.get(0)?,
-            message: row.get(1)?,
-            ts: row.get(2)?,
-            author: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-        })
-    })?
-    .filter_map(|r| r.ok())
-    .collect();
+    let mut commits = Vec::new();
+    let rows: Vec<String> = stmt.query_map([], |row| {
+        row.get::<_, String>(0)
+    })?.filter_map(|r| r.ok()).collect();
+    
+    for content in &rows {
+        // Parse commit lines from Activity Dashboard markdown
+        for line in content.lines() {
+            if line.contains("` ") && (line.contains("@") || line.contains("by")) {
+                let sha = line.split('`').nth(1).unwrap_or("unknown").to_string();
+                let message = line.split("` ").nth(1)
+                    .and_then(|s| s.split(" — ").next().or(s.split(" by ").next()))
+                    .unwrap_or(line).trim().to_string();
+                let author = line.split("@").nth(1)
+                    .and_then(|s| s.split_whitespace().next())
+                    .unwrap_or("unknown").to_string();
+                
+                commits.push(GithubCommit {
+                    sha,
+                    message,
+                    ts: 0,
+                    author,
+                });
+            }
+        }
+    }
     
     Ok(commits)
 }

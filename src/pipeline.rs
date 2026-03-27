@@ -349,13 +349,19 @@ pub async fn run_pipeline(
             cell_content: cell.content.clone(),
             previous_outputs: collected_outputs.clone(),
             credentials: std::collections::HashMap::new(),
-            video_uri: find_video_uri(board_id),
+            video_uri: {
+                let uri = find_video_uri(board_id);
+                eprintln!("📺 PIPELINE: video_uri={:?}", uri);
+                uri
+            },
             scope_id: find_scope_id(board_id),
         };
         
         // Try skill resolution first, then fall back to raw executor
         let registry = crate::skills::registry();
         let skill_match = registry.resolve_intent(&cell.content);
+        
+        eprintln!("📺 PIPELINE: Step {} skill_match={}", step_id, skill_match.map(|s| s.id.as_str()).unwrap_or("NONE"));
         
         let result = if let Some(skill_def) = skill_match {
             tracing::info!("Step {} → skill '{}' ({})", step_id, skill_def.id, skill_def.name);
@@ -367,6 +373,7 @@ pub async fn run_pipeline(
             match crate::skills::execute_skill(&skill_def.id, &skill_ctx).await {
                 Ok(skill_result) => {
                     // Handle timecoded notes output — save findings as video notes
+                    eprintln!("📺 PIPELINE: Skill result output_type={:?} findings={}", skill_result.output_type, skill_result.timecoded_findings.as_ref().map(|f| f.len()).unwrap_or(0));
                     if skill_result.output_type == crate::skills::OutputType::TimecodedNotes {
                         if let Some(ref findings) = skill_result.timecoded_findings {
                             tracing::info!("Step {} generated {} timecoded findings", step_id, findings.len());
@@ -378,7 +385,7 @@ pub async fn run_pipeline(
                                     content: finding.content.clone(),
                                     note_type: finding.finding_type.clone(),
                                     author: format!("AI/{}", skill_def.id),
-                                    created_at: chrono::Utc::now().timestamp(),
+                                    created_at: chrono::Utc::now().timestamp() as f64,
                                     pipeline_step_id: Some(step_id.clone()),
                                     pipeline_phase: Some("during".to_string()),
                                     ai_reviewed: true,
@@ -388,6 +395,8 @@ pub async fn run_pipeline(
                                     action_result: finding.suggested_action.clone(),
                                     action_model: skill_def.tools.first().cloned(),
                                     ai_flags_nearby: vec![],
+                                    reply_to: None,
+                                    thread_count: 0,
                                 };
                                 let _ = crate::timecode_notes::save_note(&note, command_tx);
                             }
@@ -399,11 +408,17 @@ pub async fn run_pipeline(
                         step_id: step_id.clone(),
                         output: skill_result.summary.clone(),
                         output_type: skill_result.output_type.clone(),
+                        artifacts: std::collections::HashMap::from([
+                            ("data".to_string(), skill_result.data.clone()),
+                        ]),
                     });
                     
                     Ok(skill_result.summary)
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    eprintln!("📺 PIPELINE: Skill '{}' FAILED: {}", skill_def.id, e);
+                    Err(e)
+                },
             }
         } else {
             // No skill matched — fall back to raw executor
@@ -420,6 +435,7 @@ pub async fn run_pipeline(
                     step_id: step_id.clone(),
                     output: output.clone(),
                     output_type: crate::skills::OutputType::Summary,
+                    artifacts: std::collections::HashMap::new(),
                 });
             }
             
@@ -756,7 +772,20 @@ pub fn approve_step(
         .find(|c| c.pipeline_config.as_ref().map(|p| p.step_id.as_str()) == Some(step_id))
         .ok_or_else(|| anyhow!("Step {} not found", step_id))?;
     
-    let mut metadata: serde_json::Value = cell.metadata_json.as_ref()
+    // CRITICAL: Re-read cell from DB to get latest metadata
+    let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+    let (content, cell_order, current_metadata_json): (String, i32, Option<String>) = conn.query_row(
+        "SELECT content, cell_order, metadata_json FROM notebook_cells WHERE id = ?1",
+        rusqlite::params![cell.cell_id],
+        |row| Ok((
+            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            row.get(1)?,
+            row.get(2)?,
+        )),
+    ).map_err(|e| anyhow!("Cell not found: {}", e))?;
+    drop(conn);
+    
+    let mut metadata: serde_json::Value = current_metadata_json.as_ref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or(json!({}));
     
@@ -768,8 +797,8 @@ pub fn approve_step(
         id: cell.cell_id.clone(),
         board_id: board_id.to_string(),
         cell_type: "markdown".to_string(),
-        cell_order: cell.cell_order,
-        content: Some(cell.content.clone()),
+        cell_order,
+        content: Some(content),
         output: None,
         collapsed: false,
         height: None,
@@ -1125,19 +1154,19 @@ fn find_video_uri(board_id: &str) -> Option<String> {
 /// Find scope_id for the board's workspace
 fn find_scope_id(board_id: &str) -> Option<String> {
     let conn = storage::db().lock().ok()?;
+    
+    // The board's workspace_id IS the scope_id
     conn.query_row(
-        "SELECT w.scope_id FROM objects b \
-         JOIN objects w ON b.parent_id = w.id \
-         WHERE b.id = ?1",
+        "SELECT workspace_id FROM objects WHERE id = ?1",
         rusqlite::params![board_id],
         |row| row.get::<_, Option<String>>(0),
     ).ok()?
     .or_else(|| {
-        // Fallback: find any scope_id
+        // Fallback: check integration_bindings for any scope
         conn.query_row(
-            "SELECT scope_id FROM objects WHERE id = ?1",
-            rusqlite::params![board_id],
-            |row| row.get::<_, Option<String>>(0),
-        ).ok()?
+            "SELECT scope_id FROM integration_bindings LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        ).ok()
     })
 }

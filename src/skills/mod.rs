@@ -12,6 +12,7 @@ pub mod jira;
 pub mod email;
 pub mod cyan_dm;
 pub mod media;
+pub mod ssai;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,7 @@ pub struct StepOutput {
     pub step_id: String,
     pub output: String,
     pub output_type: OutputType,
+    pub artifacts: HashMap<String, serde_json::Value>,  // named outputs: "transcript" → json, "metadata" → json
 }
 
 // ============================================================================
@@ -122,6 +124,9 @@ impl SkillRegistry {
         
         // Media skills
         for skill in media::register() { skills.insert(skill.id.clone(), skill); }
+        
+        // SSAI skills
+        for skill in ssai::register() { skills.insert(skill.id.clone(), skill); }
         
         tracing::info!("🔧 Skill registry loaded: {} skills", skills.len());
         for (id, skill) in &skills {
@@ -237,6 +242,10 @@ pub async fn execute_skill(skill_id: &str, ctx: &SkillContext) -> Result<SkillRe
         "qc_analysis" => media::QcAnalysis.execute(ctx).await,
         "loudness_scan" => media::LoudnessScan.execute(ctx).await,
         "scene_detect" => media::SceneDetect.execute(ctx).await,
+        
+        // SSAI skills
+        "ssai_break_detection" => ssai::AdBreakDetection.execute(ctx).await,
+        "ssai_compliance" => ssai::AdComplianceCheck.execute(ctx).await,
         
         _ => Err(anyhow!("Unknown skill: {}", skill_id)),
     }
