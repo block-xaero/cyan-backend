@@ -3898,10 +3898,38 @@ pub extern "C" fn cyan_run_pipeline(
         None => return json_cstring(&r#"{"error":"System not initialized"}"#),
     };
     
-    match crate::pipeline::run_pipeline_sync(&board_id_str, &system.command_tx, &system.event_tx) {
-        Ok(data) => json_cstring(&data.to_string()),
-        Err(e) => json_cstring(&serde_json::json!({"error": e.to_string()}).to_string()),
-    }
+    // Spawn pipeline run as background task — returns immediately
+    let command_tx = system.command_tx.clone();
+    let event_tx = system.event_tx.clone();
+    let bid = board_id_str.clone();
+    
+    let rt = match crate::RUNTIME.get() {
+        Some(rt) => rt,
+        None => return json_cstring(&r#"{"error":"Runtime not available"}"#),
+    };
+    
+    rt.spawn(async move {
+        match crate::pipeline::run_pipeline(&bid, &command_tx, &event_tx).await {
+            Ok(data) => {
+                tracing::info!("🚀 Pipeline run complete: {}", &data.to_string()[..data.to_string().len().min(200)]);
+                let _ = event_tx.send(crate::models::events::SwiftEvent::StatusUpdate {
+                    message: format!("Pipeline complete: {}", data["steps_executed"]),
+                });
+            }
+            Err(e) => {
+                tracing::error!("🚀 Pipeline run failed: {}", e);
+                let _ = event_tx.send(crate::models::events::SwiftEvent::StatusUpdate {
+                    message: format!("Pipeline failed: {}", e),
+                });
+            }
+        }
+    });
+    
+    json_cstring(&serde_json::json!({
+        "status": "started",
+        "board_id": board_id_str,
+        "message": "Pipeline running in background"
+    }).to_string())
 }
 
 /// Approve a pipeline step
@@ -3970,6 +3998,23 @@ pub extern "C" fn cyan_act_on_timecode_note(
     match crate::timecode_notes::act_on_note_ffi(json_str) {
         Ok(result) => json_cstring(&serde_json::json!({"success": true, "result": result}).to_string()),
         Err(e) => json_cstring(&serde_json::json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// Export timecoded notes as markdown
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_export_notes_markdown(board_id: *const c_char) -> *mut c_char {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    match crate::timecode_notes::export_notes_markdown_ffi(board_id_str) {
+        Ok(md) => json_cstring(&md),
+        Err(e) => {
+            eprintln!("Export notes failed: {}", e);
+            std::ptr::null_mut()
+        }
     }
 }
 // Add to ffi/core.rs — path autocomplete for g\ prefix

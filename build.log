@@ -1123,3 +1123,502 @@ warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` foun
   * `bin` target `network_test`
   * `integration-test` target `network_actor_test`
     Finished `release` profile [optimized] target(s) in 0.70s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 28.24s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 30.13s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 27.59s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 29.63s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+    Finished `release` profile [optimized] target(s) in 0.67s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 28.80s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+error[E0308]: mismatched types
+   --> src/pipeline.rs:381:49
+    |
+381 | ...                   created_at: chrono::Utc::now().timestamp() as f64,
+    |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `i64`, found `f64`
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `cyan-backend` (lib) due to 1 previous error
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 26.58s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 27.91s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 28.29s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 27.36s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 25.52s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 27.70s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 25.18s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+error[E0195]: lifetime parameters do not match the trait definition
+   --> src/skills/ssai.rs:56:16
+    |
+56  |     fn execute<'a>(
+    |                ^^
+    |
+    = note: lifetime parameters differ in whether they are early- or late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:217:22
+    |
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                      ^
+    |                      |
+    |                      `'life0` is early-bound
+    |                      this lifetime bound makes `'life0` early-bound
+    |
+   ::: src/skills/ssai.rs:50:1
+    |
+50  | impl SkillExecutor for AdBreakDetection {
+    | --------------------------------------- in this impl...
+...
+56  |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:217:34
+    |
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                                  ^
+    |                                  |
+    |                                  `'life1` is early-bound
+    |                                  this lifetime bound makes `'life1` early-bound
+    |
+   ::: src/skills/ssai.rs:50:1
+    |
+50  | impl SkillExecutor for AdBreakDetection {
+    | --------------------------------------- in this impl...
+...
+56  |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:214:1
+    |
+214 | #[async_trait::async_trait]
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `'async_trait` is early-bound
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                      - this lifetime bound makes `'async_trait` early-bound
+    |
+   ::: src/skills/ssai.rs:50:1
+    |
+50  | impl SkillExecutor for AdBreakDetection {
+    | --------------------------------------- in this impl...
+...
+56  |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+    = note: this error originates in the attribute macro `async_trait::async_trait` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0195]: lifetime parameters do not match the trait definition
+   --> src/skills/ssai.rs:221:16
+    |
+221 |     fn execute<'a>(
+    |                ^^
+    |
+    = note: lifetime parameters differ in whether they are early- or late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:217:22
+    |
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                      ^
+    |                      |
+    |                      `'life0` is early-bound
+    |                      this lifetime bound makes `'life0` early-bound
+    |
+   ::: src/skills/ssai.rs:215:1
+    |
+215 | impl SkillExecutor for AdComplianceCheck {
+    | ---------------------------------------- in this impl...
+...
+221 |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:217:34
+    |
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                                  ^
+    |                                  |
+    |                                  `'life1` is early-bound
+    |                                  this lifetime bound makes `'life1` early-bound
+    |
+   ::: src/skills/ssai.rs:215:1
+    |
+215 | impl SkillExecutor for AdComplianceCheck {
+    | ---------------------------------------- in this impl...
+...
+221 |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:214:1
+    |
+214 | #[async_trait::async_trait]
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `'async_trait` is early-bound
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                      - this lifetime bound makes `'async_trait` early-bound
+    |
+   ::: src/skills/ssai.rs:215:1
+    |
+215 | impl SkillExecutor for AdComplianceCheck {
+    | ---------------------------------------- in this impl...
+...
+221 |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+    = note: this error originates in the attribute macro `async_trait::async_trait` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+For more information about this error, try `rustc --explain E0195`.
+error: could not compile `cyan-backend` (lib) due to 2 previous errors
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+error[E0195]: lifetime parameters do not match the trait definition
+   --> src/skills/ssai.rs:56:16
+    |
+56  |     fn execute<'a>(
+    |                ^^
+    |
+    = note: lifetime parameters differ in whether they are early- or late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:217:22
+    |
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                      ^
+    |                      |
+    |                      `'life0` is early-bound
+    |                      this lifetime bound makes `'life0` early-bound
+    |
+   ::: src/skills/ssai.rs:50:1
+    |
+50  | impl SkillExecutor for AdBreakDetection {
+    | --------------------------------------- in this impl...
+...
+56  |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:217:34
+    |
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                                  ^
+    |                                  |
+    |                                  `'life1` is early-bound
+    |                                  this lifetime bound makes `'life1` early-bound
+    |
+   ::: src/skills/ssai.rs:50:1
+    |
+50  | impl SkillExecutor for AdBreakDetection {
+    | --------------------------------------- in this impl...
+...
+56  |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:214:1
+    |
+214 | #[async_trait::async_trait]
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `'async_trait` is early-bound
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                      - this lifetime bound makes `'async_trait` early-bound
+    |
+   ::: src/skills/ssai.rs:50:1
+    |
+50  | impl SkillExecutor for AdBreakDetection {
+    | --------------------------------------- in this impl...
+...
+56  |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+    = note: this error originates in the attribute macro `async_trait::async_trait` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0195]: lifetime parameters do not match the trait definition
+   --> src/skills/ssai.rs:221:16
+    |
+221 |     fn execute<'a>(
+    |                ^^
+    |
+    = note: lifetime parameters differ in whether they are early- or late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:217:22
+    |
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                      ^
+    |                      |
+    |                      `'life0` is early-bound
+    |                      this lifetime bound makes `'life0` early-bound
+    |
+   ::: src/skills/ssai.rs:215:1
+    |
+215 | impl SkillExecutor for AdComplianceCheck {
+    | ---------------------------------------- in this impl...
+...
+221 |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:217:34
+    |
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                                  ^
+    |                                  |
+    |                                  `'life1` is early-bound
+    |                                  this lifetime bound makes `'life1` early-bound
+    |
+   ::: src/skills/ssai.rs:215:1
+    |
+215 | impl SkillExecutor for AdComplianceCheck {
+    | ---------------------------------------- in this impl...
+...
+221 |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+note: `'a` differs between the trait and impl
+   --> src/skills/mod.rs:214:1
+    |
+214 | #[async_trait::async_trait]
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `'async_trait` is early-bound
+215 | pub trait SkillExecutor: Send + Sync {
+    | ------------------------------------ in this trait...
+216 |     /// Execute the skill with given context
+217 |     async fn execute(&self, ctx: &SkillContext) -> Result<SkillResult>;
+    |                      - this lifetime bound makes `'async_trait` early-bound
+    |
+   ::: src/skills/ssai.rs:215:1
+    |
+215 | impl SkillExecutor for AdComplianceCheck {
+    | ---------------------------------------- in this impl...
+...
+221 |     fn execute<'a>(
+    |                ^^ `'a` is late-bound
+    = note: this error originates in the attribute macro `async_trait::async_trait` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+For more information about this error, try `rustc --explain E0195`.
+error: could not compile `cyan-backend` (lib) due to 2 previous errors
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 26.03s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 26.56s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 25.83s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 24.74s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 26.98s
