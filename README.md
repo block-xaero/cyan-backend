@@ -4,3 +4,4 @@ Cyan makes it easy to collaborate, knowledge share cloudlessly, privately and sa
 - xaeroID (see xaeroID project)
 - xaeroflux-ffi
 
+Copyright (c) BlockXaero Inc. 
