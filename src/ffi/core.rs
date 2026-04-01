@@ -3877,10 +3877,39 @@ pub extern "C" fn cyan_pipeline_compile(
         None => return json_cstring(&r#"{"error":"System not initialized"}"#),
     };
     
-    match crate::pipeline::compile_pipeline_sync(&board_id_str, &system.command_tx) {
-        Ok(data) => json_cstring(&data.to_string()),
-        Err(e) => json_cstring(&serde_json::json!({"error": e.to_string()}).to_string()),
-    }
+    // Spawn compile as background task — returns immediately
+    let command_tx = system.command_tx.clone();
+    let event_tx = system.event_tx.clone();
+    let bid = board_id_str.clone();
+    
+    let rt = match crate::RUNTIME.get() {
+        Some(rt) => rt,
+        None => return json_cstring(&r#"{"error":"Runtime not available"}"#),
+    };
+    
+    rt.spawn(async move {
+        match crate::pipeline::compile_via_llm(&bid, &command_tx).await {
+            Ok(data) => {
+                let applied = data["applied"].as_u64().unwrap_or(0);
+                eprintln!("🔧 Pipeline compile complete: {} steps configured", applied);
+                let _ = event_tx.send(crate::models::events::SwiftEvent::StatusUpdate {
+                    message: format!("Pipeline compiled: {} steps configured", applied),
+                });
+            }
+            Err(e) => {
+                eprintln!("🔧 Pipeline compile failed: {}", e);
+                let _ = event_tx.send(crate::models::events::SwiftEvent::StatusUpdate {
+                    message: format!("Pipeline compile failed: {}", e),
+                });
+            }
+        }
+    });
+    
+    json_cstring(&serde_json::json!({
+        "status": "compiling",
+        "board_id": board_id_str,
+        "message": "Pipeline compiling in background"
+    }).to_string())
 }
 
 /// Run pipeline DAG

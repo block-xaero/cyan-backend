@@ -357,89 +357,28 @@ pub async fn run_pipeline(
             scope_id: find_scope_id(board_id),
         };
         
-        // Try skill resolution first, then fall back to raw executor
-        let registry = crate::skills::registry();
-        let skill_match = registry.resolve_intent(&cell.content);
+        // Execute via Cyan Lens (primary) with local fallback
+        let prev_outputs: Vec<serde_json::Value> = collected_outputs.iter()
+            .map(|o| json!({ "step_id": o.step_id, "summary": o.output }))
+            .collect();
         
-        eprintln!("📺 PIPELINE: Step {} skill_match={}", step_id, skill_match.map(|s| s.id.as_str()).unwrap_or("NONE"));
+        let metadata = crate::pipeline_executor::find_asset_metadata(board_id);
         
-        let result = if let Some(skill_def) = skill_match {
-            tracing::info!("Step {} → skill '{}' ({})", step_id, skill_def.id, skill_def.name);
-            
-            let _ = event_tx.send(SwiftEvent::StatusUpdate {
-                message: format!("Pipeline: step '{}' → skill '{}'", step_id, skill_def.name),
-            });
-            
-            match crate::skills::execute_skill(&skill_def.id, &skill_ctx).await {
-                Ok(skill_result) => {
-                    // Handle timecoded notes output — save findings as video notes
-                    eprintln!("📺 PIPELINE: Skill result output_type={:?} findings={}", skill_result.output_type, skill_result.timecoded_findings.as_ref().map(|f| f.len()).unwrap_or(0));
-                    if skill_result.output_type == crate::skills::OutputType::TimecodedNotes {
-                        if let Some(ref findings) = skill_result.timecoded_findings {
-                            tracing::info!("Step {} generated {} timecoded findings", step_id, findings.len());
-                            for finding in findings {
-                                let note = crate::timecode_notes::TimecodeNote {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    board_id: board_id.to_string(),
-                                    timecode_seconds: finding.timecode_seconds,
-                                    content: finding.content.clone(),
-                                    note_type: finding.finding_type.clone(),
-                                    author: format!("AI/{}", skill_def.id),
-                                    created_at: chrono::Utc::now().timestamp() as f64,
-                                    pipeline_step_id: Some(step_id.clone()),
-                                    pipeline_phase: Some("during".to_string()),
-                                    ai_reviewed: true,
-                                    human_approved: false,
-                                    action_skill: finding.suggested_action.as_ref().map(|_| skill_def.id.clone()),
-                                    action_status: Some("complete".to_string()),
-                                    action_result: finding.suggested_action.clone(),
-                                    action_model: skill_def.tools.first().cloned(),
-                                    ai_flags_nearby: vec![],
-                                    reply_to: None,
-                                    thread_count: 0,
-                                };
-                                let _ = crate::timecode_notes::save_note(&note, command_tx);
-                            }
-                        }
-                    }
-                    
-                    // Collect output for next steps (chained context)
-                    collected_outputs.push(crate::skills::StepOutput {
-                        step_id: step_id.clone(),
-                        output: skill_result.summary.clone(),
-                        output_type: skill_result.output_type.clone(),
-                        artifacts: std::collections::HashMap::from([
-                            ("data".to_string(), skill_result.data.clone()),
-                        ]),
-                    });
-                    
-                    Ok(skill_result.summary)
-                }
-                Err(e) => {
-                    eprintln!("📺 PIPELINE: Skill '{}' FAILED: {}", skill_def.id, e);
-                    Err(e)
-                },
-            }
-        } else {
-            // No skill matched — fall back to raw executor
-            tracing::info!("Step {} no skill match, using executor '{}'", step_id, config.executor);
-            let exec_result = match config.executor.as_str() {
-                "local" if config.command.is_some() => execute_local_step(config).await,
-                "manual" => Ok("Awaiting human action".to_string()),
-                _ => execute_lens_step(config, &cell.content).await,
-            };
-            
-            // Still collect output for context chaining
-            if let Ok(ref output) = exec_result {
+        let result = match crate::pipeline_executor::execute_pipeline_step(
+            board_id, step_id, &cell.content, &config.executor,
+            metadata, prev_outputs, command_tx, event_tx,
+        ).await {
+            Ok((summary, findings)) => {
+                // Collect output for context chaining
                 collected_outputs.push(crate::skills::StepOutput {
                     step_id: step_id.clone(),
-                    output: output.clone(),
-                    output_type: crate::skills::OutputType::Summary,
+                    output: summary.clone(),
+                    output_type: if findings.is_empty() { crate::skills::OutputType::Summary } else { crate::skills::OutputType::TimecodedNotes },
                     artifacts: std::collections::HashMap::new(),
                 });
+                Ok(summary)
             }
-            
-            exec_result
+            Err(e) => Err(e),
         };
         
         let duration = start.elapsed().as_secs_f64();

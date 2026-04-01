@@ -1622,3 +1622,213 @@ warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found t
   * `integration-test` target `delta_sync_test`
    Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
     Finished `release` profile [optimized] target(s) in 26.98s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 26.98s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 28.23s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 29.40s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+    Finished `release` profile [optimized] target(s) in 0.81s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 28.43s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 27.11s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 26.21s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 28.00s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+    Finished `release` profile [optimized] target(s) in 0.64s
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+error[E0277]: `std::option::Option<std::string::String>` doesn't implement `std::fmt::Display`
+   --> src/diagram_gen.rs:183:64
+    |
+183 |         req = req.header("Authorization", format!("Bearer {}", token));
+    |                                                           --   ^^^^^ `std::option::Option<std::string::String>` cannot be formatted with the default formatter
+    |                                                           |
+    |                                                           required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `std::option::Option<std::string::String>`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+    = note: required for `&std::option::Option<std::string::String>` to implement `std::fmt::Display`
+    = note: this error originates in the macro `$crate::__export::format_args` which comes from the expansion of the macro `format` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `std::option::Option<std::string::String>` doesn't implement `std::fmt::Display`
+   --> src/diagram_gen.rs:216:74
+    |
+216 |         tree_req = tree_req.header("Authorization", format!("Bearer {}", token));
+    |                                                                     --   ^^^^^ `std::option::Option<std::string::String>` cannot be formatted with the default formatter
+    |                                                                     |
+    |                                                                     required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `std::option::Option<std::string::String>`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+    = note: required for `&std::option::Option<std::string::String>` to implement `std::fmt::Display`
+    = note: this error originates in the macro `$crate::__export::format_args` which comes from the expansion of the macro `format` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `std::option::Option<std::string::String>` doesn't implement `std::fmt::Display`
+   --> src/diagram_gen.rs:313:64
+    |
+313 |         req = req.header("Authorization", format!("Bearer {}", token));
+    |                                                           --   ^^^^^ `std::option::Option<std::string::String>` cannot be formatted with the default formatter
+    |                                                           |
+    |                                                           required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `std::option::Option<std::string::String>`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+    = note: required for `&std::option::Option<std::string::String>` to implement `std::fmt::Display`
+    = note: this error originates in the macro `$crate::__export::format_args` which comes from the expansion of the macro `format` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `cyan-backend` (lib) due to 3 previous errors
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+error[E0277]: `std::option::Option<std::string::String>` doesn't implement `std::fmt::Display`
+   --> src/diagram_gen.rs:183:64
+    |
+183 |         req = req.header("Authorization", format!("Bearer {}", token));
+    |                                                           --   ^^^^^ `std::option::Option<std::string::String>` cannot be formatted with the default formatter
+    |                                                           |
+    |                                                           required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `std::option::Option<std::string::String>`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+    = note: required for `&std::option::Option<std::string::String>` to implement `std::fmt::Display`
+    = note: this error originates in the macro `$crate::__export::format_args` which comes from the expansion of the macro `format` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `std::option::Option<std::string::String>` doesn't implement `std::fmt::Display`
+   --> src/diagram_gen.rs:216:74
+    |
+216 |         tree_req = tree_req.header("Authorization", format!("Bearer {}", token));
+    |                                                                     --   ^^^^^ `std::option::Option<std::string::String>` cannot be formatted with the default formatter
+    |                                                                     |
+    |                                                                     required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `std::option::Option<std::string::String>`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+    = note: required for `&std::option::Option<std::string::String>` to implement `std::fmt::Display`
+    = note: this error originates in the macro `$crate::__export::format_args` which comes from the expansion of the macro `format` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `std::option::Option<std::string::String>` doesn't implement `std::fmt::Display`
+   --> src/diagram_gen.rs:313:64
+    |
+313 |         req = req.header("Authorization", format!("Bearer {}", token));
+    |                                                           --   ^^^^^ `std::option::Option<std::string::String>` cannot be formatted with the default formatter
+    |                                                           |
+    |                                                           required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `std::option::Option<std::string::String>`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+    = note: required for `&std::option::Option<std::string::String>` to implement `std::fmt::Display`
+    = note: this error originates in the macro `$crate::__export::format_args` which comes from the expansion of the macro `format` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `cyan-backend` (lib) due to 3 previous errors
+warning: file `/Users/anirudhvyas/cyan-backend/tests/network_actor_test.rs` found to be present in multiple build targets:
+  * `bin` target `network_test`
+  * `integration-test` target `network_actor_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/snapshot_protocol_test.rs` found to be present in multiple build targets:
+  * `bin` target `snapshot_test`
+  * `integration-test` target `snapshot_protocol_test`
+warning: file `/Users/anirudhvyas/cyan-backend/tests/delta_sync_test.rs` found to be present in multiple build targets:
+  * `bin` target `delta_test`
+  * `integration-test` target `delta_sync_test`
+   Compiling cyan-backend v0.1.0 (/Users/anirudhvyas/cyan-backend)
+    Finished `release` profile [optimized] target(s) in 26.85s

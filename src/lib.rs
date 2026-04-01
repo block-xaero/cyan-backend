@@ -21,6 +21,7 @@ mod lens_bridge;
 pub use lens_bridge::{LensBridge, RawEvent, XfEvent};
 
 mod ai_bridge;
+pub mod diagram_gen;
 pub mod cyan_lens_client;
 pub mod models;
 mod ffi;
@@ -1520,3 +1521,4 @@ pub mod tests {
 pub mod pipeline;
 pub mod timecode_notes;
 pub mod skills;
+pub mod pipeline_executor;
