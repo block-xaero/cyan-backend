@@ -11,6 +11,10 @@ mod xaero_ffi {
     pub use xaeroid::xaero_free_string;
     pub use xaeroid::xaero_generate_json;
     pub use xaeroid::xaero_sign_with_key;
+    pub use xaeroid::anonymous::xaero_create_anonymous_session;
+    pub use xaeroid::anonymous::xaero_reveal_anonymous_identity;
+    pub use xaeroid::anonymous::xaero_verify_anonymous_join;
+    pub use xaeroid::anonymous::xaero_verify_reveal;
 }
 pub use xaero_ffi::*;
 
@@ -1048,13 +1052,14 @@ impl CommandActor {
                     // Query chats from DB
                     match storage::chat_list_by_workspace(&workspace_id) {
                         Ok(chats) => {
-                            eprintln!("💬 [CHAT] Found {} chats in DB", chats.len());
+                            let chat_count = chats.len();
+                            eprintln!("💬 [CHAT] Found {} chats in DB", chat_count);
 
                             // Emit each chat as a ChatSent event to the chat_panel buffer
                             for chat in chats {
                                 let event = SwiftEvent::Network(NetworkEvent::ChatSent {
                                     id: chat.id,
-                                    workspace_id: chat.workspace_id,
+                                    workspace_id: chat.workspace_id.clone(),
                                     message: chat.message,
                                     author: chat.author,
                                     parent_id: chat.parent_id,
@@ -1062,6 +1067,12 @@ impl CommandActor {
                                 });
                                 let _ = self.event_tx.send(event);
                             }
+                            
+                            // Signal history loading complete
+                            let _ = self.event_tx.send(SwiftEvent::ChatHistoryComplete {
+                                workspace_id: workspace_id.clone(),
+                            });
+                            eprintln!("💬 [CHAT] ChatHistoryComplete ({} msgs)", chat_count);
                         }
                         Err(e) => {
                             eprintln!("💬 [CHAT] 🔴 Failed to load chat history: {}", e);
@@ -1346,7 +1357,8 @@ fn route_event_to_buffers(
         SwiftEvent::BoardLeft { .. } |
         SwiftEvent::FileDownloadProgress { .. } |
         SwiftEvent::FileDownloaded { .. } |
-        SwiftEvent::FileDownloadFailed { .. } => {
+        SwiftEvent::FileDownloadFailed { .. } |
+        SwiftEvent::ChatHistoryComplete { .. } => {
             file_tree.lock().unwrap().push_back(event_json.to_string());
             board_grid.lock().unwrap().push_back(event_json.to_string());
         }
@@ -1444,6 +1456,12 @@ fn route_event_to_buffers(
 
                 // Profile updates → Chat (for author display name resolution)
                 NetworkEvent::ProfileUpdated { .. } => {
+                    chat_panel.lock().unwrap().push_back(event_json.to_string());
+                }
+
+                // Anonymous participation → Chat panel
+                NetworkEvent::AnonymousJoined { .. } |
+                NetworkEvent::IdentityRevealed { .. } => {
                     chat_panel.lock().unwrap().push_back(event_json.to_string());
                 }
 

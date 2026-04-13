@@ -4225,3 +4225,173 @@ pub extern "C" fn cyan_autocomplete_path(
         Err(_) => std::ptr::null_mut(),
     }
 }
+
+// ============================================================================
+// Username normalization
+// ============================================================================
+
+/// Human-readable fallback: "User-A3F2" instead of raw hex
+pub fn friendly_node_id(node_id: &str) -> String {
+    if node_id.len() > 8 {
+        format!("User-{}", node_id[..4].to_uppercase())
+    } else {
+        node_id.to_string()
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_friendly_node_id(node_id: *const c_char) -> *mut c_char {
+    let Some(nid) = (unsafe { cstr_arg(node_id) }) else {
+        return std::ptr::null_mut();
+    };
+    CString::new(friendly_node_id(&nid)).unwrap_or_default().into_raw()
+}
+
+// ============================================================================
+// Anonymous mode FFI
+// ============================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_create_anonymous_session(scope_id: *const c_char) -> *mut c_char {
+    let Some(scope) = (unsafe { cstr_arg(scope_id) }) else {
+        return std::ptr::null_mut();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+    
+    let secret_bytes = sys.secret_key.to_bytes();
+    let session = xaeroid::anonymous::AnonymousSession::new(&secret_bytes, &scope);
+    let join_payload = session.join_payload();
+    
+    let _ = crate::storage::anonymous_session_save(
+        &scope,
+        &hex::encode(session.ephemeral_pubkey),
+        &hex::encode(session.ephemeral_secret),
+        &hex::encode(session.commitment),
+        &session.handle,
+    );
+    
+    // Broadcast to group
+    if let Some(gid) = crate::storage::board_get_group_id(&scope)
+        .or_else(|| crate::storage::workspace_get_group_id(&scope)) {
+        let evt = NetworkEvent::AnonymousJoined {
+            ephemeral_key: hex::encode(session.ephemeral_pubkey),
+            commitment: hex::encode(session.commitment),
+            handle: session.handle.clone(),
+            scope_id: scope.clone(),
+            joined_at: chrono::Utc::now().timestamp(),
+            signature: join_payload.signature.clone(),
+        };
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id: gid,
+            event: evt.clone(),
+        });
+        let _ = sys.event_tx.send(SwiftEvent::Network(evt));
+    }
+    
+    let result = serde_json::json!({
+        "ephemeral_key": hex::encode(session.ephemeral_pubkey),
+        "ephemeral_secret": hex::encode(session.ephemeral_secret),
+        "commitment": hex::encode(session.commitment),
+        "handle": session.handle,
+        "scope_id": scope,
+    });
+    
+    match CString::new(result.to_string()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_reveal_anonymous_identity(scope_id: *const c_char) -> *mut c_char {
+    let Some(scope) = (unsafe { cstr_arg(scope_id) }) else {
+        return std::ptr::null_mut();
+    };
+    let Some(sys) = SYSTEM.get() else {
+        return std::ptr::null_mut();
+    };
+    
+    let Some((_eph_key, eph_secret, _commitment, handle, revealed)) = 
+        crate::storage::anonymous_session_get(&scope) else {
+        return std::ptr::null_mut();
+    };
+    if revealed { return std::ptr::null_mut(); }
+    
+    let secret_bytes = sys.secret_key.to_bytes();
+    let eph_secret_bytes: [u8; 32] = match hex::decode(&eph_secret) {
+        Ok(b) if b.len() == 32 => b.try_into().unwrap(),
+        _ => return std::ptr::null_mut(),
+    };
+    
+    let eph_pubkey = xaeroid::XaeroID::ed25519_pubkey(&eph_secret_bytes);
+    let real_pubkey = xaeroid::XaeroID::ed25519_pubkey(&secret_bytes);
+    
+    let display_name: Option<String> = {
+        let db = sys.db.lock().unwrap();
+        db.query_row(
+            "SELECT display_name FROM user_profiles WHERE node_id = ?1",
+            rusqlite::params![&sys.node_id],
+            |row| row.get::<_, String>(0),
+        ).ok()
+    };
+    
+    let proof_sig = xaeroid::XaeroID::ed25519_sign(&eph_pubkey, &secret_bytes);
+    let _ = crate::storage::anonymous_session_reveal(&scope);
+    
+    if let Some(gid) = crate::storage::board_get_group_id(&scope)
+        .or_else(|| crate::storage::workspace_get_group_id(&scope)) {
+        let evt = NetworkEvent::IdentityRevealed {
+            ephemeral_key: hex::encode(eph_pubkey),
+            real_pubkey: hex::encode(real_pubkey),
+            real_name: display_name.clone(),
+            handle: handle.clone(),
+            scope_id: scope.clone(),
+            proof_signature: hex::encode(proof_sig),
+            revealed_at: chrono::Utc::now().timestamp(),
+        };
+        let _ = sys.network_tx.send(NetworkCommand::Broadcast {
+            group_id: gid,
+            event: evt.clone(),
+        });
+        let _ = sys.event_tx.send(SwiftEvent::Network(evt));
+    }
+    
+    let result = serde_json::json!({
+        "ephemeral_key": hex::encode(eph_pubkey),
+        "real_pubkey": hex::encode(real_pubkey),
+        "real_name": display_name,
+        "handle": handle,
+        "scope_id": scope,
+        "revealed": true,
+    });
+    
+    match CString::new(result.to_string()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_get_anonymous_status(scope_id: *const c_char) -> *mut c_char {
+    let Some(scope) = (unsafe { cstr_arg(scope_id) }) else {
+        return std::ptr::null_mut();
+    };
+    let result = if let Some((_ek, _es, _c, handle, revealed)) = 
+        crate::storage::anonymous_session_get(&scope) {
+        serde_json::json!({ "anonymous": !revealed, "handle": handle, "revealed": revealed })
+    } else {
+        serde_json::json!({ "anonymous": false, "handle": null, "revealed": false })
+    };
+    match CString::new(result.to_string()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_exit_anonymous_mode(scope_id: *const c_char) -> bool {
+    let Some(scope) = (unsafe { cstr_arg(scope_id) }) else { return false; };
+    crate::storage::anonymous_session_delete(&scope).is_ok()
+}

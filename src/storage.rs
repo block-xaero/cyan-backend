@@ -1326,3 +1326,83 @@ pub fn integration_insert(
     )?;
     Ok(())
 }
+
+// ============================================================================
+// Anonymous Sessions
+// ============================================================================
+
+pub fn anonymous_session_save(
+    scope_id: &str,
+    ephemeral_key: &str,
+    ephemeral_secret: &str,
+    commitment: &str,
+    handle: &str,
+) -> Result<()> {
+    let conn = db().lock().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS anonymous_sessions (
+            scope_id TEXT PRIMARY KEY,
+            ephemeral_key TEXT NOT NULL,
+            ephemeral_secret TEXT NOT NULL,
+            commitment TEXT NOT NULL,
+            handle TEXT NOT NULL,
+            revealed INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO anonymous_sessions 
+         (scope_id, ephemeral_key, ephemeral_secret, commitment, handle, revealed, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+        params![scope_id, ephemeral_key, ephemeral_secret, commitment, handle, now],
+    )?;
+    Ok(())
+}
+
+pub fn anonymous_session_get(scope_id: &str) -> Option<(String, String, String, String, bool)> {
+    let conn = db().lock().unwrap();
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS anonymous_sessions (
+            scope_id TEXT PRIMARY KEY,
+            ephemeral_key TEXT NOT NULL,
+            ephemeral_secret TEXT NOT NULL,
+            commitment TEXT NOT NULL,
+            handle TEXT NOT NULL,
+            revealed INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        )",
+        [],
+    );
+    conn.query_row(
+        "SELECT ephemeral_key, ephemeral_secret, commitment, handle, revealed 
+         FROM anonymous_sessions WHERE scope_id = ?1",
+        params![scope_id],
+        |row| Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i32>(4)? != 0,
+        )),
+    ).ok()
+}
+
+pub fn anonymous_session_reveal(scope_id: &str) -> Result<()> {
+    let conn = db().lock().unwrap();
+    conn.execute(
+        "UPDATE anonymous_sessions SET revealed = 1 WHERE scope_id = ?1",
+        params![scope_id],
+    )?;
+    Ok(())
+}
+
+pub fn anonymous_session_delete(scope_id: &str) -> Result<()> {
+    let conn = db().lock().unwrap();
+    conn.execute(
+        "DELETE FROM anonymous_sessions WHERE scope_id = ?1",
+        params![scope_id],
+    )?;
+    Ok(())
+}

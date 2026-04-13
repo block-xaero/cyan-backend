@@ -19,3 +19,4 @@ build/
 # Added by cargo
 
 /target
+.env

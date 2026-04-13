@@ -174,6 +174,24 @@ pub enum NetworkEvent {
         /// RawEvent JSON payload (see lens_bridge.rs for structure)
         payload: String,
     },
+    // ---- Anonymous participation events ----
+    AnonymousJoined {
+        ephemeral_key: String,
+        commitment: String,
+        handle: String,
+        scope_id: String,
+        joined_at: i64,
+        signature: String,
+    },
+    IdentityRevealed {
+        ephemeral_key: String,
+        real_pubkey: String,
+        real_name: Option<String>,
+        handle: String,
+        scope_id: String,
+        proof_signature: String,
+        revealed_at: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +293,10 @@ pub enum SwiftEvent {
     /// Sync complete
     SyncComplete {
         group_id: String,
+    },
+    /// Chat history finished loading for a workspace
+    ChatHistoryComplete {
+        workspace_id: String,
     },
 }
 

@@ -484,7 +484,7 @@ async fn call_vllm(prompt: &str, max_tokens: u32, temperature: f32) -> Result<St
     let vllm_url = std::env::var("CYAN_VLLM_URL")
         .unwrap_or_else(|_| "http://localhost:8000".to_string());
     let model = std::env::var("CYAN_VLLM_MODEL")
-        .unwrap_or_else(|_| "mistralai/Mistral-7B-Instruct-v0.3".to_string());
+        .unwrap_or_else(|_| "/opt/models/llama-3.3-70b-awq".to_string());
     
     let client = reqwest::Client::new();
     
