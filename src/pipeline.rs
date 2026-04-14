@@ -12,8 +12,8 @@
 //   /pipeline export   → Generate Airflow DAG Python file
 
 use anyhow::{anyhow, Result};
-use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::algo::toposort;
+use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -33,7 +33,13 @@ pub struct PipelineStepConfig {
     pub step_id: String,
     pub depends_on: Vec<String>,
     pub executor: String,           // "local", "cloud", "manual", "lens"
-    pub model: Option<String>,      // AI model to use
+    pub model: Option<String>,      // AI model to use (legacy, prefer model_config)
+    #[serde(default)]
+    pub model_config: Option<ModelConfig>,  // Full model configuration
+    #[serde(default)]
+    pub tools: Vec<String>,         // Tools this step needs: ["ffprobe", "ffmpeg", "whisper"]
+    #[serde(default = "default_output_format")]
+    pub output_format: String,      // "markdown", "srt", "json", "findings"
     pub command: Option<String>,    // resolved command
     pub timeout_seconds: Option<u64>,
     pub retry_count: Option<u32>,
@@ -41,6 +47,19 @@ pub struct PipelineStepConfig {
     #[serde(default)]
     pub notifications: Vec<StepNotification>,
     pub state: PipelineStepState,
+}
+
+fn default_output_format() -> String { "markdown".to_string() }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub id: String,                     // "llama-3.3-70b-awq", "whisper-large-v3"
+    #[serde(default)]
+    pub endpoint: Option<String>,       // Override default endpoint
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,14 +127,14 @@ struct PipelineCell {
 /// into executable pipeline steps.
 pub fn compile_pipeline(board_id: &str) -> Result<serde_json::Value> {
     let cells = load_pipeline_cells(board_id)?;
-    
+
     if cells.is_empty() {
         return Err(anyhow!("No cells found in board"));
     }
-    
+
     // Build structured prompt for Lens
     let mut steps = Vec::new();
-    
+
     for (i, cell) in cells.iter().enumerate() {
         let step_id = if let Some(ref config) = cell.pipeline_config {
             config.step_id.clone()
@@ -123,7 +142,7 @@ pub fn compile_pipeline(board_id: &str) -> Result<serde_json::Value> {
             // Generate step_id from content (first few words, snake_case)
             generate_step_id(&cell.content, i)
         };
-        
+
         // If cell already has pipeline config, preserve it
         if let Some(ref config) = cell.pipeline_config {
             steps.push(json!({
@@ -146,7 +165,7 @@ pub fn compile_pipeline(board_id: &str) -> Result<serde_json::Value> {
             }));
         }
     }
-    
+
     Ok(json!({
         "board_id": board_id,
         "total_cells": cells.len(),
@@ -169,12 +188,12 @@ fn build_compile_prompt(cells: &[PipelineCell]) -> String {
          Return JSON array of step configs.\n\n\
          Steps:\n"
     );
-    
+
     for (i, cell) in cells.iter().enumerate() {
         let title = first_line(&cell.content);
         prompt.push_str(&format!("\nStep {} - {}:\n{}\n", i + 1, title, cell.content));
     }
-    
+
     prompt.push_str("\nRespond with only a JSON array of pipeline step configs.");
     prompt
 }
@@ -187,7 +206,7 @@ pub fn apply_compiled_configs(
 ) -> Result<usize> {
     let cells = load_pipeline_cells(board_id)?;
     let mut applied = 0;
-    
+
     for step in compiled_steps {
         let cell_id = step["cell_id"].as_str()
             .or_else(|| {
@@ -195,10 +214,10 @@ pub fn apply_compiled_configs(
                 let idx = step["index"].as_u64()? as usize;
                 cells.get(idx).map(|c| c.cell_id.as_str())
             });
-        
+
         let Some(cell_id) = cell_id else { continue };
         let Some(cell) = cells.iter().find(|c| c.cell_id == cell_id) else { continue };
-        
+
         // Build pipeline config from compiled step
         let config = PipelineStepConfig {
             step_id: step["step_id"].as_str().unwrap_or("unknown").to_string(),
@@ -207,6 +226,11 @@ pub fn apply_compiled_configs(
                 .unwrap_or_default(),
             executor: step["executor"].as_str().unwrap_or("local").to_string(),
             model: step["model"].as_str().map(String::from).or(Some("cyan-lens".to_string())),
+            model_config: None,
+            tools: step["tools"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            output_format: step["output_format"].as_str().unwrap_or("markdown").to_string(),
             command: step["command"].as_str().map(String::from),
             timeout_seconds: step["timeout_seconds"].as_u64(),
             retry_count: step["retry_count"].as_u64().map(|v| v as u32),
@@ -214,14 +238,14 @@ pub fn apply_compiled_configs(
             notifications: vec![],
             state: PipelineStepState::default(),
         };
-        
+
         // Merge into existing metadata
         let mut metadata: serde_json::Value = cell.metadata_json.as_ref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(json!({}));
-        
+
         metadata["pipeline"] = serde_json::to_value(&config)?;
-        
+
         // Update cell via command channel (triggers gossip)
         let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
             id: cell.cell_id.clone(),
@@ -234,10 +258,10 @@ pub fn apply_compiled_configs(
             height: None,
             metadata_json: Some(metadata.to_string()),
         });
-        
+
         applied += 1;
     }
-    
+
     Ok(applied)
 }
 
@@ -252,22 +276,22 @@ pub async fn run_pipeline(
     event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<serde_json::Value> {
     let cells = load_pipeline_cells(board_id)?;
-    
+
     // Collect steps with pipeline configs
     let steps: Vec<_> = cells.iter()
         .filter_map(|c| c.pipeline_config.as_ref().map(|p| (c, p)))
         .collect();
-    
+
     if steps.is_empty() {
         return Err(anyhow!("No pipeline steps configured. Run /pipeline compile first."));
     }
-    
+
     // Build DAG with petgraph
     let mut graph = DiGraph::<String, ()>::new();
     let mut node_map: HashMap<String, NodeIndex> = HashMap::new();
     let mut cell_map: HashMap<String, &PipelineCell> = HashMap::new();
     let mut config_map: HashMap<String, &PipelineStepConfig> = HashMap::new();
-    
+
     // Add nodes
     for (cell, config) in &steps {
         let idx = graph.add_node(config.step_id.clone());
@@ -275,7 +299,7 @@ pub async fn run_pipeline(
         cell_map.insert(config.step_id.clone(), cell);
         config_map.insert(config.step_id.clone(), config);
     }
-    
+
     // Add edges (dependencies)
     for (_cell, config) in &steps {
         if let Some(&to_idx) = node_map.get(&config.step_id) {
@@ -286,103 +310,90 @@ pub async fn run_pipeline(
             }
         }
     }
-    
+
     // Topological sort
     let order = toposort(&graph, None)
         .map_err(|_| anyhow!("Pipeline has circular dependencies"))?;
-    
+
     let run_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let mut results = Vec::new();
-    let mut collected_outputs: Vec<crate::skills::StepOutput> = Vec::new();
-    
+
     tracing::info!("Pipeline run {} started: {} steps in DAG order", run_id, order.len());
-    
+
     // Execute in topological order
     for node_idx in order {
         let step_id = &graph[node_idx];
         let cell = cell_map[step_id];
         let config = config_map[step_id];
-        
+
         // Skip already completed steps
         if config.state.status == "human_approved" || config.state.status == "skipped" {
             tracing::info!("Step {} already {}, skipping", step_id, config.state.status);
             continue;
         }
-        
+
         // Skip manual steps (need human action)
         if config.executor == "manual" {
             tracing::info!("Step {} is manual, skipping execution", step_id);
             update_step_state(board_id, &cell.cell_id, cell, "scheduled", None, None, &run_id, command_tx)?;
             continue;
         }
-        
+
         // Check if dependencies are met
         let deps_met = config.depends_on.iter().all(|dep| {
             config_map.get(dep)
-                .map(|c| c.state.status == "human_approved" || 
-                     (c.auto_advance && c.state.status == "ai_complete"))
+                .map(|c| c.state.status == "human_approved" ||
+                    (c.auto_advance && c.state.status == "ai_complete"))
                 .unwrap_or(true) // unknown deps are considered met
         });
-        
+
         if !deps_met {
             tracing::info!("Step {} dependencies not met, marking scheduled", step_id);
             update_step_state(board_id, &cell.cell_id, cell, "scheduled", None, None, &run_id, command_tx)?;
             results.push(json!({ "step_id": step_id, "status": "scheduled", "reason": "dependencies_pending" }));
             continue;
         }
-        
+
         // Execute step
         tracing::info!("Executing step: {} (executor: {})", step_id, config.executor);
         update_step_state(board_id, &cell.cell_id, cell, "running", None, None, &run_id, command_tx)?;
-        
+
         // Notify UI that step is running
         let _ = event_tx.send(SwiftEvent::StatusUpdate {
             message: format!("Pipeline: step '{}' running", step_id),
         });
-        
+
         let start = std::time::Instant::now();
-        
-        // Build skill context with previous step outputs
-        let skill_ctx = crate::skills::SkillContext {
-            board_id: board_id.to_string(),
-            step_id: step_id.clone(),
-            cell_content: cell.content.clone(),
-            previous_outputs: collected_outputs.clone(),
-            credentials: std::collections::HashMap::new(),
-            video_uri: {
-                let uri = find_video_uri(board_id);
-                eprintln!("📺 PIPELINE: video_uri={:?}", uri);
-                uri
-            },
-            scope_id: find_scope_id(board_id),
-        };
-        
-        // Execute via Cyan Lens (primary) with local fallback
-        let prev_outputs: Vec<serde_json::Value> = collected_outputs.iter()
-            .map(|o| json!({ "step_id": o.step_id, "summary": o.output }))
-            .collect();
-        
+
+        // ── Gather inputs from dependency cells (DB reads, not in-memory) ──
+        let dependency_outputs = gather_dependency_outputs(board_id, &config.depends_on);
+        eprintln!("📺 PIPELINE: Step {} has {} dependency outputs: {:?}",
+            step_id,
+            dependency_outputs.len(),
+            dependency_outputs.iter().map(|d| format!("{}({}B)", d["step_id"].as_str().unwrap_or("?"), d["output"].as_str().map(|s| s.len()).unwrap_or(0))).collect::<Vec<_>>()
+        );
+
         let metadata = crate::pipeline_executor::find_asset_metadata(board_id);
-        
+
+        // ── Build step execution context ──
+        let _model_endpoint = config.model_config.as_ref()
+            .and_then(|m| m.endpoint.clone());
+        let _model_id = config.model_config.as_ref()
+            .map(|m| m.id.clone())
+            .or_else(|| config.model.clone());
+
         let result = match crate::pipeline_executor::execute_pipeline_step(
             board_id, step_id, &cell.content, &config.executor,
-            metadata, prev_outputs, command_tx, event_tx,
+            metadata, dependency_outputs, command_tx, event_tx,
         ).await {
             Ok((summary, findings)) => {
-                // Collect output for context chaining
-                collected_outputs.push(crate::skills::StepOutput {
-                    step_id: step_id.clone(),
-                    output: summary.clone(),
-                    output_type: if findings.is_empty() { crate::skills::OutputType::Summary } else { crate::skills::OutputType::TimecodedNotes },
-                    artifacts: std::collections::HashMap::new(),
-                });
                 Ok(summary)
             }
             Err(e) => Err(e),
         };
-        
+
         let duration = start.elapsed().as_secs_f64();
-        
+
         match result {
             Ok(output) => {
                 tracing::info!("Step {} completed in {:.1}s", step_id, duration);
@@ -390,15 +401,15 @@ pub async fn run_pipeline(
                     board_id, &cell.cell_id, cell, "ai_complete",
                     Some(&output), None, &run_id, Some(duration), command_tx,
                 )?;
-                
+
                 // Send notification
                 let _ = event_tx.send(SwiftEvent::StatusUpdate {
                     message: format!("Pipeline: step '{}' complete ({:.1}s)", step_id, duration),
                 });
-                
+
                 // Process notifications for this step
                 fire_notifications(config, "ai_complete", board_id, step_id, event_tx);
-                
+
                 results.push(json!({
                     "step_id": step_id,
                     "status": "ai_complete",
@@ -412,32 +423,32 @@ pub async fn run_pipeline(
                     board_id, &cell.cell_id, cell, "failed",
                     None, Some(&e.to_string()), &run_id, command_tx,
                 )?;
-                
+
                 fire_notifications(config, "failed", board_id, step_id, event_tx);
-                
+
                 results.push(json!({
                     "step_id": step_id,
                     "status": "failed",
                     "error": e.to_string()
                 }));
-                
+
                 // Don't break — continue with independent steps
             }
         }
     }
-    
+
     // Check if pipeline is complete
     let all_done = steps.iter().all(|(_, config)| {
         config.state.status == "human_approved" || config.state.status == "skipped"
     });
-    
+
     if all_done {
         // Fire pipeline_complete notifications
         for (_, config) in &steps {
             fire_notifications(config, "pipeline_complete", board_id, &config.step_id, event_tx);
         }
     }
-    
+
     Ok(json!({
         "run_id": run_id,
         "board_id": board_id,
@@ -454,9 +465,9 @@ pub async fn run_pipeline(
 async fn execute_local_step(config: &PipelineStepConfig) -> Result<String> {
     let command = config.command.as_ref()
         .ok_or_else(|| anyhow!("No command specified for local step"))?;
-    
+
     let timeout = config.timeout_seconds.unwrap_or(300);
-    
+
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout),
         TokioCommand::new("sh")
@@ -466,7 +477,7 @@ async fn execute_local_step(config: &PipelineStepConfig) -> Result<String> {
     ).await
         .map_err(|_| anyhow!("Step timed out after {}s", timeout))?
         .map_err(|e| anyhow!("Process error: {}", e))?;
-    
+
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
@@ -482,12 +493,12 @@ pub async fn call_vllm_public(prompt: &str, max_tokens: u32, temperature: f32) -
 
 async fn call_vllm(prompt: &str, max_tokens: u32, temperature: f32) -> Result<String> {
     let vllm_url = std::env::var("CYAN_VLLM_URL")
-        .unwrap_or_else(|_| "http://localhost:8000".to_string());
+        .unwrap_or_else(|_| "http://localhost:9000".to_string());
     let model = std::env::var("CYAN_VLLM_MODEL")
         .unwrap_or_else(|_| "/opt/models/llama-3.3-70b-awq".to_string());
-    
+
     let client = reqwest::Client::new();
-    
+
     let response = client.post(format!("{}/v1/chat/completions", vllm_url))
         .json(&json!({
             "model": model,
@@ -499,7 +510,7 @@ async fn call_vllm(prompt: &str, max_tokens: u32, temperature: f32) -> Result<St
         .send()
         .await
         .map_err(|e| anyhow!("vLLM API error: {}", e))?;
-    
+
     if response.status().is_success() {
         let body: serde_json::Value = response.json().await
             .map_err(|e| anyhow!("vLLM parse error: {}", e))?;
@@ -517,11 +528,11 @@ async fn call_vllm(prompt: &str, max_tokens: u32, temperature: f32) -> Result<St
 /// Compile pipeline: send English cells to vLLM, get back step configs
 pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<CommandMsg>) -> Result<serde_json::Value> {
     let cells = load_pipeline_cells(board_id)?;
-    
+
     if cells.is_empty() {
         return Err(anyhow!("No cells found in board"));
     }
-    
+
     // Filter out cells that are just URLs (asset references)
     let step_cells: Vec<_> = cells.iter()
         .filter(|c| {
@@ -529,32 +540,32 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             !trimmed.starts_with("http://") && !trimmed.starts_with("https://") && !trimmed.is_empty()
         })
         .collect();
-    
+
     if step_cells.is_empty() {
         return Err(anyhow!("No pipeline steps found (only asset references)"));
     }
-    
+
     // Build prompt
     let mut prompt = String::from(
         "Return ONLY a JSON array of pipeline step configs. No explanation, no markdown, just the JSON array.\n\n\
          Steps:\n"
     );
-    
+
     for (i, cell) in step_cells.iter().enumerate() {
         let title = first_line(&cell.content);
         prompt.push_str(&format!("{}. {}\n", i + 1, title));
     }
-    
+
     prompt.push_str(
         "\nEach object needs: step_id (snake_case string), depends_on (array of step_id strings that must complete first), \
          executor (one of: local, lens, cloud, manual), command (string or null), timeout_seconds (integer)"
     );
-    
+
     tracing::info!("Pipeline compile: sending {} steps to vLLM", step_cells.len());
-    
+
     // Call vLLM
     let response = call_vllm(&prompt, 1000, 0.1).await?;
-    
+
     // Parse JSON array from response (might have markdown fences)
     let cleaned = response
         .trim()
@@ -562,20 +573,20 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
-    
+
     let configs: Vec<serde_json::Value> = serde_json::from_str(cleaned)
         .map_err(|e| anyhow!("Failed to parse vLLM response as JSON: {}. Raw: {}", e, &cleaned[..cleaned.len().min(300)]))?;
-    
+
     tracing::info!("Pipeline compile: got {} step configs from vLLM", configs.len());
-    
+
     // Apply configs to cells
     let mut applied = 0;
     for (i, config_val) in configs.iter().enumerate() {
         if i >= step_cells.len() { break; }
         let cell = step_cells[i];
-        
+
         let step_id = config_val["step_id"].as_str().unwrap_or(&format!("step_{}", i)).to_string();
-        
+
         let config = PipelineStepConfig {
             step_id: step_id.clone(),
             depends_on: config_val["depends_on"].as_array()
@@ -583,6 +594,9 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
                 .unwrap_or_default(),
             executor: config_val["executor"].as_str().unwrap_or("lens").to_string(),
             model: Some("cyan-lens".to_string()),
+            model_config: None,
+            tools: vec![],
+            output_format: "markdown".to_string(),
             command: config_val["command"].as_str().map(String::from),
             timeout_seconds: config_val["timeout_seconds"].as_u64(),
             retry_count: Some(1),
@@ -590,14 +604,14 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             notifications: vec![],
             state: PipelineStepState::default(),
         };
-        
+
         // Merge into cell metadata
         let mut metadata: serde_json::Value = cell.metadata_json.as_ref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(json!({}));
-        
+
         metadata["pipeline"] = serde_json::to_value(&config)?;
-        
+
         let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
             id: cell.cell_id.clone(),
             board_id: board_id.to_string(),
@@ -609,10 +623,10 @@ pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<Comman
             height: None,
             metadata_json: Some(metadata.to_string()),
         });
-        
+
         applied += 1;
     }
-    
+
     Ok(json!({
         "success": true,
         "steps_compiled": applied,
@@ -628,7 +642,7 @@ async fn execute_lens_step(config: &PipelineStepConfig, cell_content: &str) -> R
          Provide a detailed result with findings, any issues detected, and recommendations.",
         cell_content
     );
-    
+
     call_vllm(&prompt, 500, 0.3).await
 }
 
@@ -636,7 +650,7 @@ async fn execute_lens_step(config: &PipelineStepConfig, cell_content: &str) -> R
 async fn execute_cloud_step(config: &PipelineStepConfig) -> Result<String> {
     let command = config.command.as_ref()
         .ok_or_else(|| anyhow!("No command specified for cloud step"))?;
-    
+
     // For now, execute locally as a fallback
     // TODO: Deploy to Airflow on EC2 or trigger ECS task
     tracing::warn!("Cloud executor not yet implemented, running locally: {}", command);
@@ -649,7 +663,7 @@ async fn execute_cloud_step(config: &PipelineStepConfig) -> Result<String> {
 
 pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
     let cells = load_pipeline_cells(board_id)?;
-    
+
     let mut steps = Vec::new();
     let mut total = 0;
     let mut ai_complete = 0;
@@ -657,7 +671,7 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
     let mut running = 0;
     let mut failed = 0;
     let mut pending = 0;
-    
+
     for cell in &cells {
         if let Some(ref config) = cell.pipeline_config {
             total += 1;
@@ -668,7 +682,7 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
                 "failed" => failed += 1,
                 _ => pending += 1,
             }
-            
+
             steps.push(json!({
                 "step_id": config.step_id,
                 "title": first_line(&cell.content),
@@ -681,7 +695,7 @@ pub fn pipeline_status(board_id: &str) -> Result<serde_json::Value> {
             }));
         }
     }
-    
+
     Ok(json!({
         "board_id": board_id,
         "total_steps": total,
@@ -706,11 +720,11 @@ pub fn approve_step(
     command_tx: &UnboundedSender<CommandMsg>,
 ) -> Result<()> {
     let cells = load_pipeline_cells(board_id)?;
-    
+
     let cell = cells.iter()
         .find(|c| c.pipeline_config.as_ref().map(|p| p.step_id.as_str()) == Some(step_id))
         .ok_or_else(|| anyhow!("Step {} not found", step_id))?;
-    
+
     // CRITICAL: Re-read cell from DB to get latest metadata
     let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
     let (content, cell_order, current_metadata_json): (String, i32, Option<String>) = conn.query_row(
@@ -723,15 +737,15 @@ pub fn approve_step(
         )),
     ).map_err(|e| anyhow!("Cell not found: {}", e))?;
     drop(conn);
-    
+
     let mut metadata: serde_json::Value = current_metadata_json.as_ref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or(json!({}));
-    
+
     metadata["pipeline"]["state"]["status"] = json!("human_approved");
     metadata["pipeline"]["state"]["human_reviewer"] = json!(reviewer.unwrap_or("anonymous"));
     metadata["pipeline"]["state"]["human_approved_at"] = json!(chrono::Utc::now().timestamp());
-    
+
     let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
         id: cell.cell_id.clone(),
         board_id: board_id.to_string(),
@@ -743,7 +757,7 @@ pub fn approve_step(
         height: None,
         metadata_json: Some(metadata.to_string()),
     });
-    
+
     tracing::info!("Step {} approved by {}", step_id, reviewer.unwrap_or("anonymous"));
     Ok(())
 }
@@ -757,13 +771,13 @@ pub fn export_airflow_dag(board_id: &str, dag_name: Option<&str>) -> Result<Stri
     let steps: Vec<_> = cells.iter()
         .filter_map(|c| c.pipeline_config.as_ref().map(|p| (c, p)))
         .collect();
-    
+
     if steps.is_empty() {
         return Err(anyhow!("No pipeline steps configured"));
     }
-    
+
     let name = dag_name.unwrap_or("cyan_pipeline");
-    
+
     let mut py = format!(
         "# Generated by Cyan Pipeline\n\
          # Board: {}\n\
@@ -785,12 +799,12 @@ pub fn export_airflow_dag(board_id: &str, dag_name: Option<&str>) -> Result<Stri
          ) as dag:\n\n",
         board_id, name
     );
-    
+
     // Generate task for each step
     for (cell, config) in &steps {
         let title = first_line(&cell.content).replace("'", "\\'");
         let command = config.command.as_deref().unwrap_or("echo 'No command configured'").replace("'", "\\'");
-        
+
         match config.executor.as_str() {
             "local" | "cloud" => {
                 py.push_str(&format!(
@@ -827,7 +841,7 @@ pub fn export_airflow_dag(board_id: &str, dag_name: Option<&str>) -> Result<Stri
             _ => {}
         }
     }
-    
+
     // Generate dependencies
     py.push_str("\t# Dependencies\n");
     for (_cell, config) in &steps {
@@ -835,7 +849,7 @@ pub fn export_airflow_dag(board_id: &str, dag_name: Option<&str>) -> Result<Stri
             py.push_str(&format!("\t{} >> {}\n", dep, config.step_id));
         }
     }
-    
+
     Ok(py)
 }
 
@@ -843,29 +857,68 @@ pub fn export_airflow_dag(board_id: &str, dag_name: Option<&str>) -> Result<Stri
 // Helpers
 // ============================================================================
 
+/// Read outputs from dependency cells in the DB.
+/// This is the key to proper output chaining — each step reads its inputs
+/// from the persisted output column of its dependency cells.
+fn gather_dependency_outputs(board_id: &str, depends_on: &[String]) -> Vec<serde_json::Value> {
+    if depends_on.is_empty() {
+        return vec![];
+    }
+
+    let conn = match storage::db().lock() {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    depends_on.iter().filter_map(|dep_step_id| {
+        let result: Option<(String, Option<String>, Option<String>)> = conn.query_row(
+            "SELECT json_extract(metadata_json, '$.pipeline.step_id'), \
+                    output, \
+                    json_extract(metadata_json, '$.pipeline.output_format') \
+             FROM notebook_cells \
+             WHERE board_id = ?1 \
+             AND json_extract(metadata_json, '$.pipeline.step_id') = ?2",
+            rusqlite::params![board_id, dep_step_id],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        ).ok();
+
+        result.map(|(step_id, output, format)| {
+            json!({
+                "step_id": step_id,
+                "output": output.unwrap_or_default(),
+                "format": format.unwrap_or_else(|| "markdown".to_string()),
+            })
+        })
+    }).collect()
+}
+
 /// Load cells with pipeline metadata from a board
 fn load_pipeline_cells(board_id: &str) -> Result<Vec<PipelineCell>> {
     let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
-    
+
     let mut stmt = conn.prepare(
         "SELECT id, board_id, cell_order, content, metadata_json \
          FROM notebook_cells WHERE board_id = ?1 ORDER BY cell_order"
     )?;
-    
+
     let cells = stmt.query_map(rusqlite::params![board_id], |row| {
         let cell_id: String = row.get(0)?;
         let board_id: String = row.get(1)?;
         let cell_order: i32 = row.get(2)?;
         let content: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
         let metadata_json: Option<String> = row.get(4)?;
-        
+
         // Parse pipeline config from metadata
         let pipeline_config = metadata_json.as_ref().and_then(|json_str| {
             let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
             let pipeline = val.get("pipeline")?;
             serde_json::from_value(pipeline.clone()).ok()
         });
-        
+
         Ok(PipelineCell {
             cell_id,
             board_id,
@@ -875,9 +928,9 @@ fn load_pipeline_cells(board_id: &str) -> Result<Vec<PipelineCell>> {
             metadata_json,
         })
     })?
-    .filter_map(|r| r.ok())
-    .collect();
-    
+        .filter_map(|r| r.ok())
+        .collect();
+
     Ok(cells)
 }
 
@@ -908,7 +961,7 @@ fn update_step_state_full(
 ) -> Result<()> {
     // CRITICAL: Re-read cell from DB to get latest metadata (avoids race condition)
     let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
-    
+
     let (content, cell_order, current_metadata_json): (String, i32, Option<String>) = conn.query_row(
         "SELECT content, cell_order, metadata_json FROM notebook_cells WHERE id = ?1",
         rusqlite::params![cell_id],
@@ -918,18 +971,18 @@ fn update_step_state_full(
             row.get(2)?,
         )),
     ).map_err(|e| anyhow!("Cell not found: {}", e))?;
-    
+
     drop(conn); // Release lock before sending command
-    
+
     let mut metadata: serde_json::Value = current_metadata_json.as_ref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or(json!({}));
-    
+
     let now = chrono::Utc::now().timestamp();
-    
+
     metadata["pipeline"]["state"]["status"] = json!(status);
     metadata["pipeline"]["state"]["run_id"] = json!(run_id);
-    
+
     if status == "running" {
         metadata["pipeline"]["state"]["started_at"] = json!(now);
     }
@@ -943,21 +996,21 @@ fn update_step_state_full(
     if let Some(dur) = duration {
         metadata["pipeline"]["state"]["duration"] = json!(dur);
     }
-    
+
     let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
         id: cell_id.to_string(),
         board_id: board_id.to_string(),
         cell_type: "markdown".to_string(),
         cell_order,
         content: Some(content),
-        output: None,
+        output: ai_result.map(|s| s.to_string()),
         collapsed: false,
         height: None,
         metadata_json: Some(metadata.to_string()),
     });
-    
+
     tracing::info!("📝 Pipeline step {} → {} (metadata: {}B)", cell_id.get(..8).unwrap_or(cell_id), status, metadata.to_string().len());
-    
+
     Ok(())
 }
 
@@ -972,7 +1025,7 @@ fn fire_notifications(
     for notif in &config.notifications {
         if notif.trigger == trigger {
             let message = notif.message.as_deref().unwrap_or("Pipeline step update");
-            
+
             match notif.action.as_str() {
                 "dm" => {
                     let _ = event_tx.send(SwiftEvent::StatusUpdate {
@@ -1018,11 +1071,11 @@ fn generate_step_id(content: &str, index: usize) -> String {
     let words: Vec<&str> = first.split_whitespace()
         .take(3)
         .collect();
-    
+
     if words.is_empty() {
         return format!("step_{}", index);
     }
-    
+
     words.join("_")
         .to_lowercase()
         .chars()
@@ -1055,7 +1108,7 @@ pub fn compile_pipeline_sync(
     rt.block_on(compile_via_llm(board_id, command_tx))
 }
 
-/// Run pipeline — blocking FFI wrapper  
+/// Run pipeline — blocking FFI wrapper
 pub fn run_pipeline_sync(
     board_id: &str,
     command_tx: &UnboundedSender<CommandMsg>,
@@ -1071,13 +1124,13 @@ fn find_video_uri(board_id: &str) -> Option<String> {
     let mut stmt = conn.prepare(
         "SELECT content FROM notebook_cells WHERE board_id = ?1 ORDER BY cell_order LIMIT 20"
     ).ok()?;
-    
+
     let rows: Vec<String> = stmt.query_map(rusqlite::params![board_id], |row| {
         row.get::<_, Option<String>>(0)
     }).ok()?
-    .filter_map(|r| r.ok().flatten())
-    .collect();
-    
+        .filter_map(|r| r.ok().flatten())
+        .collect();
+
     for content in &rows {
         for word in content.split_whitespace() {
             if (word.starts_with("http://") || word.starts_with("https://") || word.starts_with("s3://"))
@@ -1093,19 +1146,19 @@ fn find_video_uri(board_id: &str) -> Option<String> {
 /// Find scope_id for the board's workspace
 fn find_scope_id(board_id: &str) -> Option<String> {
     let conn = storage::db().lock().ok()?;
-    
+
     // The board's workspace_id IS the scope_id
     conn.query_row(
         "SELECT workspace_id FROM objects WHERE id = ?1",
         rusqlite::params![board_id],
         |row| row.get::<_, Option<String>>(0),
     ).ok()?
-    .or_else(|| {
-        // Fallback: check integration_bindings for any scope
-        conn.query_row(
-            "SELECT scope_id FROM integration_bindings LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        ).ok()
-    })
+        .or_else(|| {
+            // Fallback: check integration_bindings for any scope
+            conn.query_row(
+                "SELECT scope_id FROM integration_bindings LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            ).ok()
+        })
 }

@@ -448,7 +448,7 @@ pub async fn execute_pipeline_step(
     event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<(String, Vec<Finding>)> {
     let lens_url = std::env::var("CYAN_LENS_URL")
-        .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        .unwrap_or_else(|_| "http://localhost:9080".to_string());
     
     // Try Lens first
     match execute_step_via_lens(
@@ -495,9 +495,11 @@ async fn execute_step_locally(
             cell_content: cell_content.to_string(),
             previous_outputs: previous_outputs.iter()
                 .filter_map(|v| {
+                    let output = v["output"].as_str()
+                        .or_else(|| v["summary"].as_str())?;
                     Some(crate::skills::StepOutput {
                         step_id: v["step_id"].as_str()?.to_string(),
-                        output: v["summary"].as_str()?.to_string(),
+                        output: output.to_string(),
                         output_type: crate::skills::OutputType::Summary,
                         artifacts: std::collections::HashMap::new(),
                     })
@@ -588,6 +590,7 @@ pub fn find_asset_metadata(_board_id: &str) -> Option<serde_json::Value> {
     // In production: read from first cell or MAM API
     Some(json!({
         "title": "Big Buck Bunny",
+        "source_url": "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4",
         "content_type": "animated_film",
         "genre": ["animation", "comedy", "family"],
         "source_language": "en",
