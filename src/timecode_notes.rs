@@ -245,8 +245,14 @@ pub async fn act_on_note(
         note.content, note.note_type
     ));
     
-    // Call vLLM
-    let result = crate::pipeline::call_vllm_public(&prompt, 500, 0.3).await?;
+    // Call vLLM first (local Lens), fall back to Claude API (cloud)
+    let result = match crate::pipeline::call_vllm_public(&prompt, 500, 0.3).await {
+        Ok(r) => r,
+        Err(vllm_err) => {
+            eprintln!("🤖 vLLM unavailable ({}), falling back to Claude API", vllm_err);
+            crate::pipeline::call_claude_fallback(&prompt, 500).await?
+        }
+    };
     
     // Update note with AI's response
     let mut updated_note = note.clone();

@@ -525,6 +525,47 @@ async fn call_vllm(prompt: &str, max_tokens: u32, temperature: f32) -> Result<St
     }
 }
 
+
+/// Call Claude API as fallback when vLLM is unavailable
+pub async fn call_claude_fallback(prompt: &str, max_tokens: u32) -> anyhow::Result<String> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| {
+            let home = std::env::var("HOME").map_err(|e| e)?;
+            let env_str = std::fs::read_to_string(format!("{}/Documents/.env", home))
+                .map_err(|_| std::env::VarError::NotPresent)?;
+            env_str.lines()
+                .find(|l| l.starts_with("ANTHROPIC_API_KEY="))
+                .map(|l| l.trim_start_matches("ANTHROPIC_API_KEY=").trim().to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .map_err(|_| anyhow::anyhow!("No Anthropic API key found"))?;
+
+    let client = reqwest::Client::new();
+    let response = client.post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}]
+        }))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Claude API error: {}", e))?;
+
+    if response.status().is_success() {
+        let body: serde_json::Value = response.json().await?;
+        let text = body["content"][0]["text"].as_str().unwrap_or("No response");
+        Ok(text.to_string())
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(anyhow::anyhow!("Claude API returned {}: {}", status, &body[..body.len().min(200)]))
+    }
+}
+
 /// Compile pipeline: send English cells to vLLM, get back step configs
 pub async fn compile_via_llm(board_id: &str, command_tx: &UnboundedSender<CommandMsg>) -> Result<serde_json::Value> {
     let cells = load_pipeline_cells(board_id)?;
@@ -759,6 +800,62 @@ pub fn approve_step(
     });
 
     tracing::info!("Step {} approved by {}", step_id, reviewer.unwrap_or("anonymous"));
+    Ok(())
+}
+
+/// Retry a pipeline step — reset to pending while preserving all metadata
+pub fn retry_step(
+    board_id: &str,
+    step_id: &str,
+    command_tx: &UnboundedSender<CommandMsg>,
+) -> Result<()> {
+    let cells = load_pipeline_cells(board_id)?;
+
+    let cell = cells.iter()
+        .find(|c| c.pipeline_config.as_ref().map(|p| p.step_id.as_str()) == Some(step_id))
+        .ok_or_else(|| anyhow!("Step {} not found", step_id))?;
+
+    // CRITICAL: Re-read cell from DB to get latest metadata
+    let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+    let (content, cell_order, current_metadata_json): (String, i32, Option<String>) = conn.query_row(
+        "SELECT content, cell_order, metadata_json FROM notebook_cells WHERE id = ?1",
+        rusqlite::params![cell.cell_id],
+        |row| Ok((
+            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            row.get(1)?,
+            row.get(2)?,
+        )),
+    ).map_err(|e| anyhow!("Cell not found: {}", e))?;
+    drop(conn);
+
+    let mut metadata: serde_json::Value = current_metadata_json.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(json!({}));
+
+    metadata["pipeline"]["state"]["status"] = json!("pending");
+    metadata["pipeline"]["state"]["error"] = json!(null);
+    metadata["pipeline"]["state"]["ai_result"] = json!(null);
+    metadata["pipeline"]["state"]["duration"] = json!(null);
+    metadata["pipeline"]["state"]["started_at"] = json!(null);
+    metadata["pipeline"]["state"]["ai_completed_at"] = json!(null);
+    
+    // Increment attempt counter
+    let attempt = metadata["pipeline"]["state"]["attempt"].as_u64().unwrap_or(0);
+    metadata["pipeline"]["state"]["attempt"] = json!(attempt + 1);
+
+    let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
+        id: cell.cell_id.clone(),
+        board_id: board_id.to_string(),
+        cell_type: "markdown".to_string(),
+        cell_order,
+        content: Some(content),
+        output: None,
+        collapsed: false,
+        height: None,
+        metadata_json: Some(metadata.to_string()),
+    });
+
+    tracing::info!("Step {} reset to pending (retry)", step_id);
     Ok(())
 }
 

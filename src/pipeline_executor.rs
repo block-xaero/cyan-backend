@@ -447,6 +447,65 @@ pub async fn execute_pipeline_step(
     command_tx: &UnboundedSender<CommandMsg>,
     event_tx: &UnboundedSender<SwiftEvent>,
 ) -> Result<(String, Vec<Finding>)> {
+
+    // ── DEMO CACHE: Check for cached results first ──────────────────────
+    // Remove this block when productionizing. It plays back pre-computed
+    // results with realistic delays so the demo doesn't depend on GPU/Lens.
+    if let Some(cached) = load_cached_step_result(step_id) {
+        eprintln!("📺 PIPELINE: Cache hit for step '{}' — simulating execution", step_id);
+        
+        let _ = event_tx.send(SwiftEvent::StatusUpdate {
+            message: format!("🔄 Step '{}' → Cyan Lens", step_id),
+        });
+        
+        // Simulate model inference with progressive status updates
+        for marker in &cached.status_markers {
+            tokio::time::sleep(std::time::Duration::from_millis(marker.delay_ms)).await;
+            let _ = event_tx.send(SwiftEvent::StatusUpdate {
+                message: format!("{} {}", marker.icon, marker.message),
+            });
+        }
+        
+        // Final pause before "completing"
+        tokio::time::sleep(std::time::Duration::from_millis(cached.final_delay_ms)).await;
+        
+        // Save findings as timecoded notes
+        for finding in &cached.findings {
+            let note = crate::timecode_notes::TimecodeNote {
+                id: uuid::Uuid::new_v4().to_string(),
+                board_id: board_id.to_string(),
+                timecode_seconds: finding.timecode_seconds,
+                content: finding.content.clone(),
+                note_type: finding.finding_type.clone(),
+                author: format!("AI/{}", step_id),
+                created_at: chrono::Utc::now().timestamp() as f64,
+                pipeline_step_id: Some(step_id.to_string()),
+                pipeline_phase: Some("during".to_string()),
+                ai_reviewed: true,
+                human_approved: false,
+                action_skill: None,
+                action_status: Some("complete".to_string()),
+                action_result: finding.suggested_action.clone(),
+                action_model: cached.model_used.clone(),
+                ai_flags_nearby: vec![],
+                reply_to: None,
+                thread_count: 0,
+            };
+            let _ = crate::timecode_notes::save_note(&note, command_tx);
+        }
+        
+        if !cached.findings.is_empty() {
+            eprintln!("📺 PIPELINE: Saved {} cached timecoded notes for step {}", cached.findings.len(), step_id);
+        }
+        
+        let _ = event_tx.send(SwiftEvent::StatusUpdate {
+            message: format!("✅ Step '{}' complete ({:.1}s)", step_id, cached.simulated_duration),
+        });
+        
+        return Ok((cached.summary, cached.findings));
+    }
+    // ── END DEMO CACHE ──────────────────────────────────────────────────
+
     let lens_url = std::env::var("CYAN_LENS_URL")
         .unwrap_or_else(|_| "http://localhost:9080".to_string());
     
@@ -589,23 +648,73 @@ pub fn find_asset_metadata(_board_id: &str) -> Option<serde_json::Value> {
     // For demo: return BigBuckBunny metadata
     // In production: read from first cell or MAM API
     Some(json!({
-        "title": "Big Buck Bunny",
-        "source_url": "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4",
-        "content_type": "animated_film",
-        "genre": ["animation", "comedy", "family"],
+        "title": "Tears of Steel",
+        "source_url": "https://download.blender.org/demo/movies/ToS/tears_of_steel_720p.mov",
+        "content_type": "sci_fi_drama",
+        "genre": ["sci-fi", "drama", "action"],
         "source_language": "en",
-        "target_languages": ["hi", "ta", "te", "kn"],
+        "target_languages": ["hi", "ta", "te"],
         "target_markets": ["IN", "SG", "AE"],
-        "resolution": "FHD",
-        "duration_seconds": 596.0,
-        "rating": "U",
+        "resolution": "HD",
+        "duration_seconds": 734.0,
+        "rating": "M18",
         "ad_tier": "premium",
-        "historical_cpm": 450.0,
-        "engagement_curve": [0.98, 0.95, 0.92, 0.88, 0.85, 0.82, 0.78, 0.75, 0.72, 0.71],
+        "historical_cpm": 300.0,
+        "engagement_curve": [0.95, 0.88, 0.82, 0.85, 0.88, 0.91, 0.89, 0.82, 0.78, 0.75],
         "delivery_platforms": [
             {"platform": "JioStar", "format": "HEVC_1080p"},
-            {"platform": "YouTube", "format": "H264_4K"},
+            {"platform": "YouTube India", "format": "H264_HD"},
             {"platform": "Hotstar", "format": "ABR_ladder"}
         ]
     }))
+}
+
+// ============================================================================
+// DEMO CACHE — Remove this section when productionizing
+// ============================================================================
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CachedStepResult {
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<Finding>,
+    #[serde(default)]
+    pub status_markers: Vec<CachedStatusMarker>,
+    #[serde(default = "default_final_delay")]
+    pub final_delay_ms: u64,
+    #[serde(default = "default_simulated_duration")]
+    pub simulated_duration: f64,
+    #[serde(default)]
+    pub model_used: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CachedStatusMarker {
+    pub icon: String,
+    pub message: String,
+    #[serde(default = "default_marker_delay")]
+    pub delay_ms: u64,
+}
+
+fn default_final_delay() -> u64 { 1500 }
+fn default_simulated_duration() -> f64 { 29.6 }
+fn default_marker_delay() -> u64 { 800 }
+
+/// Load cached step result from ~/.cyan/pipeline_cache/{step_id}.json
+fn load_cached_step_result(step_id: &str) -> Option<CachedStepResult> {
+    let home = std::env::var("HOME").unwrap_or_else(|e| {
+        eprintln!("📺 CACHE DEBUG: HOME env not set: {}", e);
+        String::new()
+    });
+    let cache_path = format!("{}/Documents/pipeline_cache/{}.json", home, step_id);
+    eprintln!("📺 CACHE DEBUG: Looking for cache at: {}", cache_path);
+    let data = match std::fs::read_to_string(&cache_path) {
+        Ok(d) => { eprintln!("📺 CACHE DEBUG: File read OK, {} bytes", d.len()); d },
+        Err(e) => { eprintln!("📺 CACHE DEBUG: File read FAILED: {}", e); return None; },
+    };
+    let cached: CachedStepResult = match serde_json::from_str(&data) {
+        Ok(c) => { eprintln!("📺 CACHE DEBUG: JSON parse OK"); c },
+        Err(e) => { eprintln!("📺 CACHE DEBUG: JSON parse FAILED: {}", e); return None; },
+    };
+    Some(cached)
 }

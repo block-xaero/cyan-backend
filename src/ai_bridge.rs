@@ -270,7 +270,15 @@ impl AIBridge {
         Self {
             db,
             event_tx,
-            claude_api_key: RwLock::new(Some("***REDACTED***".to_string())),
+            claude_api_key: RwLock::new(
+                std::env::var("ANTHROPIC_API_KEY").ok().or_else(|| {
+                    let home = std::env::var("HOME").ok()?;
+                    let env_str = std::fs::read_to_string(format!("{}/Documents/.env", home)).ok()?;
+                    env_str.lines()
+                        .find(|l| l.starts_with("ANTHROPIC_API_KEY="))
+                        .map(|l| l.trim_start_matches("ANTHROPIC_API_KEY=").trim().to_string())
+                })
+            ),
             claude_client,
             cell_models: RwLock::new(HashMap::new()),
             cloud_client: RwLock::new(None),

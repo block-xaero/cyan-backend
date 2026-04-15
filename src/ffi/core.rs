@@ -3984,6 +3984,30 @@ pub extern "C" fn cyan_pipeline_approve(
     crate::pipeline::approve_step(board_id_str, step_id_str, None, &system.command_tx).is_ok()
 }
 
+
+/// Retry a pipeline step (reset to pending, preserve metadata)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_retry(
+    board_id: *const c_char,
+    step_id: *const c_char,
+) -> bool {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let step_id_str = match unsafe { CStr::from_ptr(step_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return false,
+    };
+    
+    crate::pipeline::retry_step(board_id_str, step_id_str, &system.command_tx).is_ok()
+}
+
 // ============================================================================
 // Timecoded Notes FFI
 // ============================================================================
