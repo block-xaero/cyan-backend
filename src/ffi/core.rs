@@ -4008,6 +4008,25 @@ pub extern "C" fn cyan_pipeline_retry(
     crate::pipeline::retry_step(board_id_str, step_id_str, &system.command_tx).is_ok()
 }
 
+
+/// Reset all pipeline steps to pending (for demo resets)
+#[unsafe(no_mangle)]
+pub extern "C" fn cyan_pipeline_reset(
+    board_id: *const c_char,
+) -> bool {
+    let board_id_str = match unsafe { CStr::from_ptr(board_id) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    
+    let system = match SYSTEM.get() {
+        Some(s) => s,
+        None => return false,
+    };
+    
+    crate::pipeline::reset_pipeline(board_id_str, &system.command_tx).is_ok()
+}
+
 // ============================================================================
 // Timecoded Notes FFI
 // ============================================================================

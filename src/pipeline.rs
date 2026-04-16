@@ -859,6 +859,66 @@ pub fn retry_step(
     Ok(())
 }
 
+/// Reset all pipeline steps to pending, clear outputs and timecoded notes
+pub fn reset_pipeline(
+    board_id: &str,
+    command_tx: &UnboundedSender<CommandMsg>,
+) -> Result<()> {
+    let cells = load_pipeline_cells(board_id)?;
+    let conn = storage::db().lock().map_err(|e| anyhow!("DB lock: {}", e))?;
+
+    // Reset each step
+    for cell in &cells {
+        if cell.pipeline_config.is_none() { continue; }
+
+        let (content, cell_order, current_metadata_json): (String, i32, Option<String>) = conn.query_row(
+            "SELECT content, cell_order, metadata_json FROM notebook_cells WHERE id = ?1",
+            rusqlite::params![cell.cell_id],
+            |row| Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get(1)?,
+                row.get(2)?,
+            )),
+        ).map_err(|e| anyhow!("Cell not found: {}", e))?;
+
+        let mut metadata: serde_json::Value = current_metadata_json.as_ref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(json!({}));
+
+        metadata["pipeline"]["state"]["status"] = json!("pending");
+        metadata["pipeline"]["state"]["error"] = json!(null);
+        metadata["pipeline"]["state"]["ai_result"] = json!(null);
+        metadata["pipeline"]["state"]["duration"] = json!(null);
+        metadata["pipeline"]["state"]["started_at"] = json!(null);
+        metadata["pipeline"]["state"]["ai_completed_at"] = json!(null);
+        metadata["pipeline"]["state"]["human_approved_at"] = json!(null);
+        metadata["pipeline"]["state"]["run_id"] = json!(null);
+        metadata["pipeline"]["state"]["attempt"] = json!(0);
+
+        let _ = command_tx.send(CommandMsg::UpdateNotebookCell {
+            id: cell.cell_id.clone(),
+            board_id: board_id.to_string(),
+            cell_type: "markdown".to_string(),
+            cell_order,
+            content: Some(content),
+            output: None,
+            collapsed: false,
+            height: None,
+            metadata_json: Some(metadata.to_string()),
+        });
+    }
+
+    // Delete timecoded notes for this board
+    conn.execute(
+        "DELETE FROM notebook_cells WHERE board_id = ?1 AND cell_type = 'timecode_note'",
+        rusqlite::params![board_id],
+    )?;
+
+    drop(conn);
+    tracing::info!("Pipeline reset: all steps pending, notes cleared for board {}", &board_id[..8]);
+    Ok(())
+}
+
 // ============================================================================
 // Export: Generate Airflow DAG
 // ============================================================================
